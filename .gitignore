@@ -1,0 +1,17 @@
+node_modules/
+*.vsix
+*.zip
+*.log
+*.aux
+*.fls
+*.fdb_latexmk
+*.nav
+*.snm
+*.toc
+*.out
+*.synctex.gz
+tests/output/
+out/
+.DS_Store
+Thumbs.db
+

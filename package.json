@@ -1,0 +1,75 @@
+{
+  "name": "texflow",
+  "displayName": "TeXFlow — Visual LaTeX",
+  "description": "A visual editor for real LaTeX files inside VS Code, with Beamer and document mode support for article, report and book.",
+  "version": "0.10.5",
+  "publisher": "local-lea",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Programming Languages",
+    "Visualization"
+  ],
+  "activationEvents": [
+    "onCommand:texflow.openVisualEditor",
+    "onCommand:texflow.projectCheck",
+    "onCommand:texflow.newProject"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "texflow.openVisualEditor",
+        "title": "TeXFlow: Open Visual LaTeX Editor"
+      },
+      {
+        "command": "texflow.projectCheck",
+        "title": "TeXFlow: Check Project"
+      },
+      {
+        "command": "texflow.newProject",
+        "title": "TeXFlow: New Project"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "texflow.openVisualEditor",
+          "when": "resourceExtname == .tex",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "texflow.openVisualEditor",
+          "when": "resourceExtname == .tex",
+          "group": "navigation"
+        },
+        {
+          "command": "texflow.projectCheck",
+          "when": "resourceExtname == .tex",
+          "group": "navigation@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "npm run compile && bash tests/run_fixtures.sh",
+    "package": "npm run compile && vsce package",
+    "check": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:LeandroZipitria/texflow.git"
+  },
+  "icon": "media/texflow-icon.png"
+}
