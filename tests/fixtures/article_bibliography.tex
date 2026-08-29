@@ -1,0 +1,32 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[spanish]{babel}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage[backend=biber,style=authoryear]{biblatex}
+\addbibresource{references.bib}
+
+\title{Prueba de bibliografía — Article}
+\author{TeXFlow test}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Citas en texto}
+La literatura institucional enfatiza el papel de las instituciones de largo plazo \parencite{acemoglu2001}.
+Según \textcite{angrist2009}, el diseño de investigación es central para la inferencia causal.
+Una cita genérica también debe funcionar \cite{heckman1979}.
+
+\section{Varias referencias}
+Podemos citar varias fuentes simultáneamente \parencite{acemoglu2001,angrist2009}.
+También incluimos un reporte \parencite{worldbank2024}, una fuente en línea \parencite{ourworld2025} y un manuscrito \parencite{workingpaper2026}.
+
+\section{Matemática y citas}
+Un modelo simple puede escribirse como
+\[
+y_i = \alpha + \beta x_i + \varepsilon_i,
+\]
+y luego discutir la estrategia empírica \parencite{angrist2009}.
+
+\printbibliography
+\end{document}

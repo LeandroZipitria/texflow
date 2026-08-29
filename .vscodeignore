@@ -1,9 +1,10 @@
-src/**
-tests/**
-node_modules/**
 .git/**
 .github/**
 .vscode/**
+src/**
+tests/**
+documentation/**
+node_modules/**
 *.zip
 *.vsix
 *.log
@@ -15,8 +16,9 @@ node_modules/**
 *.toc
 *.out
 *.synctex.gz
+*.map
 package-lock.json
 tsconfig.json
-README.md
-CHANGELOG.md
 CONTRIBUTING.md
+docs/DEVELOPMENT.md
+docs/LABS_0.13_FEATURE_MATRIX.md

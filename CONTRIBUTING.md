@@ -11,9 +11,9 @@ Thanks for helping improve TeXFlow.
 ## Local setup
 
 ```bash
-npm install
+npm ci
 npm run compile
-npm test
+bash tests/run_fixtures.sh
 ```
 
 ## Tests

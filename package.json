@@ -1,10 +1,28 @@
 {
   "name": "texflow",
   "displayName": "TeXFlow — Visual LaTeX",
-  "description": "A visual editor for real LaTeX files inside VS Code, with Beamer and document mode support for article, report and book.",
-  "version": "0.10.5",
-  "publisher": "local-lea",
+  "description": "A visual editor for real LaTeX and Beamer files in VS Code, with semantic text editing, math, citations, references, figures, tables, layout tools, and source-preserving round trips.",
+  "version": "0.14.2",
+  "publisher": "leandrozipitria",
   "license": "MIT",
+  "homepage": "https://github.com/LeandroZipitria/texflow#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LeandroZipitria/texflow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LeandroZipitria/texflow/issues"
+  },
+  "keywords": [
+    "latex",
+    "tex",
+    "beamer",
+    "visual editor",
+    "academic writing",
+    "mathematics",
+    "citations",
+    "tables"
+  ],
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -58,7 +76,6 @@
   },
   "scripts": {
     "compile": "tsc -p .",
-    "test": "npm run compile && bash tests/run_fixtures.sh",
     "package": "npm run compile && vsce package",
     "check": "npm run compile"
   },
@@ -66,10 +83,6 @@
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^3.9.2",
     "typescript": "^7.0.2"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git@github.com:LeandroZipitria/texflow.git"
   },
   "icon": "media/texflow-icon.png"
 }

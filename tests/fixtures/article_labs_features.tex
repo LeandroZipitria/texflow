@@ -1,0 +1,80 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{amsthm}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{makeidx}
+\usepackage{nomencl}
+\usepackage{multicol}
+\makeindex
+\makenomenclature
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{definition}{Definition}
+\begin{document}
+\section{Labs objects}
+Text with a \footnote{Footnote text}, a \href{https://example.com}{link}, a \url{https://example.com}, an \index{TeXFlow} entry and \nomenclature{$\alpha$}{A parameter}.
+Today is \today. The job is \jobname.
+
+\begin{gather}
+a=b+c \\
+d=e+f
+\end{gather}
+
+\begin{multline}
+a+b+c+d+e+f \\
+= g+h+i
+\end{multline}
+
+\begin{quote}
+A semantic quotation.
+\end{quote}
+
+\begin{minipage}{0.8\linewidth}
+A simple minipage container.
+\end{minipage}
+
+\begin{theorem}
+A simple theorem.
+\end{theorem}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lc}
+\toprule
+Item & Value \\
+\midrule
+A & 1 \\
+B & 2 \\
+\bottomrule
+\end{tabular}
+\caption{Booktabs table}
+\label{tab:labs}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{subfigure}[t]{0.45\textwidth}
+\centering
+\includegraphics[width=\linewidth]{figure_sample.png}
+\caption{First}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.45\textwidth}
+\centering
+\includegraphics[width=\linewidth]{figure_sample.png}
+\caption{Second}
+\end{subfigure}
+\caption{Subfigures}
+\label{fig:labs}
+\end{figure}
+
+\newpage
+After a page break.
+\printindex
+\printnomenclature
+\end{document}

@@ -1,0 +1,27 @@
+\documentclass[aspectratio=169]{beamer}
+\usepackage[spanish]{babel}
+\usepackage[T1]{fontenc}
+\usepackage[backend=biber,style=authoryear]{biblatex}
+\addbibresource{references.bib}
+
+\title{Prueba de bibliografía — Beamer}
+\author{TeXFlow test}
+\date{\today}
+
+\begin{document}
+\begin{frame}
+\titlepage
+\end{frame}
+
+\begin{frame}{Citas}
+La evidencia institucional puede citarse así \parencite{acemoglu2001}.
+
+Según \textcite{angrist2009}, una buena estrategia empírica requiere diseño.
+
+Dos trabajos juntos: \parencite{acemoglu2001,heckman1979}.
+\end{frame}
+
+\begin{frame}[allowframebreaks]{Referencias}
+\printbibliography
+\end{frame}
+\end{document}

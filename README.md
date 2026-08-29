@@ -1,86 +1,95 @@
 # TeXFlow
 
-TeXFlow is a visual editor for real LaTeX files inside VS Code.
+## Write LaTeX, without writing LaTeX.
 
-It keeps `.tex` as the source of truth while letting you edit Beamer slides and document-mode content visually, with synced PDF preview and source-aware updates.
+TeXFlow is a visual editor for real LaTeX files inside VS Code. It lets you focus on writing while keeping your `.tex` files intact, editable, and fully accessible.
 
-![TeXFlow screenshot placeholder](media/texflow-icon.png)
+**Current stable release: 0.14.2.**
 
-## What it supports today
+TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` file remains the source of truth. When TeXFlow cannot safely edit a complex construct visually, it preserves the underlying LaTeX rather than silently rewriting it.
 
-- Beamer Visual Mode.
-- Document Mode for `article`, `report`, and `book`.
+## Highlights
+
+- Visual editing for `article`, `report`, `book`, and Beamer documents.
+- Semantic paragraphs, headings, lists, and document structure.
+- Bold, italic, underline, color, and paragraph alignment.
+- Inline and display mathematics, equations, `align`, `gather`, `multline`, cases, and matrices.
+- Citations, bibliography workflows, labels, and cross-references.
+- Figures with captions, labels, resize, rotation, and subfigures.
+- Tables with row/column editing, alignment, captions, labels, Booktabs, and CSV/TSV import.
+- Document spacing, local columns, document settings, and raw preamble access.
+- Beamer frames, blocks, columns, and frame options.
+- Copy, cut, paste, duplicate, and move selected semantic objects.
 - Visual, Source, Split, and PDF workflows.
-- Inline and display math editing.
-- Lists and common structural content.
-- TOC-aware document structure in supported modes.
-
-## Support matrix
-
-| Capability | Beamer | Article | Report | Book |
-| --- | --- | --- | --- | --- |
-| Visual mode | supported | supported | supported | supported |
-| Visual editing | supported | supported | supported | supported |
-| Math editing | supported | supported | supported | supported |
-| Lists | supported | supported | supported | supported |
-| Frames | supported | planned | planned | planned |
-| Chapters | planned | supported | supported | supported |
-| TOC | supported | supported | supported | supported |
-| PDF | supported | supported | supported | supported |
-| Bibliography | planned | planned | planned | planned |
+- Conservative preservation of unsupported LaTeX.
 
 ## Installation
 
-1. Build or obtain the VSIX.
+### Visual Studio Marketplace
+
+Install **TeXFlow — Visual LaTeX** from the VS Code Extensions view, or use the Marketplace listing:
+
+https://marketplace.visualstudio.com/items?itemName=leandrozipitria.texflow
+
+### Install from VSIX
+
+1. Download the `.vsix` from the GitHub release.
 2. In VS Code, open the Extensions view.
-3. Use `Install from VSIX...`.
-4. Select the TeXFlow VSIX.
+3. Choose **Install from VSIX...**.
+4. Select the TeXFlow package.
 
 ## Requirements
 
-- VS Code
-- A working LaTeX installation
-- `latexmk` for the bundled fixture checks
+- VS Code 1.90 or newer.
+- A working local LaTeX distribution such as TeX Live or MiKTeX.
+- The tools required by your document, for example `latexmk`, `bibtex`, or `biber` when applicable.
 
-## Basic workflow
+## Quick start
 
-1. Open a `.tex` file.
-2. Choose Visual, Source, Split, or PDF.
-3. Edit the document visually or in source.
-4. Let TeXFlow sync changes back to the file.
-5. Compile and inspect the resulting PDF.
+1. Open a `.tex` file in VS Code.
+2. Run **TeXFlow: Open Visual LaTeX Editor**.
+3. Edit in Visual mode, or switch between Visual, Source, Split, and PDF.
+4. Compile with your local LaTeX toolchain.
+5. Return to Source at any time: the `.tex` file remains canonical.
 
-## Beamer Mode
+## Documentation
 
-Beamer documents are edited frame by frame. TeXFlow supports visible text, lists, and math in presentation slides.
+- [User Manual](docs/USER_MANUAL.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Development and architecture](docs/DEVELOPMENT.md)
+- [Changelog](CHANGELOG.md)
 
-## Document Mode
+## Design principle
 
-TeXFlow supports `article`, `report`, and `book` in a continuous visual layout with structural navigation for headings and TOC-aware content.
+TeXFlow is intentionally conservative. Visual editing is used where the source can be parsed and serialized safely. Unsupported or highly customized LaTeX is preserved so that opening a document in TeXFlow does not require converting it to another document format.
 
-## Compilation
+LyX is used only as a technical reference for structural-editing problems that mature LaTeX editors have already confronted, such as paragraph semantics, embedded objects, cursor boundaries, and source preservation. TeXFlow's interface and visual editors are independent product decisions.
 
-TeXFlow does not replace LaTeX compilation. It helps you edit the `.tex` source and inspect the resulting PDF.
-
-## Development and tests
+## Development
 
 ```bash
-npm install
+npm ci
 npm run compile
+```
+
+Run the regression fixtures with:
+
+```bash
 bash tests/run_fixtures.sh
 ```
 
-> Development note: the current `package-lock.json` still references registry tarballs from an internal Artifactory mirror. The public TeXFlow source and fixtures are ready, but a fully reproducible `npm ci` needs registry normalization before it can be treated as a clean public build step.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
-## Known limitations
+## Author and development approach
 
-- Bibliography support is planned, not complete.
-- Advanced visual figure editing is not yet a full replacement for source editing.
-- Table editing is not a public promise in this release.
+**Created by Leandro Zipitria.**
 
-## Roadmap
+TeXFlow was designed and developed through an iterative human–AI collaboration. The product concept, design decisions, testing, and development direction are by Leandro Zipitria. Implementation code was generated with OpenAI's ChatGPT under the creator's direction and testing.
 
-- Bibliography workflows.
-- Better figure editing.
-- Stronger document structure tools.
-- More regression coverage.
+## Repository
+
+https://github.com/LeandroZipitria/texflow
+
+## License
+
+MIT. See [LICENSE](LICENSE).

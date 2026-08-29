@@ -1,0 +1,30 @@
+\documentclass[11pt,a4paper]{book}
+\usepackage[spanish]{babel}
+\usepackage[T1]{fontenc}
+\usepackage[backend=biber,style=authoryear]{biblatex}
+\addbibresource{references.bib}
+
+\title{Prueba de bibliografía — Book}
+\author{TeXFlow test}
+\date{\today}
+
+\begin{document}
+\frontmatter
+\maketitle
+\tableofcontents
+
+\mainmatter
+\chapter{Introducción}
+La discusión comienza con \textcite{acemoglu2001}.
+También usamos una cita parentética \parencite{angrist2009}.
+
+\chapter{Evidencia}
+\section{Selección}
+Un trabajo clásico es \textcite{heckman1979}.
+
+\section{Reportes y recursos}
+Se incluyen un reporte \parencite{worldbank2024} y un recurso online \parencite{ourworld2025}.
+
+\backmatter
+\printbibliography[heading=bibintoc,title={Bibliografía}]
+\end{document}

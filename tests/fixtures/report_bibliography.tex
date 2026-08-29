@@ -1,0 +1,27 @@
+\documentclass[11pt,a4paper]{report}
+\usepackage[spanish]{babel}
+\usepackage[T1]{fontenc}
+\usepackage[backend=biber,style=authoryear]{biblatex}
+\addbibresource{references.bib}
+
+\title{Prueba de bibliografía — Report}
+\author{TeXFlow test}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Marco conceptual}
+\section{Instituciones}
+Un ejemplo de artículo académico es \textcite{acemoglu2001}.
+Una referencia parentética puede ser \parencite{worldbank2024}.
+
+\section{Métodos}
+Los métodos econométricos se discuten extensamente en \textcite{angrist2009} y \textcite{heckman1979}.
+
+\chapter{Fuentes adicionales}
+Una fuente web puede citarse con \parencite{ourworld2025}.
+
+\printbibliography[heading=bibintoc,title={Referencias}]
+\end{document}

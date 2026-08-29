@@ -1,0 +1,31 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{multicol}
+\begin{document}
+\section{Caret boundaries}
+A paragraph must remain whole before an equation.
+
+\begin{equation}
+\alpha+\beta=\theta
+\end{equation}
+
+A paragraph must remain whole after an equation and before a figure.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=.25\linewidth]{figure_sample.png}
+\caption{Boundary fixture}
+\label{fig:boundary}
+\end{figure}
+
+A paragraph must remain whole after a figure and before columns.
+
+\begin{multicols}{2}
+Column one text.
+\columnbreak
+Column two text.
+\end{multicols}
+
+A final paragraph must remain whole after columns.
+\end{document}
