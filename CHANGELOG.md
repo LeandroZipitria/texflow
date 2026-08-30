@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.14.3 — 2026-08-29
+
+- Fixed Beamer `block`, `alertblock`, and `exampleblock` collapsing when they coexist with columns.
+- Fixed the Beamer columns Visual layout so column cells are actually displayed side by side instead of stacking vertically.
+- Rendered `\[ ... \]` display mathematics inside editable Beamer blocks with KaTeX while preserving the LaTeX delimiters on serialization.
+- Added Beamer frame-local text size controls (`Normal`, `Small`, `Footnotesize`, `Scriptsize`, `Tiny`) under the Beamer menu, preserving standard LaTeX size commands.
+- Added a focused Beamer regression fixture and validation plan.
+- No changes to tables, figures, citations, general text, or top-level math handling.
+
 ## 0.14.2 — 2026-08-29
 
 - Fixed Cmd/Ctrl+V for copied/cut semantic objects so native system-clipboard text cannot be pasted in addition to the TeXFlow object.

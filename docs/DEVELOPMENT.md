@@ -46,4 +46,4 @@ Every new semantic object should be tested for:
 
 Never overwrite a build that has been given to the tester. Each experiment/fix gets a new version identifier. Stable baselines are promoted only after manual validation.
 
-`0.14.2` is the current stable release baseline. New functionality should be developed in a new version and promoted only after regression and manual validation.
+`0.14.3` is the current stable release baseline. New functionality should be developed in a new version and promoted only after regression and manual validation.

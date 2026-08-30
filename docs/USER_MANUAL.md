@@ -8,7 +8,7 @@ TeXFlow is a visual editor for LaTeX and Beamer inside VS Code. It is designed t
 
 TeXFlow follows a conservative rule: structures it understands are shown as semantic visual objects; structures it does not understand are preserved as LaTeX rather than silently rewritten.
 
-> This manual documents the stable `0.14.2` release. TeXFlow remains conservative: unsupported complex constructs are preserved as LaTeX rather than rewritten.
+> This manual documents the stable `0.14.3` release. TeXFlow remains conservative: unsupported complex constructs are preserved as LaTeX rather than rewritten.
 
 ## 2. Installation and requirements
 
@@ -186,7 +186,7 @@ Author notes are encoded as marked source comments and never appear in the PDF.
 
 ## 16. Beamer
 
-Beamer documents expose a dedicated **Beamer** menu. Supported features include frames, blocks, alert/example blocks, columns and frame options such as vertical alignment, `fragile` and `allowframebreaks`.
+Beamer documents expose a dedicated **Beamer** menu. Supported features include frames, blocks, alert/example blocks, columns, frame-local text size (`Normal`, `Small`, `Footnotesize`, `Scriptsize`, `Tiny`), and frame options such as vertical alignment, `fragile` and `allowframebreaks`.
 
 Math, figures, tables, citations and other shared objects reuse the same visual concepts where possible.
 
