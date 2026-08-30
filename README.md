@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="media/texflow-icon.png" alt="TeXFlow logo" width="160">
+</p>
+
 # TeXFlow
 
 ## Write LaTeX, without writing LaTeX.
@@ -57,6 +61,7 @@ https://marketplace.visualstudio.com/items?itemName=leandrozipitria.texflow
 - [User Manual](docs/USER_MANUAL.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Development and architecture](docs/DEVELOPMENT.md)
+- [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
 
 ## Design principle
