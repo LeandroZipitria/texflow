@@ -38,6 +38,31 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "TeXFlow",
+      "properties": {
+        "texflow.spellCheck.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable local spell checking in the TeXFlow visual editor."
+        },
+        "texflow.spellCheck.language": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "en",
+            "es"
+          ],
+          "enumDescriptions": [
+            "Automatic",
+            "English",
+            "Español"
+          ],
+          "description": "Preferred spell checking language."
+        }
+      }
+    },
     "commands": [
       {
         "command": "texflow.openVisualEditor",
@@ -85,5 +110,9 @@
     "@vscode/vsce": "^3.9.2",
     "typescript": "^7.0.2"
   },
-  "icon": "media/texflow-icon.png"
+  "icon": "media/texflow-icon.png",
+  "dependencies": {
+    "@cspell/dict-es-es": "^3.0.8",
+    "cspell-lib": "^9.8.0"
+  }
 }

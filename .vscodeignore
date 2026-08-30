@@ -4,7 +4,6 @@
 src/**
 tests/**
 documentation/**
-node_modules/**
 *.zip
 *.vsix
 *.log
