@@ -20,7 +20,7 @@ source "$ROOT_DIR/tests/lib/latex_integrity.sh"
 LATEXMK="${LATEXMK:-$(command -v latexmk)}"
 
 status=0
-for tex in "$FIXTURES_DIR"/*.tex; do
+while IFS= read -r tex; do
   base="$(basename "$tex" .tex)"
   workdir="$OUT_DIR/work/$base"
   rm -rf "$workdir"
@@ -39,5 +39,5 @@ for tex in "$FIXTURES_DIR"/*.tex; do
     cp "$LOG_DIR/$base.log" "$FAIL_DIR/$base.log"
     status=1
   fi
-done
+done < <(find "$FIXTURES_DIR" -type f -name '*.tex' | sort)
 exit "$status"
