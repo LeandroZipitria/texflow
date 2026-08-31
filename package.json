@@ -112,6 +112,7 @@
   },
   "icon": "media/texflow-icon.png",
   "dependencies": {
+    "@cspell/dict-en_us": "^4.4.37",
     "@cspell/dict-es-es": "^3.0.8",
     "cspell-lib": "^9.8.0"
   }

@@ -15,6 +15,10 @@ declare module 'cspell-lib' {
   export interface SpellCheckDocumentSettings {
     words?: string[];
     suggestionsTimeout?: number;
+    loadDefaultConfiguration?: boolean;
+    language?: string;
+    dictionaries?: string[];
+    dictionaryDefinitions?: { name: string; path: string; description: string }[];
   }
 
   export interface SpellCheckIssue {

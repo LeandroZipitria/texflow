@@ -37,19 +37,31 @@ function normalizeSuggestions(suggestions: unknown): string[] {
 }
 
 function spellcheckSettings(language: SpellcheckLanguage) {
+  const englishDictionaryDir = path.dirname(require.resolve('@cspell/dict-en_us/cspell-ext.json'));
   const settings: {
     words: string[];
     suggestionsTimeout: number;
+    loadDefaultConfiguration: boolean;
     language?: string;
     dictionaries?: string[];
     dictionaryDefinitions?: { name: string; path: string; description: string }[];
-  } = { words: [], suggestionsTimeout: 250 };
+  } = {
+    words: [],
+    suggestionsTimeout: 250,
+    loadDefaultConfiguration: false,
+    language: language === 'es' ? 'es-ES' : 'en-US',
+    dictionaries: ['en_us'],
+    dictionaryDefinitions: [{
+      name: 'en_us',
+      path: path.join(englishDictionaryDir, 'en_US.trie.gz'),
+      description: 'American English Dictionary'
+    }]
+  };
 
   if (language === 'es') {
     const dictionaryDir = path.dirname(require.resolve('@cspell/dict-es-es/cspell-ext.json'));
-    settings.language = 'es-ES';
     settings.dictionaries = ['es-es'];
-    settings.dictionaryDefinitions = [{
+    settings.dictionaryDefinitions = [...(settings.dictionaryDefinitions || []), {
       name: 'es-es',
       path: path.join(dictionaryDir, 'Spanish.trie.gz'),
       description: 'Spanish Dictionary (Spain)'

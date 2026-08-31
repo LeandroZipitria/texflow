@@ -4,6 +4,9 @@
 src/**
 tests/**
 documentation/**
+node_modules/@cspell/dict-*/**
+!node_modules/@cspell/dict-en_us/**
+!node_modules/@cspell/dict-es-es/**
 *.zip
 *.vsix
 *.log
