@@ -11,7 +11,7 @@ node_modules/
 *.out
 *.synctex.gz
 tests/output/
+tests/manual/
 out/
 .DS_Store
 Thumbs.db
-

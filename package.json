@@ -2,7 +2,7 @@
   "name": "texflow",
   "displayName": "TeXFlow — Visual LaTeX",
   "description": "A visual editor for real LaTeX and Beamer files in VS Code, with semantic text editing, math, citations, references, figures, tables, layout tools, and source-preserving round trips.",
-  "version": "0.14.3",
+  "version": "0.15.0",
   "publisher": "leandrozipitria",
   "license": "MIT",
   "homepage": "https://github.com/LeandroZipitria/texflow#readme",
@@ -38,6 +38,31 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "TeXFlow",
+      "properties": {
+        "texflow.spellCheck.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable local spell checking in the TeXFlow visual editor."
+        },
+        "texflow.spellCheck.language": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "en",
+            "es"
+          ],
+          "enumDescriptions": [
+            "Automatic",
+            "English",
+            "Español"
+          ],
+          "description": "Preferred spell checking language."
+        }
+      }
+    },
     "commands": [
       {
         "command": "texflow.openVisualEditor",
@@ -85,5 +110,10 @@
     "@vscode/vsce": "^3.9.2",
     "typescript": "^7.0.2"
   },
-  "icon": "media/texflow-icon.png"
+  "icon": "media/texflow-icon.png",
+  "dependencies": {
+    "@cspell/dict-en_us": "^4.4.37",
+    "@cspell/dict-es-es": "^3.0.8",
+    "cspell-lib": "^9.8.0"
+  }
 }
