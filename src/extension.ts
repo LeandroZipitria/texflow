@@ -1965,10 +1965,74 @@ function parseBlocks(body: string): ParsedBlock[] {
   let cursor = 0;
   let count = 0;
   let m: RegExpExecArray | null;
+  let currentAlign: 'left' | 'center' | 'right' | 'justify' = 'justify';
+
+  const alignmentFromDirective = (
+    raw: string,
+    current: 'left' | 'center' | 'right' | 'justify' = 'justify'
+  ): 'left' | 'center' | 'right' | 'justify' => {
+    const matches = [...String(raw || '').matchAll(/\\(centering|raggedright|raggedleft|justifying)\b/g)];
+    if (!matches.length) return current;
+    const command = matches[matches.length - 1][1];
+    if (command === 'centering') return 'center';
+    if (command === 'raggedright') return 'left';
+    if (command === 'raggedleft') return 'right';
+    return 'justify';
+  };
+
+  const isOnlyAlignmentDirective = (raw: string): boolean =>
+    /^(?:\s|%[^\n]*(?:\n|$))*\\(?:centering|raggedright|raggedleft|justifying)\b\s*(?:%[^\n]*)?\s*$/.test(String(raw || ''));
 
   const pushText = (s: number, e: number) => {
     const raw = body.slice(s, e);
     if (!raw.trim()) return;
+
+    if (s === 0) {
+      const size = /^((?:(?:[ \t\r\n]+)|(?:[ \t]*%[^\n]*(?:\r?\n|$)))*)\\(?:normalsize|small|footnotesize|scriptsize|tiny)\b[ \t]*(?:%[^\n]*)?(?:\r?\n)?/.exec(raw);
+      if (size) {
+        const prefix = String(size[1] || '');
+        const commandStart = s + prefix.length;
+        const commandEnd = s + size[0].length;
+
+        if (prefix) pushText(s, commandStart);
+
+        blocks.push({
+          id: `b${count++}`,
+          kind: 'raw',
+          start: commandStart,
+          end: commandEnd,
+          raw: body.slice(commandStart, commandEnd),
+          text: body.slice(commandStart, commandEnd).trim()
+        });
+
+        if (commandEnd < e) pushText(commandEnd, e);
+        return;
+      }
+    }
+
+    const alignmentDirective = /(^|\r?\n)([ \t]*\\(centering|raggedright|raggedleft|justifying)\b[ \t]*(?:%[^\n]*)?)(?=\r?\n|$)/m.exec(raw);
+    if (alignmentDirective) {
+      const linePrefix = String(alignmentDirective[1] || '');
+      const command = String(alignmentDirective[3] || '');
+      const commandStart = s + (alignmentDirective.index ?? 0) + linePrefix.length;
+      const commandEnd = commandStart + String(alignmentDirective[2] || '').length;
+
+      if (commandStart > s) pushText(s, commandStart);
+
+      blocks.push({
+        id: `b${count++}`,
+        kind: 'raw',
+        start: commandStart,
+        end: commandEnd,
+        raw: body.slice(commandStart, commandEnd),
+        text: body.slice(commandStart, commandEnd).trim()
+      });
+
+      currentAlign = alignmentFromDirective(`\\${command}`, currentAlign);
+
+      if (commandEnd < e) pushText(commandEnd, e);
+      return;
+    }
 
     const trimmedRaw = raw.trim();
     if (trimmedRaw && trimmedRaw.split(/\r?\n/).every(line => /^\s*%/.test(line))) {
@@ -1994,10 +2058,27 @@ function parseBlocks(body: string): ParsedBlock[] {
       return;
     }
 
-    // A blank line is a paragraph boundary in LaTeX. Keep those separators
-    // outside editable ranges: TeXFlow edits paragraph content, never the
-    // structural whitespace that separates it from headings/environments.
-    if (isSafeParagraph(raw)) {
+    const nextAlign = alignmentFromDirective(raw, currentAlign);
+
+    if (isOnlyAlignmentDirective(raw)) {
+      const lead = raw.search(/\S/);
+      const trailMatch = /\s*$/.exec(raw);
+      const trail = trailMatch ? trailMatch[0].length : 0;
+      const start = lead < 0 ? s : s + lead;
+      const end = e - trail;
+      const cleanRaw = body.slice(start, end);
+      if (cleanRaw) blocks.push({ id: `b${count++}`, kind: 'raw', start, end, raw: cleanRaw, text: cleanRaw });
+      currentAlign = nextAlign;
+      return;
+    }
+
+    // Match the webview safety classification exactly. Alignment directives
+    // are semantic state, not a reason to classify the whole chunk as raw.
+    const unsafe =
+      /^(?:\s*%|\s*\\(?:newpage|clearpage|pagebreak)\b)/m.test(raw) ||
+      /\\(begin|end|input|include|hypertarget|label|only|visible|uncover|pause|vspace|includegraphics|tikz)/.test(raw);
+
+    if (!unsafe) {
       const sep = /\n[ \t]*\n+/g;
       let local = 0;
       const pushSegment = (a: number, b: number) => {
@@ -2011,7 +2092,9 @@ function parseBlocks(body: string): ParsedBlock[] {
         const segEnd = s + b - trail;
         if (segEnd <= segStart) return;
         const text = body.slice(segStart, segEnd);
-        blocks.push({ id: `b${count++}`, kind: 'paragraph', start: segStart, end: segEnd, raw: text, text });
+        const block: ParsedBlock = { id: `b${count++}`, kind: 'paragraph', start: segStart, end: segEnd, raw: text, text };
+        (block as any).align = nextAlign;
+        blocks.push(block);
       };
       let sm: RegExpExecArray | null;
       while ((sm = sep.exec(raw))) {
@@ -2019,6 +2102,7 @@ function parseBlocks(body: string): ParsedBlock[] {
         local = sep.lastIndex;
       }
       pushSegment(local, raw.length);
+      currentAlign = nextAlign;
       return;
     }
 
@@ -2029,6 +2113,7 @@ function parseBlocks(body: string): ParsedBlock[] {
     const end = e - trail;
     const cleanRaw = body.slice(start, end);
     if (cleanRaw) blocks.push({ id: `b${count++}`, kind: 'raw', start, end, raw: cleanRaw, text: cleanRaw });
+    currentAlign = nextAlign;
   };
 
   while ((m = tokenRe.exec(body))) {
@@ -2110,7 +2195,7 @@ function parseBlocks(body: string): ParsedBlock[] {
         block.columnCount = Math.max(2, Math.min(4, Number(m[2]) || 2));
         // Article multicols is one flowing text stream. Manual column breaks are
         // preserved as source text instead of being turned into separate editors.
-        block.columnTexts = [inner.trim()];
+        block.columnTexts = inner.split(/\\columnbreak\b/).map(x => x.trim());
       } else {
         const parts = [...inner.matchAll(/\\column\{[^}]+\}([\s\S]*?)(?=\\column\{|$)/g)].map(x => String(x[1] || '').trim());
         block.columnTexts = parts.length ? parts : [inner];
@@ -2143,7 +2228,7 @@ function isSafeParagraph(raw: string): boolean {
   const t = raw.trim();
   if (!t) return false;
   if (/^(?:%|\\(?:newpage|clearpage|pagebreak)\b)/m.test(t)) return false;
-  if (/\\(begin|end|input|include|hypertarget|label|only|visible|uncover|pause|vspace|centering|includegraphics|tikz)/.test(t)) return false;
+  if (/\\(begin|end|input|include|hypertarget|label|only|visible|uncover|pause|vspace|includegraphics|tikz)/.test(t)) return false;
   return true;
 }
 
@@ -2236,7 +2321,10 @@ function serializeBlock(block: ParsedBlock, payload: any): string {
   if (block.kind === 'columns') {
     const texts = (payload.texts || block.columnTexts || []).map((x: unknown) => String(x ?? '').trim());
     const count = Math.max(2, Math.min(4, Number(payload.count || block.columnCount || texts.length || 2)));
-    if (block.env === 'multicols') return `\\begin{multicols}{${count}}\n${String(texts[0] || '').trim()}\n\\end{multicols}`;
+    if (block.env === 'multicols') {
+      const content = texts.slice(0, count).map((x: string) => x.trim()).join('\n\\columnbreak\n');
+      return `\\begin{multicols}{${count}}\n${content}\n\\end{multicols}`;
+    }
     const widths = Array.from({ length: count }, () => Number((0.96 / count).toFixed(3)));
     return `\\begin{columns}[T]\n${widths.map((w,i)=>`\\column{${w}\\textwidth}\n${texts[i] || ''}`).join('\n')}\n\\end{columns}`;
   }
@@ -2547,7 +2635,7 @@ body{display:flex;flex-direction:column}
 .cite-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.46);display:none;align-items:center;justify-content:center;z-index:260}.cite-modal-backdrop.open{display:flex}.cite-modal{width:min(760px,calc(100vw - 34px));max-height:min(720px,calc(100vh - 34px));display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line-strong);border-radius:14px;box-shadow:0 28px 70px rgba(0,0,0,.42);overflow:hidden}.cite-modal-head,.cite-modal-foot{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}.cite-modal-foot{border-bottom:0;border-top:1px solid var(--line);justify-content:flex-end}.cite-modal-body{padding:14px;overflow:auto}.cite-search-row{display:grid;grid-template-columns:1fr 150px;gap:10px;margin-bottom:12px}.cite-search,.cite-style{width:100%;box-sizing:border-box;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:7px;padding:8px 10px;font:inherit}.cite-results{display:flex;flex-direction:column;gap:7px}.cite-result{display:grid;grid-template-columns:22px 1fr;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer;background:transparent;color:var(--fg);text-align:left}.cite-result:hover{background:var(--hover)}.cite-result.selected{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}.cite-result-main{min-width:0}.cite-result-title{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cite-result-meta{font-size:.82em;color:var(--muted);margin-top:2px}.cite-empty{padding:20px;color:var(--muted);text-align:center}.cite-check{align-self:center}.cite-close,.cite-cancel,.cite-insert,.cite-secondary{border:1px solid var(--line-strong);background:var(--button);color:var(--button-fg);border-radius:7px;padding:7px 11px;cursor:pointer}.cite-insert{background:var(--accent);color:var(--accent-fg);border-color:transparent}.cite-secondary{background:transparent;color:var(--fg)}.cite-secondary:disabled,.cite-insert:disabled{opacity:.45;cursor:default}.cite-preview{font-size:.78em;color:var(--muted);display:block;margin-top:2px}.cite-menu-subtitle{margin-top:8px;padding-top:9px;border-top:1px solid var(--line)}.doc-outline-bibliography{font-weight:650;color:var(--fg);margin-top:9px}.doc-outline-bibliography.pending{color:var(--muted);font-weight:500;font-style:italic}
 
 .settings-shell{display:grid;grid-template-columns:minmax(280px,420px) minmax(0,1fr);gap:16px;padding:18px;min-height:100%;box-sizing:border-box}.settings-card{border:1px solid var(--line);border-radius:10px;background:var(--paper);padding:16px}.settings-card h3{margin:0 0 12px;font-size:14px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settings-field{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--muted)}.settings-field.wide{grid-column:1/-1}.settings-field input,.settings-field select,.settings-field textarea{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:7px 8px;font:inherit}.settings-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}.settings-note{font-size:11px;color:var(--muted);line-height:1.45;margin-top:10px}.doc-columns,.columns-card{display:grid;gap:10px;margin:18px 0}.columns-grid{display:grid;gap:10px}.doc-column,.column-edit{min-height:90px;padding:10px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--paper) 97%,var(--accent) 3%);outline:none}
-.slide .beamer-block{margin:.75em 0}.slide .beamer-block .head{padding:.5em .75em}.slide .beamer-block .body{padding:.75em}.slide .columns-card{gap:.625em;margin:1.125em 0}.slide .columns-grid{gap:.625em}.slide .column-edit{min-height:5.625em;padding:.625em}.slide .columns-head{font-size:.6875em}.slide .trailing-paragraph{margin-top:.5em;padding:.3125em .4375em}.doc-column:focus,.column-edit:focus{box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 55%,transparent)}.doc-columns-flow{display:block;margin:18px 0;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:color-mix(in srgb,var(--paper) 98%,var(--accent) 2%)}.doc-column-flow{min-height:110px;padding:8px;outline:none;column-gap:28px;column-rule:1px solid color-mix(in srgb,var(--line) 65%,transparent)}.doc-column-flow:focus{box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 55%,transparent);border-radius:5px}.subfigure-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;width:100%}.subfigure-item{border:1px solid var(--line);border-radius:7px;padding:8px;background:color-mix(in srgb,var(--paper) 97%,var(--fg) 3%)}.subfigure-item img,.subfigure-item object{display:block;width:100%;max-height:260px;object-fit:contain}.subfigure-name{font-size:10px;color:var(--muted);margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.columns-head{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:11px}.symbol-search{width:100%;box-sizing:border-box;margin-bottom:8px;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:6px 8px;font:inherit}@media(max-width:900px){.settings-shell{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr}}
+.slide .beamer-block{margin:.75em 0}.slide .beamer-block .head{padding:.5em .75em}.slide .beamer-block .body{padding:.75em}.slide .columns-card{gap:.625em;margin:1.125em 0;flex-shrink:0}.slide .columns-grid{gap:.625em;align-items:stretch}.slide .column-edit{min-height:5.625em;height:auto;padding:.625em;overflow:visible;align-self:stretch}.slide .columns-head{font-size:.6875em}.slide .trailing-paragraph{margin-top:.5em;padding:.3125em .4375em}.doc-column:focus,.column-edit:focus{box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 55%,transparent)}.doc-columns-flow{display:block;margin:18px 0;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:color-mix(in srgb,var(--paper) 98%,var(--accent) 2%)}.doc-column-flow{min-height:110px;padding:8px;outline:none;column-gap:28px;column-rule:1px solid color-mix(in srgb,var(--line) 65%,transparent)}.doc-column-flow:focus{box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 55%,transparent);border-radius:5px}.subfigure-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;width:100%}.subfigure-item{border:1px solid var(--line);border-radius:7px;padding:8px;background:color-mix(in srgb,var(--paper) 97%,var(--fg) 3%)}.subfigure-item img,.subfigure-item object{display:block;width:100%;max-height:260px;object-fit:contain}.subfigure-name{font-size:10px;color:var(--muted);margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.columns-head{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:11px}.symbol-search{width:100%;box-sizing:border-box;margin-bottom:8px;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:6px 8px;font:inherit}@media(max-width:900px){.settings-shell{grid-template-columns:1fr}.settings-grid{grid-template-columns:1fr}}
 </style></head><body class="nav-open"><header class="topbar"><div class="topbar-brand" aria-label="TeXFlow"><span class="brand-full">TeXFlow</span><span class="brand-short">TF</span></div><div class="top-menu" id="file-menu"><button class="top-action menu-label" id="file-menu-button">File ▾</button><div class="top-menu-panel"><button id="new-document">New document…</button><span class="menu-divider"></span><button id="open-file" title="Open (Ctrl/Cmd+O)">Open…</button><button id="save-file" title="Save (Ctrl/Cmd+S)">Save</button><button id="save-as" title="Save as (Ctrl/Cmd+Shift+S)">Save as…</button></div></div><div class="top-menu" id="edit-menu"><button class="top-action menu-label" id="edit-menu-button">Edit ▾</button><div class="top-menu-panel"><button id="undo" title="Undo">↶ Undo</button><button id="redo" title="Redo">↷ Redo</button><span class="menu-divider"></span><button id="labs-find-replace">Find / Replace…</button><span class="menu-divider"></span><div class="menu-title">Selected object</div><button id="labs-copy-object">Copy object</button><button id="labs-paste-object">Paste object</button><button id="labs-duplicate-object">Duplicate object</button><button id="labs-move-up">Move up</button><button id="labs-move-down">Move down</button></div></div><div class="top-menu" id="structure-menu"><button class="top-action menu-label" id="structure-menu-button">Structure ▾</button><div class="top-menu-panel wide-menu" id="structure-menu-panel"></div></div><div class="top-menu" id="insert-menu"><button class="top-action menu-label" id="insert-menu-button">Insert ▾</button><div class="top-menu-panel wide-menu" id="insert-menu-panel"></div></div><div class="top-menu" id="format-menu"><button class="top-action menu-label" id="format-menu-button">Format ▾</button><div class="top-menu-panel"><div class="menu-title">Text</div><button class="format" data-format="bold"><b>B</b>&nbsp;&nbsp;Bold</button><button class="format" data-format="italic"><i>I</i>&nbsp;&nbsp;Italic</button><button class="format" data-format="underline"><u>U</u>&nbsp;&nbsp;Underline</button><button class="format" data-format="key">K&nbsp;&nbsp;Key</button><button class="format" data-format="alert">!&nbsp;&nbsp;Alert</button><span class="menu-divider"></span><div class="menu-title">Paragraph alignment</div><button class="insert" data-action="alignleft">Align left</button><button class="insert" data-action="aligncenter">Center</button><button class="insert" data-action="alignright">Align right</button><button class="insert" data-action="alignjustify">Justify / normal</button><span class="menu-divider"></span><div class="menu-title">Text color</div><div class="color-grid top-color-grid"><button class="color-swatch" data-color="black" title="black" style="background:black"></button><button class="color-swatch" data-color="gray" title="gray" style="background:gray"></button><button class="color-swatch" data-color="red" title="red" style="background:red"></button><button class="color-swatch" data-color="orange" title="orange" style="background:orange"></button><button class="color-swatch" data-color="yellow" title="yellow" style="background:yellow"></button><button class="color-swatch" data-color="green" title="green" style="background:green"></button><button class="color-swatch" data-color="blue" title="blue" style="background:blue"></button><button class="color-swatch" data-color="cyan" title="cyan" style="background:cyan"></button><button class="color-swatch" data-color="magenta" title="magenta" style="background:magenta"></button><button class="color-swatch" data-color="purple" title="purple" style="background:purple"></button><button class="color-swatch" data-color="brown" title="brown" style="background:brown"></button></div></div></div><div class="top-menu" id="references-menu"><button class="top-action menu-label" id="references-menu-button">References ▾</button><div class="top-menu-panel wide-menu" id="references-menu-panel"></div></div><div class="top-menu" id="layout-menu-top"><button class="top-action menu-label" id="layout-menu-button">Layout ▾</button><div class="top-menu-panel wide-menu" id="layout-menu-panel"></div></div><div class="top-menu" id="language-menu-top"><button class="top-action menu-label" id="language-menu-button">Language ▾</button><div class="top-menu-panel"><button id="spell-language-automatic">Automatic</button><button id="spell-language-english">English</button><button id="spell-language-spanish">Español</button><span class="menu-divider"></span><button id="spell-check-toggle">Spell checking</button></div></div><div class="top-menu beamer-only" id="beamer-menu-top"><button class="top-action menu-label" id="beamer-menu-button">Beamer ▾</button><div class="top-menu-panel"><button class="insert" data-action="frame">New frame</button><span class="menu-divider"></span><div class="menu-title">Blocks</div><button class="insert" data-action="beamerblock">Block</button><button class="insert" data-action="beameralert">Alert block</button><button class="insert" data-action="beamerexample">Example block</button><span class="menu-divider"></span><div class="menu-title">Frame text size</div><button class="frame-size-option" data-frame-size="normal">✓ Normal</button><button class="frame-size-option" data-frame-size="small">Small</button><button class="frame-size-option" data-frame-size="footnotesize">Footnotesize</button><button class="frame-size-option" data-frame-size="scriptsize">Scriptsize</button><button class="frame-size-option" data-frame-size="tiny">Tiny</button><span class="menu-divider"></span><button class="insert" data-action="frameoptions">Frame options…</button></div></div><div class="top-menu" id="view-menu"><button class="top-action menu-label" id="view-menu-button">View ▾</button><div class="top-menu-panel"><button class="document-only" id="view-continuous">✓ Continuous</button><button class="document-only" id="view-pages">Pages</button><span class="menu-divider document-only"></span><button id="toggle-nav">Index / outline</button><button id="focus-mode">Focus mode</button><span class="menu-divider"></span><button id="project-diagnostics">Project diagnostics</button></div></div><span class="top-separator"></span><nav class="mode-tabs"><button class="mode-tab active" data-view="visual">Visual</button><button class="mode-tab" data-view="source">Source</button><button class="mode-tab" data-view="split">Split</button><button class="mode-tab" data-view="pdf">PDF</button></nav><span class="top-spacer topbar-spacer"></span><button class="top-action primary" id="top-compile">▶ Compile</button><span class="save-status" id="save-status">Saved</span></header><div class="floating-actions"><button class="floating-btn focus-exit" id="exit-focus" title="Exit focus mode">⛶</button></div><div id="app"><aside class="side"><div class="brand"><span class="brand-mark">T</span><span>Document</span></div><div id="nav"></div></aside><main class="main"><div id="content" class="empty">Loading…</div></main></div>
 <div class="math-modal-backdrop" id="math-modal" aria-hidden="true">
   <section class="math-modal" role="dialog" aria-modal="true" aria-labelledby="math-modal-title">
@@ -3277,6 +3365,7 @@ function updateDocumentNode(node,replacement,refresh=true,feature=''){
  const syntheticContent=wasSynthetic?String(replacement).trim():'';
  let finalReplacement=String(replacement);
  if(wasSynthetic)finalReplacement=syntheticContent?syntheticPrefix+syntheticContent+'\n\n':'';
+
  vscode.postMessage({type:'updateDocumentNode',start,end,expected,replacement:finalReplacement,refresh,feature});
  // Mirror only edits that still match the local source snapshot. Structural
  // separators stay outside editable ranges, including for a paragraph that is
@@ -3471,6 +3560,15 @@ function parseBlocks(body){
  function text(s,e){
   const raw=body.slice(s,e);if(!raw.trim())return;
   if(s===0){const size=/^((?:(?:[ \t\r\n]+)|(?:[ \t]*%[^\n]*(?:\r?\n|$)))*)\\(?:normalsize|small|footnotesize|scriptsize|tiny)\b[ \t]*(?:%[^\n]*)?(?:\r?\n)?/.exec(raw);if(size){const prefix=String(size[1]||''),commandStart=s+prefix.length,commandEnd=s+size[0].length;if(prefix)text(s,commandStart);out.push({id:'b'+n++,kind:'raw',start:commandStart,end:commandEnd,raw:body.slice(commandStart,commandEnd),text:body.slice(commandStart,commandEnd).trim(),hidden:true,align:currentAlign});if(commandEnd<e)text(commandEnd,e);return;}}
+  const alignmentDirective=/(^|\r?\n)([ \t]*\\(centering|raggedright|raggedleft|justifying)\b[ \t]*(?:%[^\n]*)?)(?=\r?\n|$)/m.exec(raw);
+  if(alignmentDirective){
+   const linePrefix=String(alignmentDirective[1]||''),command=String(alignmentDirective[3]||''),commandStart=s+(alignmentDirective.index||0)+linePrefix.length,commandEnd=commandStart+String(alignmentDirective[2]||'').length;
+   if(commandStart>s)text(s,commandStart);
+   currentAlign=alignmentFromDirective('\\'+command,currentAlign);
+   out.push({id:'b'+n++,kind:'raw',start:commandStart,end:commandEnd,raw:body.slice(commandStart,commandEnd),text:body.slice(commandStart,commandEnd).trim(),hidden:true,align:currentAlign});
+   if(commandEnd<e)text(commandEnd,e);
+   return;
+  }
   const trimmedRaw=raw.trim();if(trimmedRaw&&trimmedRaw.split(/\r?\n/).every(line=>/^\s*%/.test(line))){const lead=raw.search(/\S/),trail=(/\s*$/.exec(raw)||[''])[0].length,start=lead<0?s:s+lead,end=e-trail,clean=body.slice(start,end);const commentNote=/^\s*%\s*TeXFlow note:/i.test(clean),commentText=clean.replace(/^\s*%\s?/gm,'').replace(/^TeXFlow note:\s*/i,'');out.push({id:'b'+n++,kind:'comment',start,end,raw:clean,text:commentText,commentText,commentNote,align:currentAlign});return;}
   // Labels in ordinary document text are structural metadata, not raw visible
   // LaTeX. Split them out before the safety classification so a heading label
@@ -3544,23 +3642,23 @@ function renderWorkspace(){mode='frames';current=Math.max(0,Math.min(current,fra
 function renderFrame(i){current=i;renderWorkspace();if(window.innerWidth<900&&typeof setNav==='function')setNav(false);}
 function renderBlock(b,fi){const wrap=document.createElement('div');wrap.className='block '+alignClass(b.align,b.kind==='itemize'?'left':'justify');if(b.hidden){wrap.style.display='none';return wrap;}
  if(b.kind==='vspace'){wrap.className+=' vspace-block semantic-block';wrap.innerHTML='<span class="vspace-label">vertical '+esc((b.spaceStarred?'* ':'')+(b.spaceAmount||''))+'</span>';bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));return wrap;}
- if(b.kind==='paragraph'){wrap.innerHTML='<div class="editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const e=wrap.firstChild;attachEditor(e);const saveParagraph=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(e)},refresh});e.__texflowCommit=(text)=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text},refresh:true});e.__texflowSaveNow=()=>saveParagraph(false);e.addEventListener('input',()=>scheduleSave(e,saveParagraph));e.addEventListener('blur',()=>flushSave(e,saveParagraph));}
+ if(b.kind==='paragraph'){wrap.innerHTML='<div class="editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const e=wrap.firstChild;attachEditor(e);const saveParagraph=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(e)},refresh};vscode.postMessage(msg);};e.__texflowCommit=(text)=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text},refresh:true};vscode.postMessage(msg);};e.__texflowSaveNow=()=>saveParagraph(false);e.addEventListener('input',()=>scheduleSave(e,saveParagraph));e.addEventListener('blur',()=>flushSave(e,saveParagraph));}
  else if(b.kind==='itemize'){const list=createVisualList(b.env,b.items||[]);list.classList.add(alignClass(b.align,'left'));const saveList=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh});list.querySelectorAll('.item-text').forEach(edit=>{edit.__texflowCommit=(text)=>{setEditableLatex(edit,text);vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh:true});};});bindListEditing(list,saveList);wrap.appendChild(list)}
- else if(b.kind==='block'){wrap.className+=' beamer-block '+(b.env==='alertblock'?'alert':b.env==='exampleblock'?'example':'');wrap.innerHTML='<div class="head" contenteditable="true">'+latexToHtml(b.title)+'</div><div class="body editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const blockHead=wrap.querySelector('.head'),blockBody=wrap.querySelector('.body');attachEditor(blockHead);attachEditor(blockBody);const saveBlock=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{title:editorToLatex(blockHead),text:editableLatex(blockBody)},refresh});blockHead.__texflowCommit=(text)=>{setEditableLatex(blockHead,text);saveBlock(true);};blockHead.__texflowSaveNow=()=>saveBlock(false);blockBody.__texflowCommit=(text)=>{setEditableLatex(blockBody,text);saveBlock(true);};blockBody.__texflowSaveNow=()=>saveBlock(false);wrap.addEventListener('focusout',()=>saveBlock(false));}
+ else if(b.kind==='block'){wrap.className+=' beamer-block '+(b.env==='alertblock'?'alert':b.env==='exampleblock'?'example':'');wrap.innerHTML='<div class="head" contenteditable="true">'+latexToHtml(b.title)+'</div><div class="body editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const blockHead=wrap.querySelector('.head'),blockBody=wrap.querySelector('.body');attachEditor(blockHead);attachEditor(blockBody);const saveBlock=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{title:editorToLatex(blockHead),text:editableLatex(blockBody)},refresh};vscode.postMessage(msg);};blockHead.__texflowCommit=(text)=>{setEditableLatex(blockHead,text);saveBlock(true);};blockHead.__texflowSaveNow=()=>saveBlock(false);blockBody.__texflowCommit=(text)=>{setEditableLatex(blockBody,text);saveBlock(true);};blockBody.__texflowSaveNow=()=>saveBlock(false);wrap.addEventListener('focusout',()=>saveBlock(false));}
  else if(b.kind==='equation'){wrap.className+=' math';wrap.innerHTML='<div class="render"></div>';let previewText=String(b.text||'').replace(/\\label\{[^}]+\}/g,'').replace(/\\(?:notag|nonumber)\b/g,'');if(/^align/.test(String(b.env||'')))previewText='\\begin{aligned}'+previewText+'\\end{aligned}';try{katex.render(previewText,wrap.querySelector('.render'),{displayMode:true,throwOnError:false})}catch{}wrap.title='Double-click to edit equation';wrap.addEventListener('dblclick',()=>openMathEditor(b,fi));}
  else if(b.kind==='figure'){renderFigure(b,fi,wrap);}
  else if(b.kind==='table'){renderTable(b,fi,wrap);}
  else if(b.kind==='columns'){renderColumns(b,fi,wrap);}
  else if(b.kind==='break'){wrap.className+=' doc-break';wrap.textContent=b.breakCommand||'newpage';}
- else if(b.kind==='comment'){wrap.className+=' doc-rich-block comment';wrap.innerHTML='<div class="doc-rich-label">'+(b.commentNote?'Author note':'Source comment')+' · not in PDF</div><div class="editable doc-rich-edit" contenteditable="true">'+esc(b.commentText||b.text||'')+'</div>';const edit=wrap.querySelector('.doc-rich-edit');attachEditor(edit);const save=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(edit)},refresh});edit.__texflowCommit=text=>{setEditableLatex(edit,text);save(true);};edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}
- else if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem'){wrap.className+=' doc-rich-block '+b.kind;wrap.innerHTML='<div class="doc-rich-label">'+esc(b.env||b.kind)+'</div><div class="editable doc-rich-edit" contenteditable="true">'+latexToHtml(b.text||'')+'</div>';const edit=wrap.querySelector('.doc-rich-edit');attachEditor(edit);const save=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(edit)},refresh});edit.__texflowCommit=text=>{setEditableLatex(edit,text);save(true);};edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}
+ else if(b.kind==='comment'){wrap.className+=' doc-rich-block comment';wrap.innerHTML='<div class="doc-rich-label">'+(b.commentNote?'Author note':'Source comment')+' · not in PDF</div><div class="editable doc-rich-edit" contenteditable="true">'+esc(b.commentText||b.text||'')+'</div>';const edit=wrap.querySelector('.doc-rich-edit');attachEditor(edit);const save=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(edit)},refresh};vscode.postMessage(msg);};edit.__texflowCommit=text=>{setEditableLatex(edit,text);save(true);};edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}
+ else if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem'){wrap.className+=' doc-rich-block '+b.kind;wrap.innerHTML='<div class="doc-rich-label">'+esc(b.env||b.kind)+'</div><div class="editable doc-rich-edit" contenteditable="true">'+latexToHtml(b.text||'')+'</div>';const edit=wrap.querySelector('.doc-rich-edit');attachEditor(edit);const save=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(edit)},refresh};vscode.postMessage(msg);};edit.__texflowCommit=text=>{setEditableLatex(edit,text);save(true);};edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}
  else {wrap.className+=' '+b.kind;wrap.innerHTML='<div class="tag">'+esc(b.kind)+' — preserved as LaTeX</div><pre>'+esc(b.raw)+'</pre>'}
  if(['equation','figure','table','columns','break','quote','container','theorem','comment'].includes(b.kind))bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));
  return wrap;}
 
 function renderColumns(block,frameIndex,wrap){
  const texts=block.columnTexts||[block.text||''],count=Math.max(2,Math.min(4,Number(block.columnCount)||texts.length||2));wrap.className+=' columns-card semantic-block';wrap.innerHTML='<div class="columns-head"><span class="tag">'+(block.env==='multicols'?'Document columns':'Beamer columns')+'</span><span>'+count+' columns</span></div><div class="columns-grid" style="grid-template-columns:repeat('+count+',minmax(0,1fr))">'+Array.from({length:count},(_,i)=>'<div class="column-edit editable" contenteditable="true" data-col="'+i+'">'+latexToHtml(texts[i]||'')+'</div>').join('')+'</div>';
- const edits=[...wrap.querySelectorAll('.column-edit')];edits.forEach(e=>attachEditor(e));const save=refresh=>vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload:{count,texts:edits.map(e=>editableLatex(e))},refresh});edits.forEach(e=>{e.__texflowCommit=text=>{setEditableLatex(e,text);save(true);};e.__texflowSaveNow=()=>save(false);e.addEventListener('input',()=>scheduleSave(e,save));e.addEventListener('blur',()=>flushSave(e,save));});
+ const edits=[...wrap.querySelectorAll('.column-edit')];edits.forEach(e=>attachEditor(e));const save=refresh=>{const msg={type:'updateBlock',frameIndex,blockId:block.id,payload:{count,texts:edits.map(e=>editableLatex(e))},refresh};vscode.postMessage(msg);};edits.forEach(e=>{e.__texflowCommit=text=>{setEditableLatex(e,text);save(true);};e.__texflowSaveNow=()=>save(false);e.addEventListener('input',()=>scheduleSave(e,save));e.addEventListener('blur',()=>flushSave(e,save));});
 }
 
 function renderTable(block,frameIndex,wrap){
