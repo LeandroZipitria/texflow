@@ -1,4 +1,4 @@
-# TeXFlow — Readmap
+# TeXFlow — Roadmap
 
 TeXFlow is a visual editor for LaTeX inside VS Code.
 
@@ -10,7 +10,7 @@ This document collects possible directions for future development. It is intenti
 
 ## Current baseline
 
-Stable baseline: **v0.14.3**
+Stable release: **v0.15.1**
 
 The current release includes, among other features:
 
@@ -24,9 +24,15 @@ The current release includes, among other features:
 - figures;
 - tables;
 - mathematics editing;
-- source preservation and round-trip editing.
+- source preservation and round-trip editing;
+- local spell checking in English and Spanish;
+- automatic/manual language selection for spell checking;
+- Beamer frame thumbnails and section/subsection navigation;
+- visual document outline for standard documents;
+- click-to-navigate document structure;
+- figures, tables, and equations in the standard-document outline.
 
-Validated functionality from v0.14.3 should not be reopened unless a new feature requires it.
+Validated functionality from the current baseline should not be reopened unless a new feature requires it or a reproducible bug is found.
 
 ---
 
@@ -34,34 +40,29 @@ Validated functionality from v0.14.3 should not be reopened unless a new feature
 
 ## Dictionaries and spell checking
 
-Add local spell checking without sending document text to external services.
+**Status: implemented**
 
-Possible features:
+Current support includes:
 
+- local spell checking without sending document text to external services;
 - enable/disable spell checking;
-- configurable language;
 - English;
 - Spanish;
-- automatic language inference from LaTeX when possible;
-- manual language override;
-- underline misspelled words;
+- automatic/manual language selection;
+- underlining of misspelled words;
 - spelling suggestions;
-- corrections only when explicitly accepted by the user.
+- corrections only when explicitly accepted by the user;
+- exclusion of mathematics, citations, labels, references, URLs, and other non-prose content where appropriate.
 
-Spell checking should ignore:
+Possible future improvements:
 
-- LaTeX commands;
-- mathematics;
-- citations;
-- labels;
-- references;
-- URLs;
-- code;
-- other non-prose elements.
+- additional languages;
+- improved automatic language inference;
+- user dictionaries;
+- project-specific dictionaries;
+- richer ignore rules.
 
-The first implementation should prefer local or native capabilities already available through VS Code, Electron, Chromium, or the operating system.
-
-Grammar and style correction should be treated as a separate problem.
+Grammar and style correction should remain a separate problem.
 
 ---
 
@@ -108,32 +109,38 @@ TeXFlow should not attempt to reproduce a full Word-style track-changes system u
 
 ## Document outline
 
-Provide a visual outline of the document.
+**Status: partially implemented**
 
-For standard documents:
+Current support for standard documents includes:
 
+- chapters where applicable;
 - sections;
 - subsections;
 - subsubsections;
+- click-to-navigate;
 - figures;
 - tables;
 - equations;
-- labels.
+- associated labels where available.
 
-For Beamer:
+Current support for Beamer includes:
 
+- source files;
 - sections;
+- subsections;
 - frames;
-- blocks;
-- relevant structural elements.
+- frame thumbnails;
+- collapsible navigation groups;
+- click-to-navigate.
 
-Possible actions:
+Possible future improvements:
 
-- click to navigate;
+- independent label entries where useful;
+- blocks and other relevant structural elements in Beamer;
+- collapse/expand for standard-document hierarchy;
 - rename;
 - reorder;
 - duplicate;
-- collapse/expand;
 - drag and drop.
 
 Example:
@@ -145,7 +152,10 @@ Introduction
 Model
   Assumptions
   Equilibrium
+  Equation: eq:model
 Results
+  Figure: Price dispersion
+  Table: Main estimates
 Conclusion
 ```
 
@@ -161,6 +171,8 @@ Model
 Results
   Frame 5
 ```
+
+Structural editing actions should be introduced incrementally because they modify source ranges and therefore carry more source-preservation risk than read-only navigation.
 
 ---
 
@@ -284,7 +296,9 @@ Matrices could eventually have a small grid-based visual editor.
 
 ## Equation structure
 
-Possible support for:
+Current support already includes several structured mathematics workflows.
+
+Possible further improvements around:
 
 - `equation`;
 - `equation*`;
@@ -511,14 +525,14 @@ This would be important for:
 
 ## Advanced presentation workflow
 
+Current support already includes frame thumbnails and section/subsection navigation.
+
 Possible improvements:
 
-- frame thumbnails;
 - reorder frames by drag and drop;
 - duplicate frame;
 - comment/uncomment frame;
-- section navigation;
-- frame preview;
+- frame preview refinements;
 - presenter notes.
 
 ---
@@ -566,8 +580,8 @@ The roadmap can be summarized into several broad areas:
 
 | Area | Examples |
 |---|---|
-| Writing | dictionaries, spellcheck, AI, comments |
-| Structure | outline, navigation, drag and drop |
+| Writing | spellcheck, AI, comments |
+| Structure | outline, navigation, structural editing |
 | LaTeX intelligence | references, bibliography, diagnostics |
 | Content | math, tables, figures, TikZ |
 | Workflow | Visual ↔ Source ↔ PDF |
@@ -614,7 +628,7 @@ Future features should preserve the following principles:
 
 # Status
 
-This file is a **future-development readmap**, not a commitment to specific releases.
+This file is a **future-development roadmap**, not a commitment to specific releases.
 
 Features should be promoted into release plans only after:
 
