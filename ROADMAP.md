@@ -10,7 +10,7 @@ This document collects possible directions for future development. It is intenti
 
 ## Current baseline
 
-Stable release: **v0.15.1**
+Stable release: **v0.16.0**
 
 The current release includes, among other features:
 

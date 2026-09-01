@@ -2,7 +2,7 @@
   "name": "texflow",
   "displayName": "TeXFlow — Visual LaTeX",
   "description": "A visual editor for real LaTeX and Beamer files in VS Code, with semantic text editing, math, citations, references, figures, tables, layout tools, and source-preserving round trips.",
-  "version": "0.15.1",
+  "version": "0.16.0",
   "publisher": "leandrozipitria",
   "license": "MIT",
   "homepage": "https://github.com/LeandroZipitria/texflow#readme",
