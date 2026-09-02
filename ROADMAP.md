@@ -10,7 +10,7 @@ This document collects possible directions for future development. It is intenti
 
 ## Current baseline
 
-Stable release: **v0.16.0**
+Stable release: **v0.17.0**
 
 The current release includes, among other features:
 
@@ -30,7 +30,13 @@ The current release includes, among other features:
 - Beamer frame thumbnails and section/subsection navigation;
 - visual document outline for standard documents;
 - click-to-navigate document structure;
-- figures, tables, and equations in the standard-document outline.
+- figures, tables, and equations in the standard-document outline;
+- TeXFlow entry point in the VS Code Activity Bar;
+- start screen for creating or opening documents;
+- creation of standalone `.tex` files;
+- creation of LaTeX project folders with `main.tex`, `preamble.tex`, and `figures/`;
+- project navigator for `.tex`, `.bib`, and supported figure files;
+- Explorer context actions for creating and opening TeXFlow documents.
 
 Validated functionality from the current baseline should not be reopened unless a new feature requires it or a reproducible bug is found.
 

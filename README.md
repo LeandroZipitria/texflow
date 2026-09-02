@@ -8,7 +8,7 @@
 
 TeXFlow is a visual editor for real LaTeX files inside VS Code. It lets you focus on writing while keeping your `.tex` files intact, editable, and fully accessible.
 
-**Current stable release: 0.16.0.**
+**Current stable release: 0.17.0.**
 
 TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` file remains the source of truth. When TeXFlow cannot safely edit a complex construct visually, it preserves the underlying LaTeX rather than silently rewriting it.
 
@@ -28,6 +28,8 @@ TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` file remai
 - Local spell checking with English and Spanish dictionaries.
 - Automatic, English, and Español language modes for spell checking.
 - Conservative preservation of unsupported LaTeX.
+- **Start from TeXFlow** — create a standalone `.tex` file or a LaTeX project directly from the TeXFlow sidebar.
+- **Project navigator** — browse relevant `.tex`, `.bib`, and figure files without leaving TeXFlow.
 
 ## Installation
 
@@ -52,11 +54,18 @@ https://marketplace.visualstudio.com/items?itemName=leandrozipitria.texflow
 
 ## Quick start
 
-1. Open a `.tex` file in VS Code.
-2. Run **TeXFlow: Open Visual LaTeX Editor**.
-3. Edit in Visual mode, or switch between Visual, Source, Split, and PDF.
-4. Compile with your local LaTeX toolchain.
-5. Return to Source at any time: the `.tex` file remains canonical.
+## Quick start
+
+1. Open **TeXFlow** from the VS Code Activity Bar.
+2. Choose **New document** or **Open existing .tex**.
+3. For a new document, create either:
+   - a standalone `.tex` file; or
+   - a LaTeX project with `main.tex`, `preamble.tex`, and `figures/`.
+4. Choose `article`, `report`, `book`, or Beamer.
+5. Edit in Visual mode, or switch between Visual, Source, Split, and PDF.
+6. Compile with your local LaTeX toolchain.
+
+You can also right-click a folder in the VS Code Explorer to create a TeXFlow document there, or right-click a `.tex` file to open it with TeXFlow.
 
 ## Documentation
 
