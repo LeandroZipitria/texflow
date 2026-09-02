@@ -34,7 +34,11 @@
   "activationEvents": [
     "onCommand:texflow.openVisualEditor",
     "onCommand:texflow.projectCheck",
-    "onCommand:texflow.newProject"
+    "onCommand:texflow.newProject",
+    "onCommand:texflow.openDocument",
+    "onView:texflow.homeView",
+    "onView:texflow.projectView",
+    "onCommand:texflow.refreshProjectNavigator"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -66,7 +70,11 @@
     "commands": [
       {
         "command": "texflow.openVisualEditor",
-        "title": "TeXFlow: Open Visual LaTeX Editor"
+        "title": "TeXFlow: Open with TeXFlow"
+      },
+      {
+        "command": "texflow.openDocument",
+        "title": "TeXFlow: Open Document"
       },
       {
         "command": "texflow.projectCheck",
@@ -74,9 +82,36 @@
       },
       {
         "command": "texflow.newProject",
-        "title": "TeXFlow: New Project"
+        "title": "TeXFlow: New Document"
+      },
+      {
+        "command": "texflow.refreshProjectNavigator",
+        "title": "TeXFlow: Refresh Project",
+        "icon": "$(refresh)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "texflow",
+          "title": "TeXFlow",
+          "icon": "media/texflow-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "texflow": [
+        {
+          "type": "webview",
+          "id": "texflow.homeView",
+          "name": "Start"
+        },
+        {
+          "id": "texflow.projectView",
+          "name": "Project"
+        }
+      ]
+    },
     "menus": {
       "editor/title": [
         {
@@ -87,17 +122,46 @@
       ],
       "explorer/context": [
         {
+          "command": "texflow.newProject",
+          "when": "explorerResourceIsFolder",
+          "group": "navigation@1"
+        },
+        {
           "command": "texflow.openVisualEditor",
           "when": "resourceExtname == .tex",
-          "group": "navigation"
+          "group": "navigation@2"
         },
         {
           "command": "texflow.projectCheck",
           "when": "resourceExtname == .tex",
+          "group": "navigation@3"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "texflow.newProject",
+          "when": "view == texflow.homeView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "texflow.openDocument",
+          "when": "view == texflow.homeView",
           "group": "navigation@2"
+        },
+        {
+          "command": "texflow.refreshProjectNavigator",
+          "when": "view == texflow.projectView",
+          "group": "navigation@1"
         }
       ]
-    }
+    },
+    "viewsWelcome": [
+      {
+        "view": "texflow.projectView",
+        "contents": "Open or create a TeXFlow document to see its project files.",
+        "when": "!texflow.hasProject"
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p .",

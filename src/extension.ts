@@ -126,11 +126,373 @@ interface BibliographyResource {
 
 type BibliographySystem = 'biblatex' | 'natbib' | 'bibtex' | 'none';
 
+
+
+const TEXFLOW_FIGURE_EXTENSIONS = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.svg', '.webp', '.gif']);
+const TEXFLOW_PROJECT_FILE_EXTENSIONS = new Set(['.tex', '.bib', ...TEXFLOW_FIGURE_EXTENSIONS]);
+const TEXFLOW_IGNORED_PROJECT_DIRS = new Set(['.git', '.vscode', 'node_modules', 'out', 'dist', 'build', '__pycache__']);
+
+type TeXFlowProjectItemKind = 'root' | 'folder' | 'tex' | 'bib' | 'figure';
+
+class TeXFlowProjectItem extends vscode.TreeItem {
+  constructor(
+    public readonly uri: vscode.Uri,
+    public readonly kind: TeXFlowProjectItemKind,
+    label: string,
+    collapsibleState: vscode.TreeItemCollapsibleState
+  ) {
+    super(label, collapsibleState);
+    this.resourceUri = uri;
+
+    if (kind === 'root' || kind === 'folder') {
+      this.iconPath = new vscode.ThemeIcon('folder');
+      this.contextValue = kind === 'root' ? 'texflowProjectRoot' : 'texflowProjectFolder';
+      this.tooltip = uri.fsPath;
+      return;
+    }
+
+    this.contextValue = kind === 'tex'
+      ? 'texflowProjectTex'
+      : kind === 'bib'
+        ? 'texflowProjectBib'
+        : 'texflowProjectFigure';
+
+    this.iconPath = new vscode.ThemeIcon(
+      kind === 'tex' ? 'file-code' : kind === 'bib' ? 'book' : 'file-media'
+    );
+    this.tooltip = uri.fsPath;
+    this.command = {
+      command: 'texflow.projectOpenItem',
+      title: 'Open',
+      arguments: [uri]
+    };
+  }
+}
+
+class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectItem> {
+  private readonly changeEmitter = new vscode.EventEmitter<TeXFlowProjectItem | undefined | void>();
+  readonly onDidChangeTreeData = this.changeEmitter.event;
+
+  private rootDocumentUri: vscode.Uri | undefined;
+  private rootFolderUri: vscode.Uri | undefined;
+
+  constructor(private readonly context: vscode.ExtensionContext) {}
+
+  async restore(): Promise<void> {
+    const saved = this.context.workspaceState.get<string>('texflow.projectNavigatorRootDocument');
+    if (!saved) {
+      await vscode.commands.executeCommand('setContext', 'texflow.hasProject', false);
+      return;
+    }
+    try {
+      const uri = vscode.Uri.parse(saved);
+      await vscode.workspace.fs.stat(uri);
+      await this.setRootDocument(uri, false);
+    } catch {
+      await this.context.workspaceState.update('texflow.projectNavigatorRootDocument', undefined);
+      await vscode.commands.executeCommand('setContext', 'texflow.hasProject', false);
+    }
+  }
+
+  async setRootDocument(uri: vscode.Uri, persist = true): Promise<void> {
+    this.rootDocumentUri = uri;
+    this.rootFolderUri = vscode.Uri.file(path.dirname(uri.fsPath));
+    if (persist) {
+      await this.context.workspaceState.update('texflow.projectNavigatorRootDocument', uri.toString());
+    }
+    await vscode.commands.executeCommand('setContext', 'texflow.hasProject', true);
+    this.refresh();
+  }
+
+  refresh(): void {
+    this.changeEmitter.fire();
+  }
+
+  getTreeItem(element: TeXFlowProjectItem): vscode.TreeItem {
+    return element;
+  }
+
+  async getChildren(element?: TeXFlowProjectItem): Promise<TeXFlowProjectItem[]> {
+    if (!this.rootFolderUri) return [];
+
+    if (!element) {
+      const rootLabel = path.basename(this.rootFolderUri.fsPath) || this.rootFolderUri.fsPath;
+      return [
+        new TeXFlowProjectItem(
+          this.rootFolderUri,
+          'root',
+          rootLabel,
+          vscode.TreeItemCollapsibleState.Expanded
+        )
+      ];
+    }
+
+    if (element.kind !== 'root' && element.kind !== 'folder') return [];
+    return this.readFolder(element.uri);
+  }
+
+  isWithinRoot(uri: vscode.Uri): boolean {
+    if (!this.rootFolderUri) return false;
+    const root = path.resolve(this.rootFolderUri.fsPath);
+    const candidate = path.resolve(uri.fsPath);
+    const rel = path.relative(root, candidate);
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  }
+
+  isRelevantResource(uri: vscode.Uri): boolean {
+    const name = path.basename(uri.fsPath);
+    return TEXFLOW_PROJECT_FILE_EXTENSIONS.has(path.extname(name).toLowerCase());
+  }
+
+  private isRelevantFile(name: string): boolean {
+    return TEXFLOW_PROJECT_FILE_EXTENSIONS.has(path.extname(name).toLowerCase());
+  }
+
+  private isCompiledDocumentPdf(uri: vscode.Uri): boolean {
+    if (!this.rootDocumentUri || path.extname(uri.fsPath).toLowerCase() !== '.pdf') return false;
+    const sameFolder = path.dirname(uri.fsPath) === path.dirname(this.rootDocumentUri.fsPath);
+    const pdfStem = path.basename(uri.fsPath, path.extname(uri.fsPath)).toLowerCase();
+    const texStem = path.basename(this.rootDocumentUri.fsPath, path.extname(this.rootDocumentUri.fsPath)).toLowerCase();
+    return sameFolder && pdfStem === texStem;
+  }
+
+  private async folderContainsRelevantFiles(uri: vscode.Uri, depth = 0): Promise<boolean> {
+    if (depth > 5) return false;
+    try {
+      const entries = await vscode.workspace.fs.readDirectory(uri);
+      for (const [name, type] of entries) {
+        if ((type & vscode.FileType.Directory) !== 0) {
+          if (TEXFLOW_IGNORED_PROJECT_DIRS.has(name.toLowerCase())) continue;
+          if (await this.folderContainsRelevantFiles(vscode.Uri.joinPath(uri, name), depth + 1)) return true;
+          continue;
+        }
+        if ((type & vscode.FileType.File) !== 0 && this.isRelevantFile(name)) {
+          const child = vscode.Uri.joinPath(uri, name);
+          if (!this.isCompiledDocumentPdf(child)) return true;
+        }
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
+  private async readFolder(uri: vscode.Uri): Promise<TeXFlowProjectItem[]> {
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(uri);
+    } catch {
+      return [];
+    }
+
+    const items: TeXFlowProjectItem[] = [];
+
+    for (const [name, type] of entries) {
+      const child = vscode.Uri.joinPath(uri, name);
+
+      if ((type & vscode.FileType.Directory) !== 0) {
+        const lower = name.toLowerCase();
+        if (TEXFLOW_IGNORED_PROJECT_DIRS.has(lower)) continue;
+
+        const commonResourceFolder = ['figures', 'figure', 'images', 'image', 'img'].includes(lower);
+        if (!commonResourceFolder && !(await this.folderContainsRelevantFiles(child))) continue;
+
+        items.push(
+          new TeXFlowProjectItem(
+            child,
+            'folder',
+            name,
+            vscode.TreeItemCollapsibleState.Collapsed
+          )
+        );
+        continue;
+      }
+
+      if ((type & vscode.FileType.File) === 0 || !this.isRelevantFile(name)) continue;
+      if (this.isCompiledDocumentPdf(child)) continue;
+
+      const ext = path.extname(name).toLowerCase();
+      const kind: TeXFlowProjectItemKind =
+        ext === '.tex' ? 'tex' : ext === '.bib' ? 'bib' : 'figure';
+
+      const item = new TeXFlowProjectItem(
+        child,
+        kind,
+        name,
+        vscode.TreeItemCollapsibleState.None
+      );
+
+      if (this.rootDocumentUri && child.toString() === this.rootDocumentUri.toString()) {
+        item.description = 'main';
+      } else if (kind === 'figure') {
+        item.description = 'figure';
+      }
+
+      items.push(item);
+    }
+
+    const rank = (item: TeXFlowProjectItem): number => {
+      if (this.rootDocumentUri && item.uri.toString() === this.rootDocumentUri.toString()) return 0;
+      if (item.kind === 'tex') return 1;
+      if (item.kind === 'bib') return 2;
+      if (item.kind === 'folder') return 3;
+      return 4;
+    };
+
+    return items.sort((a, b) => {
+      const diff = rank(a) - rank(b);
+      if (diff) return diff;
+      return String(a.label).localeCompare(String(b.label), undefined, { sensitivity: 'base' });
+    });
+  }
+}
+
+function getTeXFlowHomeHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    padding:18px 14px 24px;
+    color:var(--vscode-sideBar-foreground,var(--vscode-foreground));
+    background:var(--vscode-sideBar-background,var(--vscode-editor-background));
+    font-family:var(--vscode-font-family);
+    font-size:13px;
+  }
+  .home{max-width:360px;margin:0 auto}
+  .brand{display:flex;align-items:center;gap:10px;margin:4px 0 6px}
+  .mark{
+    width:34px;height:34px;border-radius:8px;
+    display:grid;place-items:center;
+    background:var(--vscode-button-background);
+    color:var(--vscode-button-foreground);
+    font-weight:800;font-size:18px;
+  }
+  h1{font-size:20px;line-height:1.2;margin:0}
+  .tagline{margin:0 0 20px;color:var(--vscode-descriptionForeground);line-height:1.45}
+  .actions{display:grid;gap:9px}
+  button{
+    width:100%;border:1px solid transparent;border-radius:6px;
+    padding:9px 11px;text-align:left;cursor:pointer;
+    font:inherit;font-weight:600;
+  }
+  .primary{
+    background:var(--vscode-button-background);
+    color:var(--vscode-button-foreground);
+  }
+  .primary:hover{background:var(--vscode-button-hoverBackground)}
+  .secondary{
+    background:var(--vscode-button-secondaryBackground);
+    color:var(--vscode-button-secondaryForeground);
+    border-color:var(--vscode-widget-border,transparent);
+  }
+  .secondary:hover{background:var(--vscode-button-secondaryHoverBackground)}
+  .hint{
+    margin-top:22px;padding-top:14px;border-top:1px solid var(--vscode-widget-border);
+    color:var(--vscode-descriptionForeground);font-size:12px;line-height:1.5;
+  }
+  .types{margin-top:9px;display:flex;flex-wrap:wrap;gap:5px}
+  .pill{
+    border:1px solid var(--vscode-widget-border);
+    border-radius:999px;padding:2px 7px;
+  }
+</style>
+</head>
+<body>
+  <div class="home">
+    <div class="brand"><div class="mark">T</div><h1>TeXFlow</h1></div>
+    <p class="tagline">Write LaTeX, without writing LaTeX.</p>
+    <div class="actions">
+      <button class="primary" id="new-document">＋ New document</button>
+      <button class="secondary" id="open-document">Open existing .tex</button>
+    </div>
+    <div class="hint">
+      Create either a single <code>.tex</code> file or a LaTeX project folder.
+      <p>Document types:</p>
+      <div class="types">
+        <span class="pill">Article</span>
+        <span class="pill">Report</span>
+        <span class="pill">Book</span>
+        <span class="pill">Beamer</span>
+      </div>
+      <p>You can also right-click a folder in Explorer to create a TeXFlow document there, or right-click a <code>.tex</code> file to open it with TeXFlow.</p>
+    </div>
+  </div>
+<script>
+  const vscode = acquireVsCodeApi();
+  document.getElementById('new-document').addEventListener('click', () => vscode.postMessage({type:'newDocument'}));
+  document.getElementById('open-document').addEventListener('click', () => vscode.postMessage({type:'openDocument'}));
+</script>
+</body>
+</html>`;
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel('TeXFlow');
   context.subscriptions.push(output);
 
-  context.subscriptions.push(vscode.commands.registerCommand('texflow.newProject', async () => {
+  const projectNavigator = new TeXFlowProjectNavigator(context);
+  const projectTree = vscode.window.createTreeView('texflow.projectView', {
+    treeDataProvider: projectNavigator,
+    showCollapseAll: true
+  });
+  context.subscriptions.push(projectTree);
+  void projectNavigator.restore();
+
+  context.subscriptions.push(vscode.commands.registerCommand('texflow.refreshProjectNavigator', () => {
+    projectNavigator.refresh();
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('texflow.projectOpenItem', async (uri: vscode.Uri) => {
+    const ext = path.extname(uri.fsPath).toLowerCase();
+    if (ext === '.tex') {
+      try {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        if (/\\documentclass(?:\[[^\]]*\])?\{[^}]+\}/.test(doc.getText())) {
+          await vscode.commands.executeCommand('texflow.openVisualEditor', uri);
+          return;
+        }
+      } catch {
+        // Fall through to the native editor.
+      }
+    }
+    await vscode.commands.executeCommand('vscode.open', uri);
+  }));
+
+  // Watch all files and filter by extension in code. VS Code glob matching can be
+  // case-sensitive on macOS/Linux, while image files often arrive as .JPG/.JPEG.
+  // Filtering with path.extname(...).toLowerCase() keeps project refresh reliable
+  // for both lowercase and uppercase supported extensions.
+  const projectWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+  const refreshProjectIfRelevant = (uri: vscode.Uri) => {
+    if (projectNavigator.isWithinRoot(uri) && projectNavigator.isRelevantResource(uri)) {
+      projectNavigator.refresh();
+    }
+  };
+  projectWatcher.onDidCreate(refreshProjectIfRelevant);
+  projectWatcher.onDidDelete(refreshProjectIfRelevant);
+  projectWatcher.onDidChange(refreshProjectIfRelevant);
+  context.subscriptions.push(projectWatcher);
+
+  context.subscriptions.push(vscode.commands.registerCommand('texflow.newProject', async (resource?: vscode.Uri) => {
+    const creation = await vscode.window.showQuickPick([
+      {
+        label: 'Single .tex file',
+        description: 'Create one self-contained LaTeX file',
+        value: 'file'
+      },
+      {
+        label: 'LaTeX project',
+        description: 'Create a folder with main.tex, preamble.tex, and figures/',
+        value: 'project'
+      }
+    ], { placeHolder: 'What do you want to create?' });
+    if (!creation) return;
+
     const kind = await vscode.window.showQuickPick([
       { label: 'Beamer presentation', description: 'Slides organized in frames', value: 'beamer' },
       { label: 'LaTeX article', description: 'Sections and subsections', value: 'article' },
@@ -139,46 +501,128 @@ export function activate(context: vscode.ExtensionContext) {
     ], { placeHolder: 'Choose the document class' });
     if (!kind) return;
 
-    const selected = await vscode.window.showOpenDialog({
-      canSelectFolders: true,
-      canSelectFiles: false,
-      canSelectMany: false,
-      openLabel: 'Choose parent folder'
-    });
-    if (!selected?.[0]) return;
+    const className = kind.value;
+    const projectPreamble = className === 'beamer'
+      ? `\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\usepackage{amsmath,amssymb}\n\\usepackage{graphicx}\n\\usetheme{default}\n`
+      : `\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\usepackage{amsmath,amssymb}\n\\usepackage{graphicx}\n\\usepackage{booktabs}\n`;
+
+    const body = className === 'beamer'
+      ? `\\title{Presentation title}\n\\author{Author}\n\\date{\\today}\n\n\\begin{document}\n\n\\begin{frame}\n  \\titlepage\n\\end{frame}\n\n\\begin{frame}{First frame}\n  Start writing here.\n\\end{frame}\n\n\\end{document}\n`
+      : className === 'article'
+        ? `\\title{Article title}\n\\author{Author}\n\\date{\\today}\n\n\\begin{document}\n\\maketitle\n\n\\section{Introduction}\nStart writing here.\n\n\\end{document}\n`
+        : `\\title{${className === 'book' ? 'Book' : 'Report'} title}\n\\author{Author}\n\\date{\\today}\n\n\\begin{document}\n\\maketitle\n\n\\chapter{Introduction}\nStart writing here.\n\n\\end{document}\n`;
+
+    let contextFolder: vscode.Uri | undefined;
+    if (resource) {
+      try {
+        const stat = await vscode.workspace.fs.stat(resource);
+        if ((stat.type & vscode.FileType.Directory) !== 0) contextFolder = resource;
+      } catch {
+        contextFolder = undefined;
+      }
+    }
+
+    if (creation.value === 'file') {
+      const defaultName = className === 'beamer'
+        ? 'presentation.tex'
+        : className === 'article'
+          ? 'article.tex'
+          : className === 'report'
+            ? 'report.tex'
+            : 'book.tex';
+      const defaultUri = contextFolder ? vscode.Uri.joinPath(contextFolder, defaultName) : undefined;
+      const selected = await vscode.window.showSaveDialog({
+        defaultUri,
+        saveLabel: 'Create TeXFlow document',
+        filters: { 'LaTeX documents': ['tex'] }
+      });
+      if (!selected) return;
+
+      let fileUri = selected;
+      if (!fileUri.path.toLowerCase().endsWith('.tex')) {
+        fileUri = fileUri.with({ path: fileUri.path + '.tex' });
+      }
+
+      const standalone = className === 'beamer'
+        ? `\\documentclass[aspectratio=43]{beamer}\n${projectPreamble}\n${body}`
+        : `\\documentclass[12pt]{${className}}\n${projectPreamble}\n${body}`;
+
+      try {
+        await vscode.workspace.fs.writeFile(fileUri, new TextEncoder().encode(standalone));
+        vscode.window.showInformationMessage(`TeXFlow created ${path.basename(fileUri.fsPath)}.`);
+        await vscode.commands.executeCommand('texflow.openVisualEditor', fileUri);
+      } catch (error) {
+        vscode.window.showErrorMessage(`TeXFlow could not create the document: ${String(error)}`);
+      }
+      return;
+    }
+
+    let parentFolder = contextFolder;
+    if (!parentFolder) {
+      const selected = await vscode.window.showOpenDialog({
+        canSelectFolders: true,
+        canSelectFiles: false,
+        canSelectMany: false,
+        openLabel: 'Choose parent folder'
+      });
+      if (!selected?.[0]) return;
+      parentFolder = selected[0];
+    }
 
     const projectName = await vscode.window.showInputBox({
       prompt: 'Project folder name',
-      value: kind.value === 'beamer' ? 'my-presentation' : kind.value === 'article' ? 'my-article' : kind.value === 'report' ? 'my-report' : 'my-book',
+      value: className === 'beamer' ? 'my-presentation' : className === 'article' ? 'my-article' : className === 'report' ? 'my-report' : 'my-book',
       validateInput: value => /^[^\\/:*?"<>|]+$/.test(value.trim()) ? undefined : 'Use a valid folder name.'
     });
     if (!projectName?.trim()) return;
 
-    const folder = vscode.Uri.joinPath(selected[0], projectName.trim());
+    const folder = vscode.Uri.joinPath(parentFolder, projectName.trim());
     try {
       await vscode.workspace.fs.createDirectory(folder);
       await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder, 'figures'));
       const preambleUri = vscode.Uri.joinPath(folder, 'preamble.tex');
       const mainUri = vscode.Uri.joinPath(folder, 'main.tex');
-      const preamble = kind.value === 'beamer'
-        ? `\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\usepackage{amsmath,amssymb}\n\\usepackage{graphicx}\n\\usetheme{default}\n`
-        : `\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\usepackage{amsmath,amssymb}\n\\usepackage{graphicx}\n\\usepackage{booktabs}\n`;
-      const className = kind.value;
       const main = className === 'beamer'
-        ? `\\documentclass[aspectratio=43]{beamer}\n\\input{preamble}\n\n\\title{Presentation title}\n\\author{Author}\n\\date{\\today}\n\n\\begin{document}\n\n\\begin{frame}\n  \\titlepage\n\\end{frame}\n\n\\begin{frame}{First frame}\n  Start writing here.\n\\end{frame}\n\n\\end{document}\n`
-        : className === 'article'
-          ? `\\documentclass[12pt]{article}\n\\input{preamble}\n\n\\title{Article title}\n\\author{Author}\n\\date{\\today}\n\n\\begin{document}\n\\maketitle\n\n\\section{Introduction}\nStart writing here.\n\n\\end{document}\n`
-          : `\\documentclass[12pt]{${className}}\n\\input{preamble}\n\n\\title{${className === 'book' ? 'Book' : 'Report'} title}\n\\author{Author}\n\\date{\\today}\n\n\\begin{document}\n\\maketitle\n\n\\chapter{Introduction}\nStart writing here.\n\n\\end{document}\n`;
-      await vscode.workspace.fs.writeFile(preambleUri, new TextEncoder().encode(preamble));
+        ? `\\documentclass[aspectratio=43]{beamer}\n\\input{preamble}\n\n${body}`
+        : `\\documentclass[12pt]{${className}}\n\\input{preamble}\n\n${body}`;
+      await vscode.workspace.fs.writeFile(preambleUri, new TextEncoder().encode(projectPreamble));
       await vscode.workspace.fs.writeFile(mainUri, new TextEncoder().encode(main));
-      const document = await vscode.workspace.openTextDocument(mainUri);
-      await vscode.window.showTextDocument(document, vscode.ViewColumn.One);
       vscode.window.showInformationMessage(`TeXFlow created ${projectName.trim()}.`);
       await vscode.commands.executeCommand('texflow.openVisualEditor', mainUri);
     } catch (error) {
       vscode.window.showErrorMessage(`TeXFlow could not create the project: ${String(error)}`);
     }
   }));
+
+
+  context.subscriptions.push(vscode.commands.registerCommand('texflow.openDocument', async () => {
+    const selected = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      openLabel: 'Open with TeXFlow',
+      filters: { 'LaTeX documents': ['tex'] }
+    });
+    if (!selected?.[0]) return;
+    await vscode.commands.executeCommand('texflow.openVisualEditor', selected[0]);
+  }));
+
+  const homeProvider: vscode.WebviewViewProvider = {
+    resolveWebviewView(view) {
+      view.webview.options = { enableScripts: true };
+      view.webview.html = getTeXFlowHomeHtml();
+      view.webview.onDidReceiveMessage(async msg => {
+        if (msg?.type === 'newDocument') {
+          await vscode.commands.executeCommand('texflow.newProject');
+          return;
+        }
+        if (msg?.type === 'openDocument') {
+          await vscode.commands.executeCommand('texflow.openDocument');
+        }
+      });
+    }
+  };
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider('texflow.homeView', homeProvider));
 
   context.subscriptions.push(vscode.commands.registerCommand('texflow.projectCheck', async (uri?: vscode.Uri) => {
     const active = uri ? await vscode.workspace.openTextDocument(uri) : vscode.window.activeTextEditor?.document;
@@ -215,6 +659,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     let project = await loadProject(initialDocument, output);
+    await projectNavigator.setRootDocument(project.root.uri);
     let rootUri = project.root.uri;
     const panel = vscode.window.createWebviewPanel(
       'texflowVisualEditor',
