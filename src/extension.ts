@@ -101,9 +101,31 @@ interface PresentationStyle {
   lineHeight: number;
 }
 
+interface IncludeReference {
+  sourceUri: vscode.Uri;
+  targetUri: vscode.Uri;
+  rawTarget: string;
+  command: 'input' | 'include';
+  start: number;
+  end: number;
+}
+
+interface ProjectIncludeGraph {
+  documents: Map<string, vscode.TextDocument>;
+  ordered: vscode.TextDocument[];
+  includeReferences: IncludeReference[];
+  missingIncludes: IncludeReference[];
+  includeCycles: string[][];
+  includedBy: Map<string, string[]>;
+}
+
 interface ProjectModel {
   root: vscode.TextDocument;
   documents: Map<string, vscode.TextDocument>;
+  includeReferences: IncludeReference[];
+  missingIncludes: IncludeReference[];
+  includeCycles: string[][];
+  includedBy: Map<string, string[]>;
   frames: FrameInfo[];
   isBeamer: boolean;
   documentClass: string;
@@ -175,6 +197,7 @@ class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectI
 
   private rootDocumentUri: vscode.Uri | undefined;
   private rootFolderUri: vscode.Uri | undefined;
+  private includedBy = new Map<string, string[]>();
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -197,6 +220,16 @@ class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectI
   async setRootDocument(uri: vscode.Uri, persist = true): Promise<void> {
     this.rootDocumentUri = uri;
     this.rootFolderUri = vscode.Uri.file(path.dirname(uri.fsPath));
+    this.includedBy = new Map<string, string[]>();
+
+    try {
+      const rootDocument = await vscode.workspace.openTextDocument(uri);
+      const graph = await buildProjectIncludeGraph(rootDocument);
+      this.includedBy = graph.includedBy;
+    } catch {
+      // Keep the navigator usable even if project-awareness metadata cannot be built.
+    }
+
     if (persist) {
       await this.context.workspaceState.update('texflow.projectNavigatorRootDocument', uri.toString());
     }
@@ -324,6 +357,13 @@ class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectI
 
       if (this.rootDocumentUri && child.toString() === this.rootDocumentUri.toString()) {
         item.description = 'main';
+        item.tooltip = `${child.fsPath}\nMain TeXFlow document`;
+      } else if (kind === 'tex') {
+        const parents = this.includedBy.get(child.toString()) ?? [];
+        if (parents.length) {
+          item.description = parents.length === 1 ? `included by ${parents[0]}` : 'included';
+          item.tooltip = `${child.fsPath}\nIncluded in the TeXFlow document`;
+        }
       } else if (kind === 'figure') {
         item.description = 'figure';
       }
@@ -639,6 +679,9 @@ export function activate(context: vscode.ExtensionContext) {
     output.appendLine('====================');
     output.appendLine(`Root: ${project.root.uri.fsPath}`);
     output.appendLine(`Files loaded: ${project.documents.size}`);
+    output.appendLine(`Include links: ${project.includeReferences.length}`);
+    output.appendLine(`Missing includes: ${project.missingIncludes.length}`);
+    output.appendLine(`Include cycles: ${project.includeCycles.length}`);
     output.appendLine(`Frames: ${project.frames.length}`);
     output.appendLine(`Lists: ${lists}`);
     output.appendLine(`Equations: ${equations}`);
@@ -721,6 +764,19 @@ export function activate(context: vscode.ExtensionContext) {
         presentationStyle: project.presentationStyle,
         documentSettings: getDocumentSettings(project),
         projectFiles: [...project.documents.values()].map(d => d.uri.fsPath),
+        projectIncludes: project.includeReferences.map(reference => ({
+          sourceUri: reference.sourceUri.toString(),
+          targetUri: reference.targetUri.toString(),
+          rawTarget: reference.rawTarget,
+          command: reference.command,
+          start: reference.start,
+          end: reference.end,
+          missing: project.missingIncludes.some(missing =>
+            missing.sourceUri.toString() === reference.sourceUri.toString() &&
+            missing.start === reference.start &&
+            missing.targetUri.toString() === reference.targetUri.toString()
+          )
+        })),
         sources: [...project.documents.values()].map(d => ({ uri: d.uri.toString(), label: vscode.workspace.asRelativePath(d.uri, false), text: d.getText() })),
         rootUri: project.root.uri.toString(),
         pdfUri,
@@ -1054,7 +1110,7 @@ export function activate(context: vscode.ExtensionContext) {
           const rawBlocks=frameBlocks.filter(b=>b.kind==='raw').length;
           const bibs=(await getBibliographyResources(project)).length;
           const figures=[...project.documents.values()].reduce((n,d)=>n+(d.getText().match(/\\includegraphics\b/g)||[]).length,0);
-          output.clear();output.appendLine('TeXFlow project diagnostics');output.appendLine('===========================');output.appendLine(`Root: ${project.root.uri.fsPath}`);output.appendLine(`Loaded .tex files: ${project.documents.size}`);output.appendLine(`Frames: ${project.frames.length}`);output.appendLine(`Bibliography resources: ${bibs}`);output.appendLine(`Figure commands: ${figures}`);output.appendLine(`Preserved raw blocks in Beamer frames: ${rawBlocks}`);output.appendLine('');for(const doc of project.documents.values())output.appendLine(`- ${doc.uri.fsPath}`);output.show(true);
+          output.clear();output.appendLine('TeXFlow project diagnostics');output.appendLine('===========================');output.appendLine(`Root: ${project.root.uri.fsPath}`);output.appendLine(`Loaded .tex files: ${project.documents.size}`);output.appendLine(`Include links: ${project.includeReferences.length}`);output.appendLine(`Missing includes: ${project.missingIncludes.length}`);output.appendLine(`Include cycles: ${project.includeCycles.length}`);output.appendLine(`Frames: ${project.frames.length}`);output.appendLine(`Bibliography resources: ${bibs}`);output.appendLine(`Figure commands: ${figures}`);output.appendLine(`Preserved raw blocks in Beamer frames: ${rawBlocks}`);output.appendLine('');for(const doc of project.documents.values())output.appendLine(`- ${doc.uri.fsPath}`);if(project.missingIncludes.length){output.appendLine('');output.appendLine('Missing include targets:');for(const ref of project.missingIncludes)output.appendLine(`- ${path.basename(ref.sourceUri.fsPath)} -> ${ref.rawTarget}`);}if(project.includeCycles.length){output.appendLine('');output.appendLine('Include cycles:');for(const cycle of project.includeCycles)output.appendLine(`- ${cycle.map(x=>path.basename(x)).join(' -> ')}`);}output.show(true);
         }
         if (msg.type === 'chooseSubfigures') {
           postStatus('saving');
@@ -1438,6 +1494,16 @@ export function activate(context: vscode.ExtensionContext) {
           editor.selection = new vscode.Selection(pos, pos);
           editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
         }
+        if (msg.type === 'openIncludedSource') {
+          const value = String(msg.uri || '');
+          if (!value) return;
+          try {
+            const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(value));
+            await vscode.window.showTextDocument(document, vscode.ViewColumn.Beside, false);
+          } catch {
+            vscode.window.showWarningMessage(`TeXFlow: Included file not found: ${String(msg.target || value)}`);
+          }
+        }
         if (msg.type === 'saveSource') {
           await refreshProject();
           const document = project.documents.get(String(msg.uri)) ?? await vscode.workspace.openTextDocument(vscode.Uri.parse(String(msg.uri)));
@@ -1489,13 +1555,25 @@ export function activate(context: vscode.ExtensionContext) {
         if (msg.type === 'compile') {
           panel.webview.postMessage({ type: 'compileStarted' });
           const pdfUri = vscode.Uri.file(rootUri.fsPath.replace(/\.tex$/i, '.pdf'));
+          const logUri = vscode.Uri.file(rootUri.fsPath.replace(/\.tex$/i, '.log'));
           let previousMtime = -1;
+          let previousLogMtime = -1;
           try { previousMtime = (await vscode.workspace.fs.stat(pdfUri)).mtime; } catch { /* no previous PDF */ }
+          try { previousLogMtime = (await vscode.workspace.fs.stat(logUri)).mtime; } catch { /* no previous log */ }
           await compileDocument(rootUri, panel);
           let ready = false;
+          let buildFailure = '';
           for (let attempt = 0; attempt < 60; attempt++) {
+            const fatal = await getLatexFatalBuildMessage(logUri, previousLogMtime);
+            if (fatal) {
+              buildFailure = fatal;
+              break;
+            }
             try {
               const stat = await vscode.workspace.fs.stat(pdfUri);
+              // Preserve the existing fast path for an already-valid PDF (latexmk
+              // may decide it is up to date), but only after checking the newly
+              // written log for a fatal error.
               if (stat.size > 0 && (stat.mtime !== previousMtime || attempt >= 2)) {
                 ready = true;
                 break;
@@ -1508,7 +1586,10 @@ export function activate(context: vscode.ExtensionContext) {
             panel.webview.postMessage({ type: 'compileFinished' });
             await openPdfInVsCode(pdfUri, panel);
           } else {
-            panel.webview.postMessage({ type: 'compileFailed', message: 'The PDF was not updated. Check the LaTeX build log.' });
+            panel.webview.postMessage({
+              type: 'compileFailed',
+              message: buildFailure || 'The PDF was not updated. Check the LaTeX build log.'
+            });
           }
         }
         if (msg.type === 'refreshPdf') await sendDocument();
@@ -1538,66 +1619,205 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 
+function stripLatexCommentsForIncludes(source: string): string {
+  let out = '';
+  let inComment = false;
+
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+
+    if (inComment) {
+      if (ch === '\n' || ch === '\r') {
+        inComment = false;
+        out += ch;
+      } else {
+        out += ' ';
+      }
+      continue;
+    }
+
+    if (ch === '%') {
+      let backslashes = 0;
+      for (let j = i - 1; j >= 0 && source[j] === '\\'; j--) backslashes++;
+      if (backslashes % 2 === 0) {
+        inComment = true;
+        out += ' ';
+        continue;
+      }
+    }
+
+    out += ch;
+  }
+
+  return out;
+}
+
+function extractIncludeReferences(document: vscode.TextDocument, projectRootDir?: string): IncludeReference[] {
+  const result: IncludeReference[] = [];
+  const source = stripLatexCommentsForIncludes(document.getText());
+  const re = /\\(input|include)\s*\{([^}]+)\}/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(source))) {
+    let target = String(m[2] || '').trim();
+    if (!target || /[\\#$]/.test(target)) continue;
+
+    const rawTarget = target;
+    if (!path.extname(target)) target += '.tex';
+
+    // Standard LaTeX resolves \input/\include paths from the master build
+    // directory, not from the directory of the file containing the command.
+    // Use the root document folder whenever it is known so TeXFlow's project
+    // graph matches what the compiler will actually load.
+    const resolutionBase = projectRootDir ?? path.dirname(document.uri.fsPath);
+    const targetPath = path.resolve(resolutionBase, target);
+    result.push({
+      sourceUri: document.uri,
+      targetUri: vscode.Uri.file(targetPath),
+      rawTarget,
+      command: m[1] as 'input' | 'include',
+      start: m.index,
+      end: re.lastIndex
+    });
+  }
+
+  return result;
+}
+
+function extractIncludeTargets(document: vscode.TextDocument, projectRootDir?: string): vscode.Uri[] {
+  return extractIncludeReferences(document, projectRootDir).map(reference => reference.targetUri);
+}
+
+async function buildProjectIncludeGraph(root: vscode.TextDocument): Promise<ProjectIncludeGraph> {
+  const projectRootDir = path.dirname(root.uri.fsPath);
+  const documents = new Map<string, vscode.TextDocument>();
+  const ordered: vscode.TextDocument[] = [];
+  const includeReferences: IncludeReference[] = [];
+  const missingIncludes: IncludeReference[] = [];
+  const includeCycles: string[][] = [];
+  const includedBy = new Map<string, string[]>();
+  const active: string[] = [];
+  const activeSet = new Set<string>();
+
+  const addParent = (targetKey: string, sourceUri: vscode.Uri) => {
+    const parent = path.basename(sourceUri.fsPath);
+    const parents = includedBy.get(targetKey) ?? [];
+    if (!parents.includes(parent)) parents.push(parent);
+    includedBy.set(targetKey, parents);
+  };
+
+  const visit = async (document: vscode.TextDocument, depth: number): Promise<void> => {
+    if (depth > 64) return;
+
+    const key = document.uri.toString();
+    if (!documents.has(key)) {
+      documents.set(key, document);
+      ordered.push(document);
+    }
+
+    if (activeSet.has(key)) return;
+    active.push(key);
+    activeSet.add(key);
+
+    for (const reference of extractIncludeReferences(document, projectRootDir)) {
+      includeReferences.push(reference);
+      const targetKey = reference.targetUri.toString();
+      addParent(targetKey, document.uri);
+
+      if (activeSet.has(targetKey)) {
+        const cycleStart = active.indexOf(targetKey);
+        const cycle = [...active.slice(cycleStart >= 0 ? cycleStart : 0), targetKey];
+        includeCycles.push(cycle.map(uri => vscode.Uri.parse(uri).fsPath));
+        continue;
+      }
+
+      let targetDocument: vscode.TextDocument;
+      try {
+        targetDocument = await vscode.workspace.openTextDocument(reference.targetUri);
+      } catch {
+        missingIncludes.push(reference);
+        continue;
+      }
+
+      if (!documents.has(targetKey)) {
+        await visit(targetDocument, depth + 1);
+      }
+    }
+
+    active.pop();
+    activeSet.delete(key);
+  };
+
+  await visit(root, 0);
+  return { documents, ordered, includeReferences, missingIncludes, includeCycles, includedBy };
+}
+
 async function findRootDocument(document: vscode.TextDocument): Promise<vscode.TextDocument> {
   const source = document.getText();
-  if (/\\documentclass/.test(source)) return document;
+  if (/\\documentclass/.test(stripLatexCommentsForIncludes(source))) return document;
+
   const magic = /^%\s*!TEX\s+root\s*=\s*(.+)$/mi.exec(source);
   if (magic) {
-    const rootUri = vscode.Uri.joinPath(document.uri, '..', magic[1].trim());
-    try { return await vscode.workspace.openTextDocument(rootUri); } catch { /* continue */ }
+    const rootPath = path.resolve(path.dirname(document.uri.fsPath), magic[1].trim());
+    try { return await vscode.workspace.openTextDocument(vscode.Uri.file(rootPath)); } catch { /* continue */ }
   }
+
   const folder = vscode.workspace.getWorkspaceFolder(document.uri);
   if (!folder) return document;
-  const candidates = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/*.tex'), '**/{node_modules,.git}/**', 250);
-  const base = document.uri.fsPath.replace(/\\/g, '/');
+
+  const candidates = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(folder, '**/*.tex'),
+    '**/{node_modules,.git}/**',
+    250
+  );
+  const targetKey = document.uri.toString();
+
   for (const uri of candidates) {
     try {
       const candidate = await vscode.workspace.openTextDocument(uri);
-      const text = candidate.getText();
-      if (!/\\documentclass/.test(text)) continue;
-      const includes = extractIncludeTargets(candidate);
-      if (includes.some(x => x.fsPath.replace(/\\/g, '/') === base)) return candidate;
-    } catch { /* ignore unreadable candidate */ }
+      if (!/\\documentclass/.test(stripLatexCommentsForIncludes(candidate.getText()))) continue;
+      const graph = await buildProjectIncludeGraph(candidate);
+      if (graph.documents.has(targetKey)) return candidate;
+    } catch {
+      // Ignore unreadable or malformed candidates and continue searching.
+    }
   }
-  return document;
-}
 
-function extractIncludeTargets(document: vscode.TextDocument): vscode.Uri[] {
-  const result: vscode.Uri[] = [];
-  const re = /\\(?:input|include)\s*\{([^}]+)\}/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(document.getText()))) {
-    let target = m[1].trim();
-    if (!target || /[\\#$]/.test(target)) continue;
-    if (!/\.[A-Za-z0-9]+$/.test(target)) target += '.tex';
-    result.push(vscode.Uri.joinPath(document.uri, '..', target));
-  }
-  return result;
+  return document;
 }
 
 async function loadProject(initial: vscode.TextDocument, output: vscode.OutputChannel): Promise<ProjectModel> {
   const root = await findRootDocument(initial);
-  const documents = new Map<string, vscode.TextDocument>();
-  const ordered: vscode.TextDocument[] = [];
-  const visit = async (document: vscode.TextDocument, depth: number) => {
-    const key = document.uri.toString();
-    if (documents.has(key) || depth > 12) return;
-    documents.set(key, document);
-    ordered.push(document);
-    for (const target of extractIncludeTargets(document)) {
-      try { await visit(await vscode.workspace.openTextDocument(target), depth + 1); }
-      catch { output.appendLine(`[warning] Included file not found: ${target.fsPath}`); }
-    }
-  };
-  await visit(root, 0);
+  const graph = await buildProjectIncludeGraph(root);
+
+  for (const reference of graph.missingIncludes) {
+    output.appendLine(`[warning] Included file not found: ${reference.targetUri.fsPath}`);
+  }
+  for (const cycle of graph.includeCycles) {
+    output.appendLine(`[warning] Circular include detected: ${cycle.map(x => path.basename(x)).join(' -> ')}`);
+  }
+
   const frames: FrameInfo[] = [];
-  for (const document of ordered) {
+  for (const document of graph.ordered) {
     for (const frame of parseFrames(document.getText(), document.uri.toString(), vscode.workspace.asRelativePath(document.uri, false))) {
       frame.index = frames.length;
       frames.push(frame);
     }
   }
-  return { root, documents, frames, isBeamer: isBeamerDocument(root.getText()), documentClass: getDocumentClass(root.getText()), metadata: getMetadata(root.getText()), presentationStyle: getPresentationStyle(root.getText()) };
+
+  return {
+    root,
+    documents: graph.documents,
+    includeReferences: graph.includeReferences,
+    missingIncludes: graph.missingIncludes,
+    includeCycles: graph.includeCycles,
+    includedBy: graph.includedBy,
+    frames,
+    isBeamer: isBeamerDocument(root.getText()),
+    documentClass: getDocumentClass(root.getText()),
+    metadata: getMetadata(root.getText()),
+    presentationStyle: getPresentationStyle(root.getText())
+  };
 }
 
 function getPreambleInfos(project: ProjectModel): PreambleInfo[] {
@@ -1992,6 +2212,25 @@ async function openPdfInVsCode(pdfUri: vscode.Uri, panel?: vscode.WebviewPanel) 
     preview: true
   });
   if (panel) panel.reveal(panel.viewColumn ?? vscode.ViewColumn.One, true);
+}
+
+
+async function getLatexFatalBuildMessage(logUri: vscode.Uri, previousMtime: number): Promise<string | undefined> {
+  try {
+    const stat = await vscode.workspace.fs.stat(logUri);
+    if (stat.mtime === previousMtime || stat.size <= 0) return undefined;
+    const bytes = await vscode.workspace.fs.readFile(logUri);
+    const text = new TextDecoder('utf-8').decode(bytes);
+    const fatal = /Fatal error occurred,\s*no output PDF file produced!/i.test(text) || /(?:^|\n).*Emergency stop\./m.test(text);
+    if (!fatal) return undefined;
+    const latexError = [...text.matchAll(/!\s*LaTeX Error:\s*([^\r\n]+)/g)].pop()?.[1]?.trim();
+    const fileError = [...text.matchAll(/!\s*LaTeX Error:\s*File\s+`([^']+)'\s+not found\./g)].pop()?.[1]?.trim();
+    if (fileError) return `LaTeX could not find ${fileError}.`;
+    if (latexError) return latexError;
+    return 'LaTeX stopped with a fatal error. Check the build log.';
+  } catch {
+    return undefined;
+  }
 }
 
 async function compileDocument(rootUri: vscode.Uri, panel?: vscode.WebviewPanel) {
@@ -3009,7 +3248,7 @@ body{display:flex;flex-direction:column}
 
 .document-continuous-wrap{display:flex;justify-content:center;padding:18px 0 82px}.document-continuous{box-sizing:border-box;width:min(900px,calc(100% - 24px));min-height:520px;margin:0 auto;background:var(--paper);border:1px solid color-mix(in srgb,var(--line-strong) 62%,transparent);border-radius:5px;box-shadow:0 14px 42px rgba(0,0,0,.14);padding:58px 72px 72px;font-size:16px;line-height:1.58;color:var(--fg);position:relative}.document-continuous .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-continuous .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-continuous .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}
 .document-pages{--doc-page-ratio:.7071;--doc-page-pad-x:72px;--doc-page-pad-top:64px;--doc-page-pad-bottom:70px;display:flex;flex-direction:column;align-items:center;gap:34px;padding:10px 0 82px}.document-sheet{box-sizing:border-box;width:min(794px,calc(100% - 24px));aspect-ratio:var(--doc-page-ratio);margin:0 auto;background:var(--paper);border:1px solid color-mix(in srgb,var(--line-strong) 76%,transparent);border-radius:5px;box-shadow:0 18px 52px rgba(0,0,0,.18);padding:var(--doc-page-pad-top) var(--doc-page-pad-x) var(--doc-page-pad-bottom);font-size:16px;line-height:1.58;color:var(--fg);overflow:hidden;position:relative}.document-page-content{height:100%;overflow:hidden}.document-page-number{position:absolute;bottom:18px;left:0;right:0;text-align:center;color:var(--muted);font-size:11px;opacity:.68;pointer-events:none}.document-sheet.page-overflow{box-shadow:0 0 0 1px color-mix(in srgb,var(--vscode-errorForeground) 55%,transparent),0 18px 52px rgba(0,0,0,.18)}.document-sheet.page-overflow:after{content:'Approx. page overflow';position:absolute;right:14px;bottom:15px;padding:3px 6px;border-radius:5px;background:var(--vscode-inputValidation-errorBackground,color-mix(in srgb,var(--vscode-errorForeground) 16%,var(--paper)));color:var(--vscode-inputValidation-errorForeground,var(--vscode-errorForeground));font-size:10px;font-weight:650}.doc-page-break-note{position:absolute;left:14px;bottom:16px;color:var(--muted);font-size:10px;opacity:.55;pointer-events:none}
-.doc-title{text-align:center;margin:18px 0 58px}.doc-title h1{font-size:2.05em;margin:0 0 12px;font-weight:650}.doc-title>div{color:var(--muted);margin-top:5px}.doc-heading{scroll-margin-top:72px;color:var(--fg);font-weight:650}.doc-heading.level-1{font-size:1.85em;margin:46px 0 22px}.doc-heading.level-2{font-size:1.55em;margin:38px 0 18px}.doc-heading.level-3{font-size:1.27em;margin:30px 0 14px}.doc-heading.level-4{font-size:1.1em;margin:24px 0 12px}.doc-paragraph{margin:0 0 18px;white-space:pre-wrap}.doc-list{margin:10px 0 22px;padding-left:2.1em}.doc-list li{margin:6px 0}.doc-math{position:relative;margin:24px 0;text-align:center;overflow-x:auto;padding:0 2.2em}.doc-equation-number{position:absolute;right:.2em;top:50%;transform:translateY(-50%);font-size:.9em;color:var(--muted)}.doc-code{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;background:color-mix(in srgb,var(--paper) 88%,var(--fg) 12%);padding:.08em .28em;border-radius:4px}.doc-latex-block{margin:22px 0;padding:14px 18px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 92%,var(--accent) 8%)}.doc-block-title{font-weight:650;margin-bottom:8px}.doc-figure-placeholder{margin:24px auto;padding:32px;border:1px dashed var(--line-strong);text-align:center;color:var(--muted);border-radius:8px}.doc-raw{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.doc-raw pre{white-space:pre-wrap;margin:8px 0 0}.doc-mode-note{text-align:right;color:var(--muted);font-size:11px;margin-top:54px}.doc-outline{padding:7px 10px;border-radius:6px;cursor:pointer;color:var(--muted);line-height:1.25}.doc-outline:hover{background:var(--hover);color:var(--fg)}.doc-outline.level-1{font-weight:700;color:var(--fg);margin-top:9px}.doc-outline.level-2{font-weight:600;color:var(--fg);margin-top:7px}.doc-outline.level-3{padding-left:20px;font-size:.94em}.doc-outline.level-4{padding-left:30px;font-size:.9em}.doc-outline-object{font-size:.86em;color:var(--muted);padding-top:5px;padding-bottom:5px}.doc-outline-object.depth-1{padding-left:18px}.doc-outline-object.depth-2{padding-left:26px}.doc-outline-object.depth-3{padding-left:34px}.doc-outline-object.depth-4,.doc-outline-object.depth-5{padding-left:42px}.doc-outline-object .outline-kind{font-size:.82em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:5px}.doc-outline-object .outline-label{color:var(--fg)}.doc-outline-empty{padding:12px 10px;color:var(--muted);font-size:.9em}.doc-outline-matter{margin:14px 8px 5px;padding-top:8px;border-top:1px solid var(--line);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.doc-heading.starred:before{content:'◇ ';color:var(--muted);font-size:.72em;vertical-align:.15em}.doc-toc{margin:28px 0 44px;padding:24px 26px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--paper) 98%,var(--fg) 2%)}.doc-toc h2{font-size:1.45em;margin:0 0 16px}.doc-toc-row{display:grid;grid-template-columns:4.7em 1fr;width:100%;border:0;background:transparent;color:var(--fg);font:inherit;text-align:left;padding:5px 4px;border-radius:4px;cursor:pointer}.doc-toc-row:hover{background:var(--hover)}.doc-toc-row.level-2{padding-left:14px}.doc-toc-row.level-3{padding-left:28px}.doc-toc-row.level-4{padding-left:42px;font-size:.94em}.doc-toc-number{font-variant-numeric:tabular-nums;color:var(--muted)}.doc-toc-note,.doc-toc-empty{margin-top:13px;font-size:.82em;color:var(--muted)}.document-pane{overflow:auto;padding:0 18px}.document-pane .document-pages{padding-top:10px}.document-pane .document-continuous-wrap{padding-top:10px}.document-pane .document-continuous{padding:44px 48px 54px}.document-pane .document-sheet{--doc-page-pad-x:48px;--doc-page-pad-top:44px;--doc-page-pad-bottom:54px}.workspace>.document-pages{padding-top:18px}.document-sheet .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-sheet .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-sheet .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-item-editable{min-height:1.4em;padding:1px 3px}.doc-math{cursor:default}.doc-math:hover{background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%);border-radius:6px}
+.doc-title{text-align:center;margin:18px 0 58px}.doc-title h1{font-size:2.05em;margin:0 0 12px;font-weight:650}.doc-title>div{color:var(--muted);margin-top:5px}.doc-heading{scroll-margin-top:72px;color:var(--fg);font-weight:650}.doc-heading.level-1{font-size:1.85em;margin:46px 0 22px}.doc-heading.level-2{font-size:1.55em;margin:38px 0 18px}.doc-heading.level-3{font-size:1.27em;margin:30px 0 14px}.doc-heading.level-4{font-size:1.1em;margin:24px 0 12px}.doc-paragraph{margin:0 0 18px;white-space:pre-wrap}.doc-list{margin:10px 0 22px;padding-left:2.1em}.doc-list li{margin:6px 0}.doc-math{position:relative;margin:24px 0;text-align:center;overflow-x:auto;padding:0 2.2em}.doc-equation-number{position:absolute;right:.2em;top:50%;transform:translateY(-50%);font-size:.9em;color:var(--muted)}.doc-code{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;background:color-mix(in srgb,var(--paper) 88%,var(--fg) 12%);padding:.08em .28em;border-radius:4px}.doc-latex-block{margin:22px 0;padding:14px 18px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 92%,var(--accent) 8%)}.doc-block-title{font-weight:650;margin-bottom:8px}.doc-figure-placeholder{margin:24px auto;padding:32px;border:1px dashed var(--line-strong);text-align:center;color:var(--muted);border-radius:8px}.doc-raw{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.doc-raw pre{white-space:pre-wrap;margin:8px 0 0}.doc-include{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--paper) 97%,var(--vscode-editorWidget-background));display:flex;align-items:center;gap:12px}.doc-include-main{min-width:0;flex:1}.doc-include-kind{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}.doc-include-path{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.doc-include-meta{font-size:10px;color:var(--muted);margin-top:3px}.doc-include button{border:1px solid var(--line-strong);border-radius:5px;padding:5px 9px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.doc-include button:hover{background:var(--vscode-button-secondaryHoverBackground)}.doc-include.missing{border-color:var(--vscode-inputValidation-warningBorder,var(--vscode-errorForeground));background:var(--vscode-inputValidation-warningBackground,color-mix(in srgb,var(--paper) 94%,var(--vscode-errorForeground) 6%))}.doc-include.missing .doc-include-kind{color:var(--vscode-inputValidation-warningForeground,var(--vscode-errorForeground))}.doc-mode-note{text-align:right;color:var(--muted);font-size:11px;margin-top:54px}.doc-outline{padding:7px 10px;border-radius:6px;cursor:pointer;color:var(--muted);line-height:1.25}.doc-outline:hover{background:var(--hover);color:var(--fg)}.doc-outline.level-1{font-weight:700;color:var(--fg);margin-top:9px}.doc-outline.level-2{font-weight:600;color:var(--fg);margin-top:7px}.doc-outline.level-3{padding-left:20px;font-size:.94em}.doc-outline.level-4{padding-left:30px;font-size:.9em}.doc-outline-object{font-size:.86em;color:var(--muted);padding-top:5px;padding-bottom:5px}.doc-outline-object.depth-1{padding-left:18px}.doc-outline-object.depth-2{padding-left:26px}.doc-outline-object.depth-3{padding-left:34px}.doc-outline-object.depth-4,.doc-outline-object.depth-5{padding-left:42px}.doc-outline-object .outline-kind{font-size:.82em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:5px}.doc-outline-object .outline-label{color:var(--fg)}.doc-outline-empty{padding:12px 10px;color:var(--muted);font-size:.9em}.doc-outline-matter{margin:14px 8px 5px;padding-top:8px;border-top:1px solid var(--line);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.doc-heading.starred:before{content:'◇ ';color:var(--muted);font-size:.72em;vertical-align:.15em}.doc-toc{margin:28px 0 44px;padding:24px 26px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--paper) 98%,var(--fg) 2%)}.doc-toc h2{font-size:1.45em;margin:0 0 16px}.doc-toc-row{display:grid;grid-template-columns:4.7em 1fr;width:100%;border:0;background:transparent;color:var(--fg);font:inherit;text-align:left;padding:5px 4px;border-radius:4px;cursor:pointer}.doc-toc-row:hover{background:var(--hover)}.doc-toc-row.level-2{padding-left:14px}.doc-toc-row.level-3{padding-left:28px}.doc-toc-row.level-4{padding-left:42px;font-size:.94em}.doc-toc-number{font-variant-numeric:tabular-nums;color:var(--muted)}.doc-toc-note,.doc-toc-empty{margin-top:13px;font-size:.82em;color:var(--muted)}.document-pane{overflow:auto;padding:0 18px}.document-pane .document-pages{padding-top:10px}.document-pane .document-continuous-wrap{padding-top:10px}.document-pane .document-continuous{padding:44px 48px 54px}.document-pane .document-sheet{--doc-page-pad-x:48px;--doc-page-pad-top:44px;--doc-page-pad-bottom:54px}.workspace>.document-pages{padding-top:18px}.document-sheet .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-sheet .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-sheet .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-item-editable{min-height:1.4em;padding:1px 3px}.doc-math{cursor:default}.doc-math:hover{background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%);border-radius:6px}
 .texflow-semantic-block{position:relative;outline:none}.texflow-semantic-block.semantic-block-selected{outline:2px solid color-mix(in srgb,var(--accent) 72%,transparent);outline-offset:5px;border-radius:7px}.semantic-delete{position:absolute;z-index:8;right:-9px;top:-11px;width:24px;height:24px;display:none;align-items:center;justify-content:center;border:1px solid var(--line-strong);border-radius:999px;background:var(--vscode-editor-background);color:var(--vscode-foreground);font:600 17px/1 var(--vscode-font-family);cursor:pointer;box-shadow:0 2px 7px rgba(0,0,0,.25)}.texflow-semantic-block.semantic-block-selected>.semantic-delete{display:flex}.semantic-delete:hover{background:var(--vscode-inputValidation-errorBackground,var(--hover));border-color:var(--vscode-inputValidation-errorBorder,var(--line-strong))}.doc-after-block-slot{min-height:18px;margin:-4px 0 8px;border-radius:5px;display:flex;align-items:center;justify-content:flex-start;color:transparent;font-size:11px;cursor:text;outline:none;transition:color .12s,background .12s}.doc-after-block-slot:before{content:'Start typing…';padding:2px 6px}.doc-after-block-slot:hover,.doc-after-block-slot:focus{color:var(--muted);background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%)}
 
 @media(max-width:900px){:root{--sidebar:190px;--toolrail:58px}.main{padding:22px}.slide{padding:30px 34px;min-height:480px}.tool-label{display:none}.menu-trigger,.rail-action{height:45px}.topbar-brand span:last-child{display:none}.mode-tab{padding:6px 8px}}
@@ -3202,7 +3441,7 @@ body{display:flex;flex-direction:column}
 </div>
 <script nonce="${nonce}" src="${katexJs}"></script>
 <script nonce="${nonce}">
-const vscode=acquireVsCodeApi();let frames=[],current=0,isBeamer=false,documentClass='',documentSource='',metadata={},documentSettings={},documentLayoutMode='continuous',preambleOriginalText='',preambleDirty=false,presentationStyle={aspectWidth:4,aspectHeight:3,aspectLabel:'4:3',baseFontPt:11,bodyFontPx:16,titleFontPx:24.8,lineHeight:1.28},preambles=[],currentPreamble='root-preamble',mode='frames',viewMode='visual',sources=[],rootUri='',pdfUri='',figureResources={},bibliographyEntries=[],bibliographyResources=[],bibliographyByKey={};
+const vscode=acquireVsCodeApi();let frames=[],current=0,isBeamer=false,documentClass='',documentSource='',metadata={},documentSettings={},documentLayoutMode='continuous',preambleOriginalText='',preambleDirty=false,presentationStyle={aspectWidth:4,aspectHeight:3,aspectLabel:'4:3',baseFontPt:11,bodyFontPx:16,titleFontPx:24.8,lineHeight:1.28},preambles=[],currentPreamble='root-preamble',mode='frames',viewMode='visual',sources=[],projectIncludes=[],rootUri='',pdfUri='',figureResources={},bibliographyEntries=[],bibliographyResources=[],bibliographyByKey={};
 window.addEventListener('error',e=>{const c=document.getElementById('content');if(c)c.innerHTML='<div class="empty">TeXFlow error: '+esc(e.message||'unknown error')+'</div>';});
 let pdfBuildState='idle',pdfBuildMessage='';
 const TEXFLOW_SPELL_HIGHLIGHT='texflow-spelling';
@@ -3226,7 +3465,7 @@ function texflowApplySuggestion(blockId,issue,replacement){texflowCollectSpellBl
 document.addEventListener('input',e=>{if(e.target&&e.target.closest&&e.target.closest('[contenteditable="true"]'))texflowScheduleSpellcheck();});
 document.addEventListener('contextmenu',e=>{const target=e.target&&e.target.closest?e.target.closest('[contenteditable="true"]'):null;if(!target||!texflowSpellState.enabled)return;const hit=texflowIssueAtPoint(e.clientX,e.clientY);if(!hit)return;const sugg=(hit.issue.suggestions||[]).slice(0,5);e.preventDefault();e.stopPropagation();texflowShowSpellMenu(e.clientX,e.clientY,sugg,item=>texflowApplySuggestion(hit.blockId,hit.issue,item));},{capture:true});if(texflowSpellState.requestTimer)clearTimeout(texflowSpellState.requestTimer);
 function texflowShowSpellMenu(x,y,items,apply){texflowSpellMenu.innerHTML='';if(!items.length){const b=document.createElement('button');b.textContent='Close';b.onclick=()=>texflowSpellMenu.style.display='none';texflowSpellMenu.appendChild(b);}else{items.forEach(item=>{const b=document.createElement('button');b.textContent=item;b.style.cssText='display:block;width:100%;text-align:left;padding:7px 9px;border:0;background:transparent;color:inherit;border-radius:5px;cursor:pointer;font:inherit;';b.onmouseenter=()=>b.style.background='var(--vscode-list-hoverBackground,var(--hover))';b.onmouseleave=()=>b.style.background='transparent';b.onclick=()=>{texflowSpellMenu.style.display='none';apply(item);};texflowSpellMenu.appendChild(b);});const close=document.createElement('button');close.textContent='Close';close.style.cssText='display:block;width:100%;margin-top:4px;text-align:left;padding:7px 9px;border:0;background:transparent;color:inherit;border-radius:5px;cursor:pointer;font:inherit;';close.onclick=()=>texflowSpellMenu.style.display='none';texflowSpellMenu.appendChild(close);}texflowSpellMenu.style.left=Math.max(8,Math.min(window.innerWidth-260,x))+'px';texflowSpellMenu.style.top=Math.max(8,Math.min(window.innerHeight-180,y))+'px';texflowSpellMenu.style.display='block';}
-window.addEventListener('message',e=>{if(e.data.type==='spellcheckResult'){if(String(e.data.requestId||'')!==String(texflowSpellState.pendingRequestId||''))return;if(!texflowSpellState.supported)return;texflowApplySpellHighlights(e.data.issuesById||{});return;}if(e.data.type==='compileStarted'){pdfBuildState='building';pdfBuildMessage='Compiling…';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFinished'){pdfBuildState='ready';pdfBuildMessage='PDF compiled and opened in the VS Code PDF viewer.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFailed'){pdfBuildState='error';pdfBuildMessage=e.data.message||'Compilation failed.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='saveStatus'){const el=document.getElementById('save-status');el.textContent=e.data.state==='saving'?'Saving…':e.data.state==='error'?'Save error':(e.data.message||'Saved');el.classList.toggle('error',e.data.state==='error');if(e.data.state==='saved'){clearTimeout(window.__texflowStatusTimer);window.__texflowStatusTimer=setTimeout(()=>{el.textContent='Saved';},1600);}return;}if(e.data.type==='document'){frames=e.data.frames;isBeamer=!!e.data.isBeamer;documentClass=e.data.documentClass||'';documentSource=e.data.documentSource||'';metadata=e.data.metadata||{};documentSettings=e.data.documentSettings||documentSettings||{};presentationStyle=e.data.presentationStyle||presentationStyle;applyPresentationStyle();preambles=e.data.preambles||[];sources=e.data.sources||[];rootUri=e.data.rootUri||'';pdfUri=e.data.pdfUri||'';figureResources=e.data.figureResources||{};bibliographyEntries=e.data.bibliographyEntries||[];bibliographyResources=e.data.bibliographyResources||[];bibliographyByKey={};bibliographyEntries.forEach(x=>bibliographyByKey[x.key]=x);if(e.data.spellCheckSettings){texflowSpellState.enabled=!!e.data.spellCheckSettings.enabled;texflowSpellState.language=e.data.spellCheckSettings.language||'auto';}if(Number.isInteger(e.data.selectedFrame))current=Math.max(0,Math.min(e.data.selectedFrame,frames.length-1));if(!preambles.some(x=>x.id===currentPreamble)&&preambles[0])currentPreamble=preambles[0].id;document.querySelectorAll('.beamer-only').forEach(x=>x.classList.toggle('hidden',!isBeamer));document.querySelectorAll('.document-only').forEach(x=>x.classList.toggle('hidden',isBeamer));updateDocumentViewMenu();renderTopMenus();texflowUpdateLanguageMenu();renderNav();if(mode==='preamble')renderPreamble(currentPreamble);else renderWorkspace();if(e.data.focusFrameTitle){requestAnimationFrame(()=>{const t=document.querySelector('.workspace .slide .title[contenteditable=true]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}if(e.data.focusNewMath){requestAnimationFrame(()=>{const f=frames[current];if(!f)return;const maths=parseBlocks(f.body).filter(b=>b.kind==='equation');const b=maths[maths.length-1];if(b)openMathEditor(b,current);});}if(Number.isFinite(e.data.focusDocumentHeadingStart)){requestAnimationFrame(()=>{const t=document.querySelector('.doc-heading[data-node-start="'+String(e.data.focusDocumentHeadingStart)+'"]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}texflowScheduleSpellcheck();}});
+window.addEventListener('message',e=>{if(e.data.type==='spellcheckResult'){if(String(e.data.requestId||'')!==String(texflowSpellState.pendingRequestId||''))return;if(!texflowSpellState.supported)return;texflowApplySpellHighlights(e.data.issuesById||{});return;}if(e.data.type==='compileStarted'){pdfBuildState='building';pdfBuildMessage='Compiling…';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFinished'){pdfBuildState='ready';pdfBuildMessage='PDF compiled and opened in the VS Code PDF viewer.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFailed'){pdfBuildState='error';pdfBuildMessage=e.data.message||'Compilation failed.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='saveStatus'){const el=document.getElementById('save-status');el.textContent=e.data.state==='saving'?'Saving…':e.data.state==='error'?'Save error':(e.data.message||'Saved');el.classList.toggle('error',e.data.state==='error');if(e.data.state==='saved'){clearTimeout(window.__texflowStatusTimer);window.__texflowStatusTimer=setTimeout(()=>{el.textContent='Saved';},1600);}return;}if(e.data.type==='document'){frames=e.data.frames;isBeamer=!!e.data.isBeamer;documentClass=e.data.documentClass||'';documentSource=e.data.documentSource||'';metadata=e.data.metadata||{};documentSettings=e.data.documentSettings||documentSettings||{};presentationStyle=e.data.presentationStyle||presentationStyle;applyPresentationStyle();preambles=e.data.preambles||[];sources=e.data.sources||[];projectIncludes=e.data.projectIncludes||[];rootUri=e.data.rootUri||'';pdfUri=e.data.pdfUri||'';figureResources=e.data.figureResources||{};bibliographyEntries=e.data.bibliographyEntries||[];bibliographyResources=e.data.bibliographyResources||[];bibliographyByKey={};bibliographyEntries.forEach(x=>bibliographyByKey[x.key]=x);if(e.data.spellCheckSettings){texflowSpellState.enabled=!!e.data.spellCheckSettings.enabled;texflowSpellState.language=e.data.spellCheckSettings.language||'auto';}if(Number.isInteger(e.data.selectedFrame))current=Math.max(0,Math.min(e.data.selectedFrame,frames.length-1));if(!preambles.some(x=>x.id===currentPreamble)&&preambles[0])currentPreamble=preambles[0].id;document.querySelectorAll('.beamer-only').forEach(x=>x.classList.toggle('hidden',!isBeamer));document.querySelectorAll('.document-only').forEach(x=>x.classList.toggle('hidden',isBeamer));updateDocumentViewMenu();renderTopMenus();texflowUpdateLanguageMenu();renderNav();if(mode==='preamble')renderPreamble(currentPreamble);else renderWorkspace();if(e.data.focusFrameTitle){requestAnimationFrame(()=>{const t=document.querySelector('.workspace .slide .title[contenteditable=true]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}if(e.data.focusNewMath){requestAnimationFrame(()=>{const f=frames[current];if(!f)return;const maths=parseBlocks(f.body).filter(b=>b.kind==='equation');const b=maths[maths.length-1];if(b)openMathEditor(b,current);});}if(Number.isFinite(e.data.focusDocumentHeadingStart)){requestAnimationFrame(()=>{const t=document.querySelector('.doc-heading[data-node-start="'+String(e.data.focusDocumentHeadingStart)+'"]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}texflowScheduleSpellcheck();}});
 function esc(s){return String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));}
 let activeEditable=null;const saveTimers=new WeakMap();function scheduleSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);document.getElementById('save-status').textContent='Editing…';saveTimers.set(el,setTimeout(()=>send(false),500));}function flushSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);send(true);}
 function markdownToLatex(text){
@@ -3582,12 +3821,23 @@ function parseDocumentChunk(raw,base,out,nextId){
  while((m=title.exec(source))){parseSegment(cur,m.index);cur=title.lastIndex;}
  parseSegment(cur,source.length);
 }
+function documentTokenIsCommented(source,pos){
+ const lineStart=Math.max(source.lastIndexOf('\n',Math.max(0,pos-1))+1,0);
+ const prefix=source.slice(lineStart,pos);let escaped=false;
+ for(let i=0;i<prefix.length;i++){
+  if(prefix[i]==='\\'){escaped=!escaped;continue;}
+  if(prefix[i]==='%'&&!escaped)return true;
+  escaped=false;
+ }
+ return false;
+}
 function parseDocumentFlow(){
  const info=documentBodyInfo(),body=info.source,out=[];let cur=0,n=0;const nextId=()=>n++;
  // Structural tokens are parsed in document order. Matter switches are preserved in Source
  // but are intentionally invisible in the visual body. TOC is rendered from the same
- // heading tree used by the document navigator.
- const tokenRe=/\\(chapter|section|subsection|subsubsection|paragraph)(\*)?\{([^}]*)\}|\\(tableofcontents|printbibliography|frontmatter|mainmatter|backmatter)\b|\\(bibliographystyle|bibliography)\{([^}]*)\}/g;let m;
+ // heading tree used by the document navigator. input/include are represented as
+ // read-only project links rather than generic "LaTeX preserved" blocks.
+ const tokenRe=/\\(chapter|section|subsection|subsubsection|paragraph)(\*)?\{([^}]*)\}|\\(tableofcontents|printbibliography|frontmatter|mainmatter|backmatter)\b|\\(bibliographystyle|bibliography)\{([^}]*)\}|\\(input|include)\s*\{([^}]+)\}/g;let m;
  function pushChunk(a,b){
   let start=a;
   // A label immediately following a heading belongs to that heading structurally.
@@ -3609,6 +3859,7 @@ function parseDocumentFlow(){
   parseDocumentChunk(raw,info.start+start,out,nextId);
  }
  while((m=tokenRe.exec(body))){
+  if(documentTokenIsCommented(body,m.index))continue;
   pushChunk(cur,m.index);
   if(m[1]){
    const command=m[1],starred=!!m[2],title=m[3]||'';
@@ -3622,6 +3873,14 @@ function parseDocumentFlow(){
    out.push({kind:'bibliography',id:'doc-bib'+nextId(),start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
   }else if(m[5]==='bibliographystyle'){
    /* style command is metadata; preserve in Source, do not render */
+  }else if(m[7]){
+   const absStart=info.start+m.index,absEnd=info.start+tokenRe.lastIndex;
+   const ref=projectIncludes.find(r=>r.sourceUri===rootUri&&Number(r.start)===absStart);
+   out.push({
+    kind:'include',id:'doc-include'+nextId(),start:absStart,end:absEnd,raw:m[0],
+    includeCommand:m[7],includeTarget:String(m[8]||'').trim(),
+    targetUri:ref&&ref.targetUri||'',missing:!!(ref&&ref.missing)
+   });
   }else{
    out.push({kind:'matter',id:'doc-matter'+nextId(),matter:m[4],start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
   }
@@ -3758,6 +4017,12 @@ function bindDocumentTable(el,node){
  el.addEventListener('click',()=>setStructuralTarget(node,el));
  bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));
 }
+function documentIncludeHtml(node){
+ const target=String(node.includeTarget||''),missing=!!node.missing,command=String(node.includeCommand||'input');
+ const displayTarget=target+(target&&!/\.[A-Za-z0-9]+$/.test(target)?'.tex':'');
+ const action=!missing&&node.targetUri?'<button class="doc-include-open" data-uri="'+esc(node.targetUri)+'" data-target="'+esc(displayTarget)+'">Open source</button>':'';
+ return '<div class="doc-include'+(missing?' missing':'')+'" data-node-id="'+node.id+'"><div class="doc-include-main"><div class="doc-include-kind">'+(missing?'Missing included file':'Included file')+'</div><div class="doc-include-path">'+esc(displayTarget||target)+'</div><div class="doc-include-meta">\\'+esc(command)+' · source preserved</div></div>'+action+'</div>';
+}
 function documentBlockHtml(node){
  const b=node.block;
  if(b.kind==='paragraph')return '<div class="doc-paragraph doc-editable '+alignClass(b.align,'justify')+'" data-node-id="'+node.id+'"'+(node.synthetic?' data-synthetic="true" data-placeholder="Start typing…"':'')+' contenteditable="true">'+latexToHtml(b.text||'')+'</div>';
@@ -3809,6 +4074,7 @@ function documentFlowInnerHtml(){
   if(x.kind==='matter')return;
   if(x.kind==='toc'){html+=documentTocHtml(flow);return;}
   if(x.kind==='bibliography'){html+=bibliographyHtml(x.id);return;}
+  if(x.kind==='include'){html+=documentIncludeHtml(x);return;}
   if(x.kind==='heading'){const tag=x.level<=1?'h1':x.level===2?'h2':x.level===3?'h3':'h4',labelAttr=x.label?' data-label="'+esc(x.label)+'"':'';html+='<'+tag+' id="'+x.id+'" data-node-id="'+x.id+'" data-node-start="'+x.start+'"'+labelAttr+' contenteditable="true" class="doc-heading doc-editable level-'+x.level+(x.starred?' starred':'')+'">'+latexToHtml(x.title||'')+'</'+tag+'>';return;}
   html+=documentBlockHtml(x);
   if(isAtomicDocumentBlockNode(x)){
@@ -3952,6 +4218,7 @@ function bindVisualDocument(host){
  const flow=parseDocumentFlow();const byId={};flow.forEach(x=>byId[x.id]=x);
  host.querySelectorAll('.doc-heading[contenteditable=true]').forEach(el=>{const node=byId[el.dataset.nodeId];attachEditor(el);let exiting=false;const save=refresh=>{const text=editableLatex(el).replace(/\n+/g,' ').trim();updateDocumentNode(node,'\\'+node.command+(node.starred?'*':'')+'{'+text+'}',refresh);};el.__texflowSaveNow=()=>save(false);el.addEventListener('input',()=>scheduleSave(el,save));el.addEventListener('blur',()=>{if(exiting){exiting=false;return;}flushSave(el,save);});el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const old=saveTimers.get(el);if(old)clearTimeout(old);exiting=true;save(false);const next=el.nextElementSibling;if(next&&next.classList&&next.classList.contains('doc-paragraph'))focusParagraphStart(next);else createSyntheticParagraphAfter(el,node,'');}});});
  host.querySelectorAll('.doc-paragraph[contenteditable=true]').forEach(el=>bindDocumentParagraph(el,byId[el.dataset.nodeId]));bindMultiParagraphMouseSelection(host);host.querySelectorAll('.doc-toc-row[data-target]').forEach(el=>el.addEventListener('click',()=>{const target=host.querySelector('#'+el.dataset.target)||document.getElementById(el.dataset.target);if(target)target.scrollIntoView({behavior:'smooth',block:'start'});}));
+ host.querySelectorAll('.doc-include-open[data-uri]').forEach(el=>el.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();vscode.postMessage({type:'openIncludedSource',uri:el.dataset.uri||'',target:el.dataset.target||''});}));
  host.querySelectorAll('.doc-list').forEach(list=>bindDocumentList(list,byId[list.dataset.nodeId]));
  host.querySelectorAll('.doc-math').forEach(el=>{const node=byId[el.dataset.nodeId],numberText=el.querySelector('.doc-equation-number')?.textContent||'';try{katex.render(el.dataset.tex||'',el,{displayMode:true,throwOnError:false});if(numberText){const n=document.createElement('span');n.className='doc-equation-number';n.textContent=numberText;el.appendChild(n);}}catch{el.textContent=el.dataset.tex||'';}el.title='Double-click to edit equation';el.addEventListener('dblclick',()=>openDocumentMathEditor(node));});
  host.querySelectorAll('.doc-heading[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];el.addEventListener('focus',()=>setStructuralTarget(node,el));el.addEventListener('click',()=>setStructuralTarget(node,el));});
