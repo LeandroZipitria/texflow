@@ -39,7 +39,6 @@ function buildHostParser() {
     sliceBetween(compiled, 'function findEnvironmentEnd(', 'function parseItems('),
     sliceBetween(compiled, 'function parseItems(', 'function normalizeEditableText(')
   ];
-
   const context = vm.createContext({ console });
   vm.runInContext(
     parts.join('\n\n') + '\n;globalThis.__parseBlocks = parseBlocks;',
@@ -51,15 +50,19 @@ function buildHostParser() {
 
 function buildWebviewParser() {
   // These are JavaScript functions embedded in the webview template.
+  //
+  // IMPORTANT: parseBlocks now shares findMatchingEnvEnd with the visual
+  // preview for commented-out blocks. The parity harness runs parseBlocks
+  // in an isolated VM, so the shared helper must be extracted explicitly.
   const parts = [
     sliceBetween(source, 'function splitTopItems(', 'function createVisualList('),
     sliceBetween(source, 'function alignmentFromDirective(', 'function isOnlyAlignmentDirective('),
     sliceBetween(source, 'function isOnlyAlignmentDirective(', 'function alignClass('),
     sliceBetween(source, 'function figureData(', 'function tableData('),
     sliceBetween(source, 'function tableData(', 'function parseBlocks(body){'),
+    sliceBetween(source, 'function findMatchingEnvEnd(', 'function commentedBlockPreviewHtml('),
     sliceBetween(source, 'function parseBlocks(body){', 'function applyPresentationStyle(')
   ];
-
   const context = vm.createContext({ console });
   vm.runInContext(
     parts.join('\n\n') + '\n;globalThis.__parseBlocks = parseBlocks;',
@@ -79,7 +82,6 @@ function projection(block) {
 
   if (block.kind === 'paragraph') out.align = block.align || 'justify';
   if (block.env) out.env = block.env;
-
   if (block.kind === 'columns') {
     out.columnCount = block.columnCount;
     out.columnTexts = block.columnTexts;
@@ -108,7 +110,8 @@ const cases = [
   ['multicols', '\\begin{multicols}{2}\nFirst column.\n\\columnbreak\nSecond column.\n\\end{multicols}'],
   ['beamer columns', '\\begin{columns}[T]\n\\column{0.48\\textwidth}\nLeft\n\\column{0.48\\textwidth}\nRight\n\\end{columns}'],
   ['equation', '\\begin{equation}\nx=1\n\\end{equation}'],
-  ['comment + prose', '% comment\n\nNormal paragraph.']
+  ['comment + prose', '% comment\n\nNormal paragraph.'],
+  ['comment environment', '\\begin{comment}\nOld paragraph.\n\\begin{equation}\nx=y\n\\end{equation}\n\\end{comment}\n\nVisible paragraph.']
 ];
 
 let hostParse;
@@ -128,7 +131,6 @@ let failures = 0;
 for (const [name, body] of cases) {
   let host;
   let web;
-
   try {
     host = hostParse(body).map(projection);
     web = webParse(body).map(projection);
