@@ -10,7 +10,7 @@ This document collects possible directions for future development. It is intenti
 
 ## Current baseline
 
-Stable release: **v0.17.0**
+Stable release: **v0.18.0**
 
 The current release includes, among other features:
 
@@ -36,7 +36,14 @@ The current release includes, among other features:
 - creation of standalone `.tex` files;
 - creation of LaTeX project folders with `main.tex`, `preamble.tex`, and `figures/`;
 - project navigator for `.tex`, `.bib`, and supported figure files;
-- Explorer context actions for creating and opening TeXFlow documents.
+- Explorer context actions for creating and opening TeXFlow documents;
+- multi-file LaTeX project awareness;
+- detection of `\input` and `\include` relationships;
+- nested included-file discovery;
+- main-document identification;
+- visual representation of included and missing source files;
+- safe handling of missing files and circular includes;
+- faster reporting of fatal LaTeX compilation errors.
 
 Validated functionality from the current baseline should not be reopened unless a new feature requires it or a reproducible bug is found.
 
@@ -501,6 +508,8 @@ The visual settings panel should never attempt to replace the full LaTeX preambl
 
 ## Multi-file LaTeX projects
 
+**Status: partially implemented**
+
 Support larger projects using:
 
 - `\input`;
@@ -510,11 +519,22 @@ Support larger projects using:
 - shared bibliography files;
 - cross-file labels and references.
 
+Current support includes:
+
+- detection of `\input` and `\include`;
+- nested project relationships;
+- main-document awareness;
+- included-file relationships in the Project Navigator;
+- visual include/missing-include indicators;
+- safe handling of circular and missing includes.
+
+Included `.tex` files remain separate source files. Project-wide visual editing, project-wide outline, labels, references, and structural editing across files remain future work.
+
 Possible features:
 
 - project-wide outline;
-- navigate between files;
-- identify the master document;
+- open included files directly in TeXFlow while retaining the main document as compilation context;
+- project-wide labels and cross-references;
 - visual editing while preserving the original project structure.
 
 This would be important for:
