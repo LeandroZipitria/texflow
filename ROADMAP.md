@@ -10,7 +10,7 @@ This document collects possible directions for future development. It is intenti
 
 ## Current baseline
 
-Stable release: **v0.18.0**
+Stable release: **v0.19.0**
 
 The current release includes, among other features:
 
@@ -37,13 +37,11 @@ The current release includes, among other features:
 - creation of LaTeX project folders with `main.tex`, `preamble.tex`, and `figures/`;
 - project navigator for `.tex`, `.bib`, and supported figure files;
 - Explorer context actions for creating and opening TeXFlow documents;
-- multi-file LaTeX project awareness;
-- detection of `\input` and `\include` relationships;
-- nested included-file discovery;
-- main-document identification;
-- visual representation of included and missing source files;
-- safe handling of missing files and circular includes;
-- faster reporting of fatal LaTeX compilation errors.
+- multi-file project awareness for `\input` and `\include`, including nested files, missing includes, cycles, and main-document identification;
+- document search in Visual mode with highlighted matches and next/previous navigation, including across Beamer frames;
+- source comments, author notes, and commented-out blocks represented by compact visual markers;
+- a bottom comments inspector that stays outside the document/page/slide layout;
+- insertion of comments and notes plus conversion of selected text into commented-out content.
 
 Validated functionality from the current baseline should not be reopened unless a new feature requires it or a reproducible bug is found.
 
@@ -102,17 +100,35 @@ Any external AI integration should be explicit, configurable, and opt-in.
 
 ---
 
-## Comments and review
+## Comments and notes
 
-Possible review tools:
+**Status: partially implemented**
 
-- visual comments;
-- highlights;
+Current support includes:
+
+- detection of ordinary LaTeX `%` source comments;
+- TeXFlow author notes using `% TeXFlow note: ...`;
+- detection and preservation of `comment` environments;
+- insertion of source comments, author notes, and commented-out blocks;
+- conversion of selected Visual text into commented-out content;
+- compact `C` markers anchored to the relevant document location without consuming document or slide height;
+- a bottom comments inspector outside the page/slide layout;
+- visual previews for commented-out LaTeX;
+- explicit visual-only hiding of comment markers;
+- explicit source deletion with confirmation;
+- visibility controls under **View**;
+- Beamer-safe handling when TeXFlow creates a `comment` environment inside a frame.
+
+Possible future improvements:
+
+- navigation through all comments/notes in document order;
+- richer aggregation when multiple comments share the same location;
 - TODO and FIXME navigation;
-- support for `\todo{}`;
-- show/hide LaTeX `%` comments;
-- navigation between comments;
-- lightweight review mode.
+- support for `todonotes`, including `\todo{}`, `\todo[inline]{}`, and `\missingfigure{}`;
+- optional comment filtering;
+- improved comment editing workflows.
+
+Comments should remain outside the main visual document flow so they do not crowd pages or change Beamer slide layout.
 
 TeXFlow should not attempt to reproduce a full Word-style track-changes system unless there is a clear use case.
 
@@ -191,15 +207,28 @@ Structural editing actions should be introduced incrementally because they modif
 
 ## Search and navigation
 
-Possible improvements:
+**Status: partially implemented**
 
-- search inside the visual document;
+Current support includes:
+
+- `Cmd+F` / `Ctrl+F` in Visual mode;
+- case-insensitive document search;
+- highlighting of all matches;
+- a distinct active match;
+- next/previous navigation;
+- Enter / Shift+Enter navigation;
+- search across Beamer frames.
+
+Possible future improvements:
+
+- project-wide search;
 - search headings;
 - search labels;
 - search citations;
 - search equations;
 - navigate between figures and tables;
-- jump directly from a visual element to its LaTeX source.
+- jump directly from a visual element to its LaTeX source;
+- optional replace workflow after source-preservation behavior is defined.
 
 ---
 
@@ -526,15 +555,17 @@ Current support includes:
 - main-document awareness;
 - included-file relationships in the Project Navigator;
 - visual include/missing-include indicators;
-- safe handling of circular and missing includes.
+- safe handling of circular and missing includes;
+- faster reporting of fatal compilation failures involving missing project files.
 
 Included `.tex` files remain separate source files. Project-wide visual editing, project-wide outline, labels, references, and structural editing across files remain future work.
 
 Possible features:
 
 - project-wide outline;
-- open included files directly in TeXFlow while retaining the main document as compilation context;
-- project-wide labels and cross-references;
+- navigate between files in Visual mode;
+- explicit active-document vs master-document model;
+- project-wide labels and references;
 - visual editing while preserving the original project structure.
 
 This would be important for:
@@ -551,7 +582,7 @@ This would be important for:
 
 ## Advanced presentation workflow
 
-Current support already includes frame thumbnails and section/subsection navigation.
+Current support already includes frame thumbnails, section/subsection navigation, search across frames, and comments that do not consume slide layout.
 
 Possible improvements:
 
@@ -606,7 +637,7 @@ The roadmap can be summarized into several broad areas:
 
 | Area | Examples |
 |---|---|
-| Writing | spellcheck, AI, comments |
+| Writing | spellcheck, AI, comments and notes |
 | Structure | outline, navigation, structural editing |
 | LaTeX intelligence | references, bibliography, diagnostics |
 | Content | math, tables, figures, TikZ |

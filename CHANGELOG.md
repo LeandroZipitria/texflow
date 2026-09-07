@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.19.0 — 2026-09-06
+
+### Added
+
+- Document search in Visual mode with `Cmd+F` / `Ctrl+F`.
+- Case-insensitive search with all matches highlighted and a distinct active match.
+- Next/previous search navigation with Enter and Shift+Enter.
+- Search across Beamer frames without leaving Visual mode.
+- Source comments and TeXFlow author notes represented visually without adding content to the PDF.
+- Support for preserved `comment` environments as commented-out blocks.
+- **Insert → Comments & notes** actions for source comments, author notes, commented-out blocks, and commenting out selected text.
+- Compact `C` markers anchored to comment locations.
+- A bottom comments inspector that stays outside the document/page/slide layout.
+- Visual previews for commented-out headings, prose, includes, lists, quotes, and supported mathematics.
+- **View → Comments** controls for showing or hiding comment types and restoring hidden markers.
+- Dedicated automated regression coverage for comments and notes.
+
+### Improved
+
+- Comments no longer consume document or slide height, avoiding false Beamer content overflow.
+- Opening menus preserves the most recent Visual text selection so **Comment out selection** can act on the intended text.
+- Hiding a comment marker is visual-only and does not modify the LaTeX source.
+- Source deletion is a separate explicit action with confirmation.
+- Commented-out LaTeX can be inspected and edited without turning it into active document content.
+- Beamer comment insertion safely handles the `comment` package requirements for frames.
+- Beamer parser parity coverage now includes comment environments and the shared nested-environment parser helper.
+
+### Notes
+
+Comments and notes remain part of the `.tex` source, but TeXFlow keeps their visual representation outside the main document flow. The goal is to preserve the document or slide as the primary editing surface while still making comments easy to inspect and manage.
+
 ## 0.18.0 — 2026-09-06
 
 ### Added
@@ -29,63 +60,52 @@ TeXFlow does not merge included files into a single source document. The main `.
 
 ### Added
 
-- Added a dedicated TeXFlow entry point in the VS Code Activity Bar.
-- Added a Start view for creating a new document or opening an existing `.tex` file.
-- Added creation of standalone `.tex` files for article, report, book, and Beamer documents.
-- Added creation of LaTeX project folders with `main.tex`, `preamble.tex`, and `figures/`.
-- Added a TeXFlow Project Navigator for `.tex`, `.bib`, and supported figure resources.
-- Added Explorer context actions for creating TeXFlow documents and opening `.tex` files with TeXFlow.
-- Added runtime regression checks for the entry point and Project Navigator.
+- TeXFlow entry point in the VS Code Activity Bar.
+- Start view for creating a new document or opening an existing `.tex` file.
+- Creation of standalone `.tex` files.
+- Creation of LaTeX project folders with `main.tex`, `preamble.tex`, and `figures/`.
+- Project Navigator for `.tex`, `.bib`, `.pdf`, and supported image resources.
+- Explorer context actions for creating and opening TeXFlow documents.
 
 ### Improved
 
-- Project Navigator refresh handles upper- and lower-case image extensions consistently.
-- The compiled PDF corresponding to the main `.tex` file is excluded from figure resources in the Project Navigator.
+- Compiled root PDFs are filtered from project figure resources.
+- Project navigation ignores irrelevant directories and handles supported file extensions case-insensitively.
 
 ## 0.16.0
 
 ### Added
 
-- Extended the document outline for standard documents.
-- Added figures, tables, and equations to the standard-document outline.
-- Added associated labels where available.
-- Added click-to-navigate behavior for structural document elements.
-
-### Improved
-
-- Harmonized Beamer outline typography while preserving the existing section, subsection, frame, thumbnail, and collapse structure.
+- Expanded visual document outline for standard documents.
+- Chapters, sections, subsections, and subsubsections where applicable.
+- Figures, tables, equations, and associated labels in the standard-document outline.
+- Beamer section/subsection navigation with frame thumbnails.
+- Click-to-navigate structure in Visual mode.
 
 ## 0.15.1
 
-### Fixed
+### Improved
 
-- Fixed Beamer parser parity for leading frame font-size directives including `\normalsize`, `\small`, `\footnotesize`, `\scriptsize`, and `\tiny`.
-- Fixed handling of `\centering`, `\raggedright`, `\raggedleft`, and `\justifying`, including alignment changes within the same frame.
-- Fixed `multicols` parsing and serialization around `\columnbreak`.
-- Fixed Beamer visual layout issues that could clip the second column.
-- Fixed paragraph serialization that could accumulate unwanted newlines.
-
-### Added
-
-- Added an automated Beamer parser parity test covering representative text, alignment, list, columns, math, citation/reference, and comment cases.
+- Beamer parser parity for frame text sizes and paragraph alignment.
+- Parsing and serialization of `multicols`.
+- Paragraph persistence across alignment changes.
+- Automated host/webview Beamer parser parity coverage.
 
 ## 0.15.0
 
 ### Added
 
-- Added local/offline spell checking using `cspell-lib`.
-- Added English and Spanish dictionaries.
-- Added Automatic, English, and Español spell-check language modes.
-- Added spell-check enable/disable controls under Format.
-- Added non-destructive misspelling highlights and spelling suggestions.
-- Added runtime regression checks for local spell checking.
-- Added third-party license notices for packaged spelling dependencies.
+- Local spell checking in the Extension Host.
+- English and Spanish dictionaries.
+- Automatic, English, and Español language modes.
+- Spell checking on/off control.
+- Misspelling highlights and replacement suggestions.
+- Automated runtime checks for article and Beamer spell checking.
 
 ### Improved
 
-- Spell checking excludes mathematics, citations, references, URLs, and other non-prose content where appropriate.
-- Reduced packaged spell-check dependencies so the VSIX remains compact.
-- Fixed suggestion offsets and replacement behavior, including Beamer cases.
+- Spell checking excludes mathematics and other non-prose content where appropriate.
+- Spell checking runs locally without sending document text to an external service.
 
 ## 0.14.3 — 2026-08-29
 
@@ -103,13 +123,11 @@ TeXFlow does not merge included files into a single source document. The main `.
 - Object paste is handled at the actual `paste` event and remains repeatable; normal editable-text Copy/Cut still returns paste behavior to the native text clipboard.
 - No changes to table/figure serialization, formatting, math, columns, or paragraph navigation.
 
-
 ## 0.14.1
 
 - Fixed object keyboard paste after Copy/Cut: Ctrl/Cmd+V now uses TeXFlow's internal object clipboard even after the source object has been removed.
 - Copying or cutting normal editable text returns Ctrl/Cmd+V to the native text clipboard, avoiding stale-object paste behavior.
 - No changes to table parsing/insertion, figure handling, formatting toggles, or paragraph navigation.
-
 
 ## 0.14.0
 
