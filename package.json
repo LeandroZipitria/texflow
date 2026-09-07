@@ -165,8 +165,11 @@
   },
   "scripts": {
     "compile": "tsc -p .",
-    "package": "npm run compile && vsce package",
-    "check": "npm run compile"
+    "check:runtime": "node tests/parser_single_source_runtime.js && node tests/project_active_master_runtime.js && node tests/review_runtime.js && node tests/keyboard_navigation_runtime.js && node tests/entrypoint_runtime.js && node tests/multifile_project_runtime.js && node tests/spellcheck_runtime.js && node tests/beamer_parser_parity.js",
+    "check:fast": "npm run compile && npm run check:runtime",
+    "check": "npm run check:fast && bash tests/run_fixtures.sh",
+    "check:release": "npm run check && npm run package",
+    "package": "npm run compile && vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

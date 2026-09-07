@@ -21,6 +21,22 @@ Core invariants:
 9. Character formatting is composable: bold/italic/underline/color are independent marks, not mutually exclusive modes.
 10. Native caret behavior is preferred inside prose; special keyboard logic belongs only at semantic boundaries or inside structured widgets such as tables.
 
+## Project model
+
+Starting from the post-0.19 Foundation work, project-aware editing distinguishes three scopes:
+
+- **master document**: the root document used for global metadata, packages, bibliography configuration, compilation and the root PDF;
+- **active document**: the `.tex` source currently being edited visually;
+- **project**: the complete include graph and project-wide indexes/diagnostics.
+
+During the migration, `ProjectModel.root` may remain as a compatibility alias for `masterDocument`. New code should not introduce additional root-only assumptions when the intended target is the active document.
+
+## Parser rule
+
+The Extension Host and the webview must use **one parser source of truth** for semantic LaTeX blocks. Do not reintroduce a second hand-maintained `parseBlocks` implementation inside the webview.
+
+Pure LaTeX parsing code should live outside `extension.ts` and avoid VS Code APIs whenever practical so it can be exercised directly by Node regression tests and injected into the webview runtime from the same compiled functions.
+
 ## LyX as a technical reference
 
 LyX is useful because it has already confronted many structural-editor problems: paragraph semantics, embedded objects/insets, cursor boundaries, LaTeX preservation and composable character properties. TeXFlow may study those programming/interaction ideas, but it does not use LyX as an interface model. TeXFlow's direct internal editors for figures, tables and math are deliberate product choices.
@@ -42,8 +58,16 @@ Every new semantic object should be tested for:
 - inspect Source for stable LaTeX;
 - verify unknown neighboring LaTeX remains unchanged.
 
+## Automated gate
+
+`npm run check` is the canonical regression gate during development. It must compile the extension, run the runtime regression tests and run the LaTeX fixtures.
+
+`npm run check:release` additionally packages the VSIX and is the preferred pre-release gate.
+
+A new feature is not considered integrated merely because TypeScript compiles.
+
 ## Versioning
 
 Never overwrite a build that has been given to the tester. Each experiment/fix gets a new version identifier. Stable baselines are promoted only after manual validation.
 
-`0.14.3` is the current stable release baseline. New functionality should be developed in a new version and promoted only after regression and manual validation.
+`0.19.0` is the stable release baseline for the `feature/texflow-next` architecture work. The baseline should remain reproducible and should not be reopened unless a reproducible bug requires it.

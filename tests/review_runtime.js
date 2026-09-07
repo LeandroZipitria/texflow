@@ -44,27 +44,13 @@ function windowsAfter(needle, length = 24000) {
 }
 
 // ---------------------------------------------------------------------------
-// Parser parity: TeXFlow currently has one host parser and one webview parser.
-// Review support must exist in both. This regression test is intentionally
-// explicit because a parser-parity bug previously broke comment environments.
+// Parser architecture: Review now relies on one shared parser source used by
+// the Extension Host and injected into the webview runtime.
 // ---------------------------------------------------------------------------
-const parserWindows = windowsAfter('function parseBlocks');
-ok(parserWindows.length >= 2, 'expected host and webview parseBlocks implementations');
-
-for (const [index, window] of parserWindows.entries()) {
-  ok(
-    window.includes('proof|comment') || window.includes('proof|comment)'),
-    `parseBlocks #${index + 1} does not tokenize the comment environment`
-  );
-  ok(
-    window.includes("'commentblock'"),
-    `parseBlocks #${index + 1} does not emit commentblock nodes`
-  );
-  ok(
-    window.includes("'comment'"),
-    `parseBlocks #${index + 1} does not emit source-comment nodes`
-  );
-}
+ok(source.includes("from './latex/blocks'"), 'shared parser import is missing');
+ok(source.includes('${webviewParserRuntimeSource()}'), 'shared parser is not injected into the webview');
+ok(!source.includes('function parseBlocks(body){'), 'legacy webview parseBlocks still exists');
+ok(!source.includes('function parseBlocks(body: string)'), 'legacy host parseBlocks still exists');
 
 // Project-wide include discovery must ignore both % comments and content inside
 // \begin{comment}...\end{comment}.
@@ -91,6 +77,37 @@ ok(source.includes('async function ensureBeamerFrameFragile'), 'Beamer fragile-f
 ok(source.includes("if (feature === 'commentenv')"), 'commentenv host handling is missing');
 ok(source.includes('await ensureBeamerFrameFragile(ctx.document, ctx.frame)'), 'Beamer comment insertion does not invoke the fragile-frame safeguard');
 ok(source.includes("await ensurePackage(project, 'comment')"), 'comment package auto-insertion is missing');
+
+
+// Beamer prose editors must support comment-out selection immediately, including
+// the initially empty frame body and the trailing "Continue typing" editor.
+// They must also forward the semantic feature so the host can prepare the
+// comment package / fragile frame before writing a comment environment.
+ok(source.includes("empty.__texflowCommentOutSupported=true"), 'empty Beamer frame body cannot be commented out before blur');
+ok(source.includes("trailing.__texflowCommentOutSupported=true"), 'trailing Beamer paragraph cannot be commented out before blur');
+ok(source.includes("type:'updateEmptyFrameBody',frameIndex:i,text,refresh:true,feature"), 'empty-frame comment conversion does not forward the feature');
+ok(source.includes("type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh:true,feature"), 'trailing-paragraph comment conversion does not forward the feature');
+ok(source.includes('prepareBeamerCommentEnvironment'), 'shared Beamer comment-environment preparation helper is missing');
+
+// Plain Enter in Beamer prose must be handled semantically rather than allowing
+// Chromium to accumulate transient DIV paragraph nodes that can temporarily
+// create blank lines and false slide overflow.
+ok(source.includes('function bindBeamerProseEnter'), 'semantic Beamer Enter handler is missing');
+ok(source.includes("if(e.key!=='Enter')return;"), 'Beamer Enter is not intercepted');
+ok(source.includes('bindBeamerProseEnter(empty,i)'), 'empty Beamer body does not use semantic Enter handling');
+ok(source.includes('bindBeamerProseEnter(trailing,i)'), 'trailing Beamer paragraph does not use semantic Enter handling');
+ok(source.includes('bindBeamerProseEnter(e,fi,b.id)'), 'regular Beamer paragraphs do not use semantic Enter handling');
+ok(source.includes('function insertSemanticParagraphBreak(edit)'), 'Beamer prose Enter lacks an in-place semantic paragraph break');
+ok(source.includes("className='texflow-paragraph-break'"), 'semantic paragraph marker is missing');
+ok(source.includes("contains('texflow-paragraph-break'))return TEX_PARAGRAPH_BREAK"), 'semantic paragraph marker does not serialize to a LaTeX paragraph break');
+ok(source.includes("if(insertSemanticParagraphBreak(edit))edit.dispatchEvent(new Event('input',{bubbles:true}))"), 'Beamer Enter does not keep editing local before autosave');
+ok(source.includes('.slide .block.paragraph>.editable:focus'), 'plain Beamer paragraph focus is not scoped for minimal UI');
+ok(source.includes("wrap.classList.add('paragraph')"), 'parsed Beamer paragraphs are not tagged for minimal prose focus styling');
+ok(source.includes('.slide .trailing-paragraph:focus'), 'trailing Beamer paragraph focus is not minimal');
+ok(source.includes('.slide .empty-frame-body:focus'), 'empty Beamer frame focus is not minimal');
+ok(source.includes('background:transparent;'), 'minimal Beamer prose focus does not remove field-style background');
+ok(!source.includes('pendingBeamerEnterFocus'), 'obsolete post-render Beamer caret workaround still exists');
+
 
 // ---------------------------------------------------------------------------
 // Presentation model: comments are markers, not document/slide content.

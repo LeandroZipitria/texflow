@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { spellcheckBlocks, type SpellcheckLanguage, type SpellcheckResultBlock } from './spellcheck';
+import { parseBlocks, webviewParserRuntimeSource } from './latex/blocks';
+import type { ParsedBlock } from './latex/types';
 
 interface FrameInfo {
   index: number;
@@ -15,49 +17,6 @@ interface FrameInfo {
   sourceUri: string;
   sourceFile: string;
 }
-
-interface ParsedBlock {
-  id: string;
-  kind: 'paragraph' | 'itemize' | 'block' | 'equation' | 'figure' | 'table' | 'vspace' | 'columns' | 'quote' | 'container' | 'break' | 'theorem' | 'comment' | 'commentblock' | 'raw';
-  start: number;
-  end: number;
-  raw: string;
-  title?: string;
-  env?: string;
-  text?: string;
-  items?: string[];
-  figurePath?: string;
-  figureOptions?: string;
-  figureWidth?: number;
-  figureWidthUnit?: string;
-  figureHeight?: number;
-  figureHeightUnit?: string;
-  figureCaption?: string;
-  figureShortCaption?: string;
-  figureAngle?: number;
-  figureLabel?: string;
-  figurePlacement?: string;
-  figureCaptionPosition?: 'above' | 'below';
-  figureAlign?: 'left' | 'center' | 'right';
-  tableColumns?: string[];
-  tableRows?: string[][];
-  tableCaption?: string;
-  tableLabel?: string;
-  tablePlacement?: string;
-  tableCaptionPosition?: 'above' | 'below';
-  tableSimple?: boolean;
-  tableStyle?: 'plain' | 'booktabs';
-  spaceAmount?: string;
-  spaceStarred?: boolean;
-  columnCount?: number;
-  columnTexts?: string[];
-  breakCommand?: string;
-  theoremEnv?: string;
-  commentText?: string;
-  commentNote?: boolean;
-}
-
-
 
 interface PreambleInfo {
   id: string;
@@ -120,7 +79,10 @@ interface ProjectIncludeGraph {
 }
 
 interface ProjectModel {
+  /** @deprecated Foundation compatibility alias. Use masterDocument for global project operations. */
   root: vscode.TextDocument;
+  masterDocument: vscode.TextDocument;
+  activeDocument: vscode.TextDocument;
   documents: Map<string, vscode.TextDocument>;
   includeReferences: IncludeReference[];
   missingIncludes: IncludeReference[];
@@ -779,6 +741,8 @@ export function activate(context: vscode.ExtensionContext) {
         })),
         sources: [...project.documents.values()].map(d => ({ uri: d.uri.toString(), label: vscode.workspace.asRelativePath(d.uri, false), text: d.getText() })),
         rootUri: project.root.uri.toString(),
+        masterUri: project.masterDocument.uri.toString(),
+        activeUri: project.activeDocument.uri.toString(),
         pdfUri,
         preambles: getPreambleInfos(project),
         figureResources: await getFigureResources(project, panel.webview),
@@ -798,6 +762,17 @@ export function activate(context: vscode.ExtensionContext) {
       if (!frame) return undefined;
       const document = project.documents.get(frame.sourceUri) ?? await vscode.workspace.openTextDocument(vscode.Uri.parse(frame.sourceUri));
       return { frame, document };
+    };
+    const prepareBeamerCommentEnvironment = async (frameIndex: number) => {
+      await refreshProject();
+      await ensurePackage(project, 'comment');
+      await refreshProject();
+      let ctx = await getFrameContext(frameIndex);
+      if (!ctx) return undefined;
+      await ensureBeamerFrameFragile(ctx.document, ctx.frame);
+      await refreshProject();
+      ctx = await getFrameContext(frameIndex);
+      return ctx;
     };
 
     panel.webview.onDidReceiveMessage(async msg => {
@@ -842,14 +817,7 @@ export function activate(context: vscode.ExtensionContext) {
           let ctx = await getFrameContext(msg.frameIndex);
           if (!ctx) return;
           if (String(msg.feature || '') === 'commentenv') {
-            await refreshProject();
-            await ensurePackage(project, 'comment');
-            await refreshProject();
-            ctx = await getFrameContext(msg.frameIndex);
-            if (!ctx) return;
-            await ensureBeamerFrameFragile(ctx.document, ctx.frame);
-            await refreshProject();
-            ctx = await getFrameContext(msg.frameIndex);
+            ctx = await prepareBeamerCommentEnvironment(msg.frameIndex);
             if (!ctx) return;
           }
           const blocks = parseBlocks(ctx.frame.body);
@@ -884,8 +852,12 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'updateTrailingParagraph') {
           postStatus('saving');
-          const ctx = await getFrameContext(msg.frameIndex);
+          let ctx = await getFrameContext(msg.frameIndex);
           if (!ctx) return;
+          if (String(msg.feature || '') === 'commentenv') {
+            ctx = await prepareBeamerCommentEnvironment(msg.frameIndex);
+            if (!ctx) return;
+          }
           const previous = String(msg.previous ?? '').trim();
           const text = String(msg.text ?? '').trim();
           const endToken = '\\end{frame}';
@@ -930,8 +902,12 @@ export function activate(context: vscode.ExtensionContext) {
         if (msg.type === 'updateEmptyFrameBody') {
           postStatus('saving');
           await beginHistoryStep();
-          const ctx = await getFrameContext(msg.frameIndex);
+          let ctx = await getFrameContext(msg.frameIndex);
           if (!ctx) return;
+          if (String(msg.feature || '') === 'commentenv') {
+            ctx = await prepareBeamerCommentEnvironment(msg.frameIndex);
+            if (!ctx) return;
+          }
           const frameBodyOffset = ctx.frame.raw.indexOf(ctx.frame.body);
           const absStart = ctx.frame.start + frameBodyOffset;
           const absEnd = absStart + ctx.frame.body.length;
@@ -1891,8 +1867,10 @@ async function findRootDocument(document: vscode.TextDocument): Promise<vscode.T
 }
 
 async function loadProject(initial: vscode.TextDocument, output: vscode.OutputChannel): Promise<ProjectModel> {
-  const root = await findRootDocument(initial);
-  const graph = await buildProjectIncludeGraph(root);
+  const masterDocument = await findRootDocument(initial);
+  const graph = await buildProjectIncludeGraph(masterDocument);
+  const activeDocument = graph.documents.get(initial.uri.toString()) ?? initial;
+  const root = masterDocument; // compatibility alias during the Foundation migration
 
   for (const reference of graph.missingIncludes) {
     output.appendLine(`[warning] Included file not found: ${reference.targetUri.fsPath}`);
@@ -1911,6 +1889,8 @@ async function loadProject(initial: vscode.TextDocument, output: vscode.OutputCh
 
   return {
     root,
+    masterDocument,
+    activeDocument,
     documents: graph.documents,
     includeReferences: graph.includeReferences,
     missingIncludes: graph.missingIncludes,
@@ -2721,373 +2701,6 @@ function parseFrames(source: string, sourceUri = '', sourceFile = ''): FrameInfo
   return frames;
 }
 
-function parseFigureData(raw: string) {
-  const graphic = /\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/.exec(raw);
-  const options = graphic?.[1] ?? '';
-  const path = graphic?.[2]?.trim() ?? '';
-  const optionParts = options.split(',').map(x => x.trim()).filter(Boolean);
-  const getDimension = (name: string): { value?: number; unit?: string } => {
-    const token = optionParts.find(x => new RegExp('^' + name + '\\s*=').test(x));
-    if (!token) return {};
-    const value = token.slice(token.indexOf('=') + 1).trim();
-    const m = /^([0-9]*\.?[0-9]+)\s*(\\(?:textwidth|linewidth|columnwidth|paperwidth|textheight)|[a-zA-Z]+)$/.exec(value);
-    return m ? { value: Number(m[1]), unit: m[2] } : {};
-  };
-  const width = getDimension('width'), height = getDimension('height');
-  const captionMatch = /\\caption(?:\[([^\]]*)\])?\{([^}]*)\}/.exec(raw);
-  const shortCaption = captionMatch?.[1] ?? '', caption = captionMatch?.[2] ?? '';
-  const graphicIndex = graphic?.index ?? -1;
-  const captionPosition: 'above' | 'below' = captionMatch && graphicIndex >= 0 && captionMatch.index < graphicIndex ? 'above' : 'below';
-  const label = /\\label\{([^}]+)\}/.exec(raw)?.[1] ?? '';
-  const placement = /\\begin\{figure\}(?:\[([^\]]*)\])?/.exec(raw)?.[1] ?? '';
-  const angleToken=optionParts.find(x=>/^angle\s*=/.test(x));const angle=angleToken?Number(angleToken.slice(angleToken.indexOf('=')+1).trim())||0:0;
-  const align: 'left' | 'center' | 'right' = /\\raggedleft|\\begin\{flushright\}/.test(raw) ? 'right' : /\\centering|\\begin\{center\}/.test(raw) ? 'center' : 'left';
-  return { path, options, width, height, caption, shortCaption, angle, label, placement, captionPosition, align };
-}
-
-function parseTableData(raw: string) {
-  const tab = /\\begin\{tabular\}\{([^}]*)\}([\s\S]*?)\\end\{tabular\}/.exec(raw);
-  const captionMatch = /\\caption(?:\[[^\]]*\])?\{([^}]*)\}/.exec(raw);
-  const caption = captionMatch?.[1] ?? '';
-  const tabularIndex = tab?.index ?? -1;
-  const captionPosition: 'above' | 'below' = captionMatch && tabularIndex >= 0 && captionMatch.index < tabularIndex ? 'above' : 'below';
-  const label = /\\label\{([^}]+)\}/.exec(raw)?.[1] ?? '';
-  const placement = /\\begin\{table\}(?:\[([^\]]*)\])?/.exec(raw)?.[1] ?? '';
-  if (!tab) return { simple:false, columns:[] as string[], rows:[] as string[][], caption,label,placement,captionPosition,tableStyle:'plain' as const };
-  const spec=tab[1].trim(),tableStyle=/\\(?:toprule|midrule|bottomrule)\b/.test(tab[2])?'booktabs' as const:'plain' as const;
-  const unsupported=/\\(?:multicolumn|multirow|cline|cmidrule|begin\{|end\{)/.test(tab[2]);const columnTokens=[...spec.matchAll(/[lcr]/g)].map(m=>m[0]);
-  if(!columnTokens.length||unsupported||spec.replace(/[lcr|\s]/g,'')!=='')return{simple:false,columns:columnTokens,rows:[] as string[][],caption,label,placement,captionPosition,tableStyle};
-  let body=tab[2].replace(/^[\s\n]+|[\s\n]+$/g,'').replace(/(^|\n)\s*\\(?:hline|toprule|midrule|bottomrule)\s*(?=\n|$)/g,'$1');
-  const rawRows=body.split(/\\\\(?:\s*\[[^\]]*\])?/).map(x=>x.trim()).filter(Boolean),rows=rawRows.map(r=>r.split(/(?<!\\)&/).map(c=>c.trim()));
-  if(!rows.length||rows.some(r=>r.length!==columnTokens.length))return{simple:false,columns:columnTokens,rows,caption,label,placement,captionPosition,tableStyle};
-  return{simple:true,columns:columnTokens,rows,caption,label,placement,captionPosition,tableStyle};
-}
-
-function parseBlocks(body: string): ParsedBlock[] {
-  const blocks: ParsedBlock[] = [];
-  const tokenRe = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|comment)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
-  let cursor = 0;
-  let count = 0;
-  let m: RegExpExecArray | null;
-  let currentAlign: 'left' | 'center' | 'right' | 'justify' = 'justify';
-
-  const alignmentFromDirective = (
-    raw: string,
-    current: 'left' | 'center' | 'right' | 'justify' = 'justify'
-  ): 'left' | 'center' | 'right' | 'justify' => {
-    const matches = [...String(raw || '').matchAll(/\\(centering|raggedright|raggedleft|justifying)\b/g)];
-    if (!matches.length) return current;
-    const command = matches[matches.length - 1][1];
-    if (command === 'centering') return 'center';
-    if (command === 'raggedright') return 'left';
-    if (command === 'raggedleft') return 'right';
-    return 'justify';
-  };
-
-  const isOnlyAlignmentDirective = (raw: string): boolean =>
-    /^(?:\s|%[^\n]*(?:\n|$))*\\(?:centering|raggedright|raggedleft|justifying)\b\s*(?:%[^\n]*)?\s*$/.test(String(raw || ''));
-
-  const pushText = (s: number, e: number) => {
-    const raw = body.slice(s, e);
-    if (!raw.trim()) return;
-
-    if (s === 0) {
-      const size = /^((?:(?:[ \t\r\n]+)|(?:[ \t]*%[^\n]*(?:\r?\n|$)))*)\\(?:normalsize|small|footnotesize|scriptsize|tiny)\b[ \t]*(?:%[^\n]*)?(?:\r?\n)?/.exec(raw);
-      if (size) {
-        const prefix = String(size[1] || '');
-        const commandStart = s + prefix.length;
-        const commandEnd = s + size[0].length;
-
-        if (prefix) pushText(s, commandStart);
-
-        blocks.push({
-          id: `b${count++}`,
-          kind: 'raw',
-          start: commandStart,
-          end: commandEnd,
-          raw: body.slice(commandStart, commandEnd),
-          text: body.slice(commandStart, commandEnd).trim()
-        });
-
-        if (commandEnd < e) pushText(commandEnd, e);
-        return;
-      }
-    }
-
-    const alignmentDirective = /(^|\r?\n)([ \t]*\\(centering|raggedright|raggedleft|justifying)\b[ \t]*(?:%[^\n]*)?)(?=\r?\n|$)/m.exec(raw);
-    if (alignmentDirective) {
-      const linePrefix = String(alignmentDirective[1] || '');
-      const command = String(alignmentDirective[3] || '');
-      const commandStart = s + (alignmentDirective.index ?? 0) + linePrefix.length;
-      const commandEnd = commandStart + String(alignmentDirective[2] || '').length;
-
-      if (commandStart > s) pushText(s, commandStart);
-
-      blocks.push({
-        id: `b${count++}`,
-        kind: 'raw',
-        start: commandStart,
-        end: commandEnd,
-        raw: body.slice(commandStart, commandEnd),
-        text: body.slice(commandStart, commandEnd).trim()
-      });
-
-      currentAlign = alignmentFromDirective(`\\${command}`, currentAlign);
-
-      if (commandEnd < e) pushText(commandEnd, e);
-      return;
-    }
-
-    // Standalone % comment lines can be interleaved with ordinary prose. Split
-    // the first contiguous run out before generic safety classification so a
-    // source divider/comment never turns the surrounding paragraph into raw LaTeX.
-    // Inline comments (text % comment) are deliberately left untouched for now.
-    const standaloneComment = /(^|\r?\n)([ \t]*%[^\r\n]*)/.exec(raw);
-    if (standaloneComment) {
-      const prefixLength = String(standaloneComment[1] || '').length;
-      const commentStart = (standaloneComment.index ?? 0) + prefixLength;
-      let commentEnd = commentStart + String(standaloneComment[2] || '').length;
-      while (commentEnd < raw.length) {
-        const next = /^(\r?\n)([ \t]*%[^\r\n]*)/.exec(raw.slice(commentEnd));
-        if (!next) break;
-        commentEnd += next[0].length;
-      }
-      if (commentStart > 0) pushText(s, s + commentStart);
-      const cleanRaw = raw.slice(commentStart, commentEnd);
-      const commentNote = /^\s*%\s*TeXFlow note:/i.test(cleanRaw);
-      const commentText = cleanRaw.replace(/^\s*%\s?/gm, '').replace(/^TeXFlow note:\s*/i, '');
-      blocks.push({ id: `b${count++}`, kind: 'comment', start: s + commentStart, end: s + commentEnd, raw: cleanRaw, text: commentText, commentText, commentNote });
-      if (commentEnd < raw.length) pushText(s + commentEnd, e);
-      return;
-    }
-
-    const trimmedRaw = raw.trim();
-    if (trimmedRaw && trimmedRaw.split(/\r?\n/).every(line => /^\s*%/.test(line))) {
-      const lead = raw.search(/\S/); const trail = (/\s*$/.exec(raw) || [''])[0].length;
-      const start = lead < 0 ? s : s + lead, end = e - trail; const cleanRaw = body.slice(start, end);
-      const commentNote=/^\s*%\s*TeXFlow note:/i.test(cleanRaw);const commentText=cleanRaw.replace(/^\s*%\s?/gm,'').replace(/^TeXFlow note:\s*/i,'');
-      blocks.push({ id: `b${count++}`, kind: 'comment', start, end, raw: cleanRaw, text: commentText, commentText, commentNote });
-      return;
-    }
-
-    // Standalone labels are structural metadata. Keep them in the .tex source,
-    // but exclude them from editable/raw visual ranges so editing nearby text
-    // cannot flatten, move, or delete the label command.
-    const labels = [...raw.matchAll(/\\label\{[^}]+\}/g)];
-    if (labels.length) {
-      let local = 0;
-      for (const lm of labels) {
-        const at = lm.index ?? 0;
-        if (at > local) pushText(s + local, s + at);
-        local = at + lm[0].length;
-      }
-      if (local < raw.length) pushText(s + local, e);
-      return;
-    }
-
-    const nextAlign = alignmentFromDirective(raw, currentAlign);
-
-    if (isOnlyAlignmentDirective(raw)) {
-      const lead = raw.search(/\S/);
-      const trailMatch = /\s*$/.exec(raw);
-      const trail = trailMatch ? trailMatch[0].length : 0;
-      const start = lead < 0 ? s : s + lead;
-      const end = e - trail;
-      const cleanRaw = body.slice(start, end);
-      if (cleanRaw) blocks.push({ id: `b${count++}`, kind: 'raw', start, end, raw: cleanRaw, text: cleanRaw });
-      currentAlign = nextAlign;
-      return;
-    }
-
-    // Match the webview safety classification exactly. Alignment directives
-    // are semantic state, not a reason to classify the whole chunk as raw.
-    const unsafe =
-      /^(?:\s*%|\s*\\(?:newpage|clearpage|pagebreak)\b)/m.test(raw) ||
-      /\\(begin|end|input|include|hypertarget|label|only|visible|uncover|pause|vspace|includegraphics|tikz)/.test(raw);
-
-    if (!unsafe) {
-      const sep = /\n[ \t]*\n+/g;
-      let local = 0;
-      const pushSegment = (a: number, b: number) => {
-        if (b <= a) return;
-        const segment = raw.slice(a, b);
-        const lead = segment.search(/\S/);
-        if (lead < 0) return;
-        const trailMatch = /\s*$/.exec(segment);
-        const trail = trailMatch ? trailMatch[0].length : 0;
-        const segStart = s + a + lead;
-        const segEnd = s + b - trail;
-        if (segEnd <= segStart) return;
-        const text = body.slice(segStart, segEnd);
-        const block: ParsedBlock = { id: `b${count++}`, kind: 'paragraph', start: segStart, end: segEnd, raw: text, text };
-        (block as any).align = nextAlign;
-        blocks.push(block);
-      };
-      let sm: RegExpExecArray | null;
-      while ((sm = sep.exec(raw))) {
-        pushSegment(local, sm.index);
-        local = sep.lastIndex;
-      }
-      pushSegment(local, raw.length);
-      currentAlign = nextAlign;
-      return;
-    }
-
-    const lead = raw.search(/\S/);
-    const trailMatch = /\s*$/.exec(raw);
-    const trail = trailMatch ? trailMatch[0].length : 0;
-    const start = lead < 0 ? s : s + lead;
-    const end = e - trail;
-    const cleanRaw = body.slice(start, end);
-    if (cleanRaw) blocks.push({ id: `b${count++}`, kind: 'raw', start, end, raw: cleanRaw, text: cleanRaw });
-    currentAlign = nextAlign;
-  };
-
-  while ((m = tokenRe.exec(body))) {
-    pushText(cursor, m.index);
-    if (m[0] === '$$') {
-      const endPos = body.indexOf('$$', tokenRe.lastIndex);
-      if (endPos < 0) break;
-      const end = endPos + 2;
-      const raw = body.slice(m.index, end);
-      const inner = body.slice(tokenRe.lastIndex, endPos).trim();
-      blocks.push({ id: `b${count++}`, kind: 'equation', start: m.index, end, raw, env: '$$', text: inner });
-      cursor = end;
-      tokenRe.lastIndex = end;
-      continue;
-    }
-    if (m[4] !== undefined) {
-      const raw = m[0];
-      const data = parseFigureData(raw);
-      blocks.push({
-        id: `b${count++}`, kind: 'figure', start: m.index, end: tokenRe.lastIndex, raw, env: 'includegraphics', text: raw,
-        figurePath: data.path, figureOptions: data.options, figureWidth: data.width.value, figureWidthUnit: data.width.unit,
-        figureHeight: data.height.value, figureHeightUnit: data.height.unit, figureCaption: data.caption, figureLabel: data.label, figurePlacement: data.placement, figureCaptionPosition: data.captionPosition, figureAlign: data.align
-      });
-      cursor = tokenRe.lastIndex;
-      continue;
-    }
-    if (m[6] !== undefined) {
-      const raw = m[0];
-      blocks.push({ id: `b${count++}`, kind: 'vspace', start: m.index, end: tokenRe.lastIndex, raw, text: raw, spaceAmount: String(m[6] || '').trim(), spaceStarred: m[5] === '*' });
-      cursor = tokenRe.lastIndex;
-      continue;
-    }
-    if (m[7] !== undefined) {
-      const raw = m[0];
-      blocks.push({ id: `b${count++}`, kind: 'break', start: m.index, end: tokenRe.lastIndex, raw, text: raw, breakCommand: String(m[7] || 'newpage') });
-      cursor = tokenRe.lastIndex;
-      continue;
-    }
-    const env = m[1];
-    const match = findEnvironmentEnd(body, env, tokenRe.lastIndex);
-    if (!match) break;
-    const end = match.end;
-    const raw = body.slice(m.index, end);
-    const endToken = `\\end{${env}}`;
-    const innerStart = m[0].length;
-    const inner = raw.slice(innerStart, raw.length - endToken.length).trim();
-    let kind: ParsedBlock['kind'] = 'raw';
-    if (env === 'itemize' || env === 'enumerate') kind = 'itemize';
-    else if (['block', 'alertblock', 'exampleblock'].includes(env)) kind = 'block';
-    else if (/^(equation|align|gather|multline)/.test(env)) kind = 'equation';
-    else if (env === 'figure') kind = 'figure';
-    else if (env === 'table') kind = 'table';
-    else if (env === 'columns' || env === 'multicols') kind = 'columns';
-    else if (env === 'quote' || env === 'quotation') kind = 'quote';
-    else if (env === 'minipage') kind = 'container';
-    else if (['theorem','lemma','proposition','corollary','definition','proof'].includes(env)) kind = 'theorem';
-    else if (env === 'comment') kind = 'commentblock';
-    else if (['flushleft','center','flushright'].includes(env)) kind = 'paragraph';
-    const block: ParsedBlock = { id: `b${count++}`, kind, start: m.index, end, raw, env, title: m[2] ?? '', text: inner };
-    if (kind === 'paragraph' && ['flushleft','center','flushright'].includes(env)) (block as any).align = env === 'flushleft' ? 'left' : env === 'flushright' ? 'right' : 'center';
-    if (kind === 'itemize') block.items = parseItems(inner);
-    if (kind === 'figure') {
-      const data = parseFigureData(raw);
-      block.figurePath = data.path;
-      block.figureOptions = data.options;
-      block.figureWidth = data.width.value;
-      block.figureWidthUnit = data.width.unit;
-      block.figureHeight = data.height.value;
-      block.figureHeightUnit = data.height.unit;
-      block.figureCaption = data.caption;
-      block.figureShortCaption = data.shortCaption;
-      block.figureAngle = data.angle;
-      block.figureLabel = data.label;
-      block.figurePlacement = data.placement;
-      block.figureCaptionPosition = data.captionPosition;
-      block.figureAlign = data.align;
-    }
-    if (kind === 'columns') {
-      if (env === 'multicols') {
-        block.columnCount = Math.max(2, Math.min(4, Number(m[2]) || 2));
-        // Article multicols is one flowing text stream. Manual column breaks are
-        // preserved as source text instead of being turned into separate editors.
-        block.columnTexts = inner.split(/\\columnbreak\b/).map(x => x.trim());
-      } else {
-        const parts = [...inner.matchAll(/\\column\{[^}]+\}([\s\S]*?)(?=\\column\{|$)/g)].map(x => String(x[1] || '').trim());
-        block.columnTexts = parts.length ? parts : [inner];
-        block.columnCount = block.columnTexts.length;
-      }
-    }
-    if (kind === 'table') {
-      const data = parseTableData(raw);
-      if (!data.simple) block.kind = 'raw';
-      else {
-        block.tableSimple = true;
-        block.tableColumns = data.columns;
-        block.tableRows = data.rows;
-        block.tableCaption = data.caption;
-        block.tableLabel = data.label;
-        block.tablePlacement = data.placement;
-        block.tableCaptionPosition = data.captionPosition;
-        block.tableStyle = data.tableStyle;
-      }
-    }
-    blocks.push(block);
-    cursor = end;
-    tokenRe.lastIndex = end;
-  }
-  pushText(cursor, body.length);
-  return blocks;
-}
-
-function isSafeParagraph(raw: string): boolean {
-  const t = raw.trim();
-  if (!t) return false;
-  if (/^(?:%|\\(?:newpage|clearpage|pagebreak)\b)/m.test(t)) return false;
-  if (/\\(begin|end|input|include|hypertarget|label|only|visible|uncover|pause|vspace|includegraphics|tikz)/.test(t)) return false;
-  return true;
-}
-
-function findEnvironmentEnd(source: string, env: string, from: number): { start: number; end: number } | undefined {
-  const escaped = env.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp('\\\\(begin|end)\\{' + escaped + '\\}', 'g');
-  re.lastIndex = from;
-  let depth = 1;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(source))) {
-    if (m[1] === 'begin') depth++;
-    else depth--;
-    if (depth === 0) return { start: m.index, end: m.index + m[0].length };
-  }
-  return undefined;
-}
-
-function parseItems(inner: string): string[] {
-  const starts: number[] = [];
-  const token = /\\begin\{[^}]+\}|\\end\{[^}]+\}|\\item(?:<[^>]*>)?(?:\[[^\]]*\])?/g;
-  let depth = 0;
-  let m: RegExpExecArray | null;
-  while ((m = token.exec(inner))) {
-    if (m[0].startsWith('\\begin')) depth++;
-    else if (m[0].startsWith('\\end')) depth = Math.max(0, depth - 1);
-    else if (depth === 0) starts.push(m.index);
-  }
-  return starts.map((pos, i) => inner.slice(pos, starts[i + 1] ?? inner.length)
-    .replace(/^\\item(?:<[^>]*>)?(?:\[[^\]]*\])?\s*/, '').trim());
-}
-
 function normalizeEditableText(value: unknown): string {
   let text = String(value ?? '').replace(/\r\n?/g, '\n');
   text = text.replace(/\n{3,}/g, '\n\n');
@@ -3277,7 +2890,11 @@ body.focus-mode .focus-exit{display:grid}
 .side{grid-column:1;background:color-mix(in srgb,var(--panel) 96%,var(--vscode-editor-background));border-right:1px solid var(--line);overflow:auto;padding:0 10px 18px}
 .brand{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:9px;padding:14px 10px 11px;background:var(--panel);border-bottom:1px solid var(--line);font-size:13px;font-weight:650;letter-spacing:.2px}
 .brand-mark{width:25px;height:25px;display:grid;place-items:center;border:1px solid var(--line-strong);border-radius:7px;background:color-mix(in srgb,var(--vscode-button-background) 20%,transparent);font-family:Georgia,serif;font-size:16px}
-.main{grid-column:2;min-width:0;width:100%;overflow:auto;padding:40px clamp(28px,6vw,96px) 100px;scroll-behavior:smooth;background:radial-gradient(circle at 50% 18%,color-mix(in srgb,var(--vscode-focusBorder) 4%,transparent),transparent 34%)}
+.main{grid-column:2;min-width:0;width:100%;overflow:auto;padding:40px clamp(28px,6vw,96px) 100px;scroll-behavior:smooth;background:radial-gradient(circle at 50% 18%,color-mix(in srgb,var(--vscode-focusBorder) 4%,transparent),transparent 34%);scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--vscode-scrollbarSlider-background,#797979) 78%,transparent) transparent}
+.main::-webkit-scrollbar{width:11px;height:11px}
+.main::-webkit-scrollbar-track{background:transparent}
+.main::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--vscode-scrollbarSlider-background,#797979) 82%,transparent);border:2px solid transparent;background-clip:content-box;border-radius:999px}
+.main::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--vscode-scrollbarSlider-hoverBackground,#8a8a8a) 92%,transparent);border:2px solid transparent;background-clip:content-box}
 .toolbar{position:fixed;left:calc(var(--sidebar) + 10px);top:58px;width:64px;max-height:calc(100vh - 76px);background:var(--panel);z-index:80;padding:9px 7px;display:flex;flex-direction:column;align-items:center;gap:6px;border:1px solid var(--line-strong);border-radius:11px;overflow:visible;box-shadow:0 14px 34px rgba(0,0,0,.28);transform:translateX(-12px);opacity:0;pointer-events:none;transition:transform .14s ease,opacity .14s ease,left .16s ease}
 body.tools-open .toolbar{transform:translateX(0);opacity:1;pointer-events:auto}
 body.nav-closed .toolbar{left:10px}
@@ -3330,6 +2947,29 @@ body.nav-closed .floating-actions,body.focus-mode .floating-actions{left:10px}
 .editable{outline:none;border:1px solid transparent;border-radius:5px;padding:.28em .35em;white-space:pre-wrap;line-height:var(--slide-line-height);min-height:1.55em;font-size:1em}
 .editable:hover{border-color:var(--line)}
 .editable:focus{border-color:var(--vscode-focusBorder);background:var(--vscode-input-background);box-shadow:0 0 0 1px color-mix(in srgb,var(--vscode-focusBorder) 45%,transparent)}
+/* Plain Beamer prose should look like the slide, not like a form field.
+   The caret is the editing affordance; placeholders remain only while empty. */
+.slide .block.paragraph:hover{background:transparent;box-shadow:none}
+.slide .block.paragraph>.editable:hover,
+.slide .trailing-paragraph:hover{border-color:transparent}
+.slide .block.paragraph>.editable:focus,
+.slide .trailing-paragraph:focus,
+.slide .empty-frame-body:focus{
+  outline:none;
+  border-color:transparent;
+  background:transparent;
+  box-shadow:none
+}
+.slide .empty-frame-body{
+  outline:none;
+  border:1px solid transparent;
+  border-radius:5px;
+  padding:.28em .35em;
+  white-space:pre-wrap;
+  line-height:var(--slide-line-height);
+  min-height:1.55em;
+  font-size:1em
+}
 .list-editor{padding-left:1.85em;text-align:left;line-height:var(--slide-line-height);font-size:1em}
 .list-editor .list-editor{margin-top:6px;padding-left:25px}
 .list-item{margin:.42em 0;padding-left:.08em}
@@ -3407,9 +3047,10 @@ body{display:flex;flex-direction:column}
 .math:after{content:'Double-click to edit';position:absolute;right:10px;top:8px;font-size:10px;color:var(--muted);opacity:0;transition:opacity .12s ease}
 .math:hover:after{opacity:1}
 .trailing-paragraph{min-height:1.7em;margin-top:8px;padding:5px 7px;border-radius:5px;outline:none;color:var(--vscode-editor-foreground);border:1px solid transparent}
-.trailing-paragraph:empty:before{content:attr(data-placeholder);color:var(--muted);opacity:.55;pointer-events:none}
-.trailing-paragraph:hover{border-color:color-mix(in srgb,var(--line-strong) 55%,transparent)}
-.trailing-paragraph:focus{border-color:var(--vscode-focusBorder);background:color-mix(in srgb,var(--paper) 97%,var(--vscode-editorWidget-background))}
+.trailing-paragraph:empty:before{content:attr(data-placeholder);color:var(--muted);opacity:.48;pointer-events:none}
+.trailing-paragraph:hover{border-color:transparent}
+.trailing-paragraph:focus{border-color:transparent;background:transparent;box-shadow:none}
+.texflow-paragraph-break{display:block;height:.55em;line-height:.55em;pointer-events:none;user-select:none}
 .blocks-host{flex:1;min-height:0;display:flex;flex-direction:column;justify-content:center;position:relative}.slide.v-top .blocks-host{justify-content:flex-start}.slide.v-bottom .blocks-host{justify-content:flex-end}.slide-fit{position:absolute;right:12px;bottom:9px;z-index:4;font-size:10px;line-height:1;padding:4px 6px;border-radius:5px;color:var(--muted);background:color-mix(in srgb,var(--paper) 78%,transparent);opacity:.32;pointer-events:none;transition:opacity .15s ease,background .15s ease,color .15s ease}.slide:hover .slide-fit{opacity:.7}.slide-fit.overflow{opacity:1;color:var(--vscode-inputValidation-errorForeground,var(--vscode-errorForeground));background:var(--vscode-inputValidation-errorBackground,color-mix(in srgb,var(--vscode-errorForeground) 18%,var(--paper)));font-weight:650}.slide.overflowing{box-shadow:0 0 0 1px color-mix(in srgb,var(--vscode-errorForeground) 65%,transparent),0 26px 70px rgba(0,0,0,.18)}
 .math-caret-anchor{display:inline;min-width:1px}
 .math-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.44);display:none;align-items:center;justify-content:center;z-index:500;padding:24px}
@@ -3718,7 +3359,11 @@ function texflowOpenFind(){closeTopMenus();if(viewMode==='source'||viewMode==='p
 function texflowCloseFind(){const bar=document.getElementById('texflow-find');texflowFindState.open=false;if(bar)bar.classList.remove('open');texflowFindClearHighlights();}
 window.addEventListener('message',e=>{if(e.data.type==='spellcheckResult'){if(String(e.data.requestId||'')!==String(texflowSpellState.pendingRequestId||''))return;if(!texflowSpellState.supported)return;texflowApplySpellHighlights(e.data.issuesById||{});return;}if(e.data.type==='compileStarted'){pdfBuildState='building';pdfBuildMessage='Compiling…';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFinished'){pdfBuildState='ready';pdfBuildMessage='PDF compiled and opened in the VS Code PDF viewer.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFailed'){pdfBuildState='error';pdfBuildMessage=e.data.message||'Compilation failed.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='saveStatus'){const el=document.getElementById('save-status');el.textContent=e.data.state==='saving'?'Saving…':e.data.state==='error'?'Save error':(e.data.message||'Saved');el.classList.toggle('error',e.data.state==='error');if(e.data.state==='saved'){clearTimeout(window.__texflowStatusTimer);window.__texflowStatusTimer=setTimeout(()=>{el.textContent='Saved';},1600);}return;}if(e.data.type==='document'){frames=e.data.frames;isBeamer=!!e.data.isBeamer;documentClass=e.data.documentClass||'';documentSource=e.data.documentSource||'';metadata=e.data.metadata||{};documentSettings=e.data.documentSettings||documentSettings||{};presentationStyle=e.data.presentationStyle||presentationStyle;applyPresentationStyle();preambles=e.data.preambles||[];sources=e.data.sources||[];projectIncludes=e.data.projectIncludes||[];rootUri=e.data.rootUri||'';pdfUri=e.data.pdfUri||'';figureResources=e.data.figureResources||{};bibliographyEntries=e.data.bibliographyEntries||[];bibliographyResources=e.data.bibliographyResources||[];bibliographyByKey={};bibliographyEntries.forEach(x=>bibliographyByKey[x.key]=x);if(e.data.spellCheckSettings){texflowSpellState.enabled=!!e.data.spellCheckSettings.enabled;texflowSpellState.language=e.data.spellCheckSettings.language||'auto';}if(Number.isInteger(e.data.selectedFrame))current=Math.max(0,Math.min(e.data.selectedFrame,frames.length-1));if(!preambles.some(x=>x.id===currentPreamble)&&preambles[0])currentPreamble=preambles[0].id;document.querySelectorAll('.beamer-only').forEach(x=>x.classList.toggle('hidden',!isBeamer));document.querySelectorAll('.document-only').forEach(x=>x.classList.toggle('hidden',isBeamer));updateDocumentViewMenu();renderTopMenus();texflowUpdateLanguageMenu();renderNav();if(mode==='preamble')renderPreamble(currentPreamble);else renderWorkspace();if(e.data.focusFrameTitle){requestAnimationFrame(()=>{const t=document.querySelector('.workspace .slide .title[contenteditable=true]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}if(e.data.focusNewMath){requestAnimationFrame(()=>{const f=frames[current];if(!f)return;const maths=parseBlocks(f.body).filter(b=>b.kind==='equation');const b=maths[maths.length-1];if(b)openMathEditor(b,current);});}if(Number.isFinite(e.data.focusDocumentHeadingStart)){requestAnimationFrame(()=>{const t=document.querySelector('.doc-heading[data-node-start="'+String(e.data.focusDocumentHeadingStart)+'"]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}texflowScheduleSpellcheck();}});
 function esc(s){return String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));}
-let activeEditable=null;const saveTimers=new WeakMap();function scheduleSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);document.getElementById('save-status').textContent='Editing…';saveTimers.set(el,setTimeout(()=>send(false),500));}function flushSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);send(true);}
+let activeEditable=null;const saveTimers=new WeakMap();function scheduleSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);document.getElementById('save-status').textContent='Editing…';saveTimers.set(el,setTimeout(()=>send(false),500));}
+/* Blur/focus movement must persist source WITHOUT rebuilding the webview.
+   A refresh replaces the focused contenteditable node and destroys the caret.
+   Structural actions already request refresh explicitly with save(true). */
+function flushSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);send(false);}
 function markdownToLatex(text){
  let x=String(text??'').replace(/\u200B/g,'');
  x=x.replace(/\*\*([^*\n]+)\*\*/g,'\\textbf{$1}');
@@ -3812,6 +3457,7 @@ function nodeToLatex(node){
  if(el.classList&&el.classList.contains('tex-field'))return '\\'+(el.dataset.field||'today');
  if(el.classList&&el.classList.contains('bib-print-placeholder'))return '\\printbibliography';
  if(el.classList&&el.classList.contains('math-caret-anchor'))return '';
+ if(el.classList&&el.classList.contains('texflow-paragraph-break'))return TEX_PARAGRAPH_BREAK;
  if(el.tagName==='BR')return TEX_LINE_BREAK;
  // Plain Enter creates a DIV in Chromium: serialize it as a paragraph break.
  if(el.tagName==='DIV')return (node.previousSibling?TEX_PARAGRAPH_BREAK:'')+inner;
@@ -3827,6 +3473,118 @@ function normalizeEditorLatex(value){
 }
 function editorToLatex(el){return normalizeEditorLatex([...el.childNodes].map(nodeToLatex).join(''));}
 function placeCaretEnd(el){const r=document.createRange();r.selectNodeContents(el);r.collapse(false);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
+function placeCaretStart(el){const r=document.createRange();r.selectNodeContents(el);r.collapse(true);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
+function insertSemanticParagraphBreak(edit){
+ const sel=getSelection();if(!sel||!sel.rangeCount||!edit.contains(sel.anchorNode))return false;
+ const range=sel.getRangeAt(0);range.deleteContents();
+ const marker=document.createElement('span');marker.className='texflow-paragraph-break';marker.contentEditable='false';marker.dataset.texflowParagraphBreak='true';marker.textContent='\u200B';
+ // A zero-width text node after the structural marker gives Chromium a real
+ // caret host. TeXFlow strips the character during LaTeX serialization.
+ const caret=document.createTextNode('\u200B'),frag=document.createDocumentFragment();
+ frag.appendChild(marker);frag.appendChild(caret);range.insertNode(frag);
+ const next=document.createRange();next.setStart(caret,1);next.collapse(true);sel.removeAllRanges();sel.addRange(next);
+ edit.focus();rememberVisualCursor();return true;
+}
+function focusEditableBoundary(target,dir){
+ if(!target)return false;
+ target.focus();
+ const r=document.createRange();r.selectNodeContents(target);r.collapse(dir>0);
+ const sel=getSelection();sel.removeAllRanges();sel.addRange(r);rememberVisualCursor();return true;
+}
+function visualNavigationScope(origin){
+ if(!origin||!origin.closest)return null;
+ return origin.closest('.slide')||origin.closest('.document-pages')||origin.closest('.document-continuous')||origin.closest('.visual-pane');
+}
+function visualEditableTargets(origin){
+ const scope=visualNavigationScope(origin);if(!scope)return[];
+ return [...scope.querySelectorAll('[contenteditable=true]')].filter(el=>{
+  if(el.offsetParent===null)return false;
+  if(el.classList.contains('commented-source-editor'))return false;
+  if(el.closest('.comment-inspector'))return false;
+  return true;
+ });
+}
+function relativeVisualEditable(origin,dir,skipContainer=null){
+ const targets=visualEditableTargets(origin).filter(el=>!skipContainer||!skipContainer.contains(el));
+ const i=targets.indexOf(origin);if(i>=0)return targets[i+dir]||null;
+ const ordered=dir>0?targets:[...targets].reverse();
+ for(const target of ordered){
+  const rel=origin.compareDocumentPosition(target);
+  if(dir>0&&(rel&Node.DOCUMENT_POSITION_FOLLOWING))return target;
+  if(dir<0&&(rel&Node.DOCUMENT_POSITION_PRECEDING))return target;
+ }
+ return null;
+}
+function moveVisualEditableCaret(origin,dir,skipContainer=null){
+ return focusEditableBoundary(relativeVisualEditable(origin,dir,skipContainer),dir);
+}
+function moveBeamerProseTarget(edit,dir){
+ return moveVisualEditableCaret(edit,dir);
+}
+function semanticParagraphState(edit){
+ const sel=getSelection();if(!sel||!sel.rangeCount||!sel.isCollapsed||!edit.contains(sel.anchorNode))return null;
+ const range=sel.getRangeAt(0).cloneRange(),markers=[...edit.querySelectorAll('.texflow-paragraph-break')];
+ const before=document.createRange();before.selectNodeContents(edit);
+ try{before.setEnd(range.startContainer,range.startOffset);}catch{return null;}
+ const box=document.createElement('div');box.appendChild(before.cloneContents());
+ return{range,markers,index:box.querySelectorAll('.texflow-paragraph-break').length};
+}
+function collapsedCaretRect(range){
+ const rects=range.getClientRects?range.getClientRects():null;
+ if(rects&&rects.length)return rects[0];
+ return range.getBoundingClientRect?range.getBoundingClientRect():null;
+}
+function caretNearSemanticBoundary(edit,state,dir){
+ const line=Math.max(12,parseFloat(getComputedStyle(edit).lineHeight)||16),cr=collapsedCaretRect(state.range);
+ if(!cr)return false;
+ if(dir<0&&state.index>0){
+  const mr=state.markers[state.index-1].getBoundingClientRect();
+  return cr.top<=mr.bottom+line*1.15;
+ }
+ if(dir>0&&state.index<state.markers.length){
+  const mr=state.markers[state.index].getBoundingClientRect();
+  return cr.bottom>=mr.top-line*1.15;
+ }
+ return caretOnOuterVisualLine(edit,dir<0?'first':'last');
+}
+function placeCaretAroundSemanticMarker(marker,dir){
+ if(!marker||!marker.parentNode)return false;const r=document.createRange(),s=getSelection();
+ if(dir>0){
+  const next=marker.nextSibling;
+  if(next&&next.nodeType===Node.TEXT_NODE)r.setStart(next,(next.nodeValue||'').startsWith('\u200B')?1:0);
+  else if(next&&next.nodeType===Node.ELEMENT_NODE){r.selectNodeContents(next);r.collapse(true);}
+  else r.setStartAfter(marker);
+ }else{
+  const prev=marker.previousSibling;
+  if(prev&&prev.nodeType===Node.TEXT_NODE)r.setStart(prev,(prev.nodeValue||'').length);
+  else if(prev&&prev.nodeType===Node.ELEMENT_NODE){r.selectNodeContents(prev);r.collapse(false);}
+  else r.setStartBefore(marker);
+ }
+ r.collapse(true);s.removeAllRanges();s.addRange(r);marker.closest('[contenteditable=true]')?.focus();rememberVisualCursor();return true;
+}
+function moveBeamerProseCaret(edit,dir){
+ const state=semanticParagraphState(edit);if(!state)return false;
+ if(!caretNearSemanticBoundary(edit,state,dir))return false;
+ if(dir<0&&state.index>0)return placeCaretAroundSemanticMarker(state.markers[state.index-1],-1);
+ if(dir>0&&state.index<state.markers.length)return placeCaretAroundSemanticMarker(state.markers[state.index],1);
+ if(moveBeamerProseTarget(edit,dir))return true;
+ // At the first/last editable prose target, keep the caret in the document.
+ // Do not let the browser reinterpret ArrowUp/ArrowDown as viewport scrolling.
+ return true;
+}
+function bindBeamerProseEnter(edit,frameIndex,blockId=''){
+ edit.addEventListener('keydown',e=>{
+  if(e.key!=='Enter')return;
+  e.preventDefault();
+  if(e.shiftKey){insertSoftBreak();edit.dispatchEvent(new Event('input',{bubbles:true}));return;}
+  // Do not round-trip through the Extension Host on Enter. Re-rendering the
+  // frame here replaces the focused DOM node and makes the caret disappear.
+  // Instead, insert one controlled structural marker locally. Autosave writes
+  // it as a blank LaTeX line; the normal blur/refresh later turns the two
+  // paragraphs into separate parsed blocks.
+  if(insertSemanticParagraphBreak(edit))edit.dispatchEvent(new Event('input',{bubbles:true}));
+ });
+}
 function visualCaretWhitespaceState(el){
  const sel=getSelection();if(!sel||!sel.rangeCount||!sel.isCollapsed||!el.contains(sel.anchorNode))return null;
  const r=sel.getRangeAt(0),before=document.createRange(),after=document.createRange();
@@ -3863,22 +3621,7 @@ function caretSplit(el){
 }
 function setEditableLatex(el,text){el.innerHTML=latexToHtml(text||'');renderInlineMaths(el);}
 
-function splitTopItems(inner){
- const source=String(inner||'');
- const items=[];let depth=0,start=-1,i=0;
- while(i<source.length){
-  if(source.startsWith('\\begin{',i)){depth++;i+=7;continue;}
-  if(source.startsWith('\\end{',i)){depth=Math.max(0,depth-1);i+=5;continue;}
-  if(depth===0&&source.startsWith('\\item',i)){
-   if(start>=0)items.push(source.slice(start,i).trim());
-   i+=5;while(i<source.length&&/\s/.test(source[i]))i++;start=i;continue;
-  }
-  i++;
- }
- if(start>=0)items.push(source.slice(start).trim());
- if(!items.length&&source.trim())items.push(source.trim());
- return items;
-}
+${webviewParserRuntimeSource()}
 function createVisualList(env,items){
  const list=document.createElement(env==='enumerate'?'ol':'ul');
  list.className='visual-list';
@@ -4269,7 +4012,7 @@ function bindDocumentTable(el,node){
  function markActive(cell){activeRow=Number(cell&&cell.dataset&&cell.dataset.row);activeCol=Number(cell&&cell.dataset&&cell.dataset.col);if(!Number.isFinite(activeRow))activeRow=null;if(!Number.isFinite(activeCol))activeCol=null;}
  function focusCell(target,atEnd=false){if(target)markActive(target);if(!target)return;target.focus();const r=document.createRange();r.selectNodeContents(target);r.collapse(!atEnd);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
  function caretAtBoundary(cell,which){const sel=getSelection();if(!sel||!sel.rangeCount)return false;const r=sel.getRangeAt(0);if(!r.collapsed||!cell.contains(r.startContainer))return false;const test=r.cloneRange();if(which==='start'){test.selectNodeContents(cell);test.setEnd(r.startContainer,r.startOffset);return test.toString().length===0;}test.selectNodeContents(cell);test.setStart(r.startContainer,r.startOffset);return test.toString().length===0;}
- el.querySelectorAll('.doc-table-cell').forEach(cell=>{attachEditor(cell);cell.addEventListener('focus',()=>markActive(cell));cell.addEventListener('mousedown',()=>markActive(cell));cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...el.querySelectorAll('.doc-table-cell')],i=cells.indexOf(cell),cols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/cols),col=i%cols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&caretAtBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&caretAtBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&caretAtBoundary(cell,'end'))target=cells[(row+1)*cols+col]||null;else if(e.key==='ArrowUp'&&caretAtBoundary(cell,'start')){target=row>0?cells[(row-1)*cols+col]:null;atEnd=true;}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusCell(target,atEnd);}});});
+ el.querySelectorAll('.doc-table-cell').forEach(cell=>{attachEditor(cell);cell.addEventListener('focus',()=>markActive(cell));cell.addEventListener('mousedown',()=>markActive(cell));cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...el.querySelectorAll('.doc-table-cell')],i=cells.indexOf(cell),cols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/cols),col=i%cols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&caretAtBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&caretAtBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&caretAtBoundary(cell,'end')){target=cells[(row+1)*cols+col]||null;if(!target){e.preventDefault();moveVisualEditableCaret(cell,1,el);return;}}else if(e.key==='ArrowUp'&&caretAtBoundary(cell,'start')){target=row>0?cells[(row-1)*cols+col]:null;atEnd=true;if(!target){e.preventDefault();moveVisualEditableCaret(cell,-1,el);return;}}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusCell(target,atEnd);}});});
  el.querySelectorAll('.table-col-align').forEach(x=>x.onchange=()=>save(true));if(caption)caption.onchange=()=>save(true);if(label)label.onchange=()=>save(true);if(placement)placement.onchange=()=>save(true);if(captionPosition)captionPosition.onchange=()=>save(true);if(styleInput)styleInput.onchange=()=>{save(true);if(styleInput.value==='booktabs')setTimeout(()=>vscode.postMessage({type:'ensureFeaturePackage',feature:'booktabs'}),25);};
  const addRow=el.querySelector('.table-add-row'),delRow=el.querySelector('.table-del-row'),addCol=el.querySelector('.table-add-col'),delCol=el.querySelector('.table-del-col');
  if(addRow)addRow.onclick=()=>{const p=payload(),at=activeRow!==null&&activeRow>=0&&activeRow<p.rows.length?activeRow+1:p.rows.length;p.rows.splice(at,0,Array.from({length:p.columns.length},()=>''));updateDocumentNode(node,serializeDocumentTable(node,p),true);};
@@ -4284,23 +4027,6 @@ function documentIncludeHtml(node){
  const displayTarget=target+(target&&!/\.[A-Za-z0-9]+$/.test(target)?'.tex':'');
  const action=!missing&&node.targetUri?'<button class="doc-include-open" data-uri="'+esc(node.targetUri)+'" data-target="'+esc(displayTarget)+'">Open source</button>':'';
  return '<div class="doc-include'+(missing?' missing':'')+'" data-node-id="'+node.id+'"><div class="doc-include-main"><div class="doc-include-kind">'+(missing?'Missing included file':'Included file')+'</div><div class="doc-include-path">'+esc(displayTarget||target)+'</div><div class="doc-include-meta">\\'+esc(command)+' · source preserved</div></div>'+action+'</div>';
-}
-function findMatchingEnvEnd(source,env,from){
- // Shared webview helper used by commented-block previews and the block parser.
- // Literal scanning avoids escaping issues and supports nested copies of the same environment.
- const open='\\begin{'+String(env)+'}';
- const close='\\end{'+String(env)+'}';
- let depth=1,pos=from;
- while(pos<source.length){
-  const nextOpen=source.indexOf(open,pos);
-  const nextClose=source.indexOf(close,pos);
-  if(nextClose<0)return null;
-  if(nextOpen>=0&&nextOpen<nextClose){depth+=1;pos=nextOpen+open.length;continue;}
-  depth-=1;
-  if(depth===0)return{start:nextClose,end:nextClose+close.length};
-  pos=nextClose+close.length;
- }
- return null;
 }
 function commentedBlockPreviewHtml(text){
  const source=String(text||'').replace(/\r\n?/g,'\n');
@@ -4506,8 +4232,102 @@ function paragraphCaretBoundary(el,which){const sel=getSelection();if(!sel||!sel
 function adjacentParagraphElement(el,dir){const x=dir<0?el.previousElementSibling:el.nextElementSibling;return x&&x.classList&&x.classList.contains('doc-paragraph')?x:null;}
 function combineParagraphDom(left,right){const marker=document.createElement('span');marker.dataset.texflowMergeCaret='true';marker.textContent='';const leftFrag=document.createDocumentFragment();while(right.firstChild)leftFrag.appendChild(right.firstChild);left.appendChild(marker);left.appendChild(leftFrag);renderInlineMaths(left);const live=left.querySelector('[data-texflow-merge-caret="true"]')||marker;const r=document.createRange();r.setStartBefore(live);r.collapse(true);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);live.remove();left.focus();return editableLatex(left);}
 function mergeDocumentParagraphs(left,right){if(!left||!right)return false;let leftNode=documentFlowById[left.dataset.nodeId],rightNode=documentFlowById[right.dataset.nodeId];if(!leftNode||!rightNode)return false;const lt=saveTimers.get(left),rt=saveTimers.get(right);if(lt)clearTimeout(lt);if(rt)clearTimeout(rt);if(leftNode.synthetic&&!editableLatex(left).trim()){delete documentFlowById[left.dataset.nodeId];left.remove();focusParagraphStart(right);return true;}if(leftNode.synthetic){const leftText=editableLatex(left);updateDocumentNode(leftNode,leftText,false);leftNode=documentFlowById[left.dataset.nodeId]||leftNode;}const merged=combineParagraphDom(left,right),replacement=paragraphSource(leftNode,merged);if(rightNode.synthetic){updateDocumentNode(leftNode,replacement,false);}else{const start=Number(leftNode.start),end=Number(rightNode.end),expected=documentSource.slice(start,end),fake={start,end,raw:expected,synthetic:false,block:{kind:'paragraph'}};updateDocumentNode(fake,replacement,false);leftNode.raw=replacement;leftNode.end=start+replacement.length;if(leftNode.block){leftNode.block.raw=replacement;leftNode.block.text=merged;}delete documentFlowById[right.dataset.nodeId];}if(left.__texflowState)left.__texflowState.lastSentLatex=merged;right.remove();return true;}
-function moveParagraphCaret(el,dir){const target=adjacentParagraphElement(el,dir);if(!target)return false;target.focus();const r=document.createRange();r.selectNodeContents(target);r.collapse(dir>0);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);return true;}
-function caretOnOuterVisualLine(el,which){const sel=getSelection();if(!sel||!sel.rangeCount||!sel.isCollapsed||!el.contains(sel.anchorNode))return false;const r=sel.getRangeAt(0).cloneRange(),cr=r.getBoundingClientRect(),box=el.getBoundingClientRect();if(!cr||(!cr.width&&!cr.height))return which==='first'?paragraphCaretBoundary(el,'start'):paragraphCaretBoundary(el,'end');const line=Math.max(12,parseFloat(getComputedStyle(el).lineHeight)||16);return which==='first'?cr.top<=box.top+line*.65:cr.bottom>=box.bottom-line*.65;}
+function moveDocumentTextCaret(el,dir){
+ return moveVisualEditableCaret(el,dir);
+}
+function currentVisualEditable(host){
+ const sel=getSelection();if(!sel||!sel.rangeCount)return null;
+ let node=sel.anchorNode;if(node&&node.nodeType!==Node.ELEMENT_NODE)node=node.parentElement;
+ const edit=node&&node.closest?node.closest('[contenteditable=true]'):null;
+ return edit&&host.contains(edit)?edit:null;
+}
+function restoreSelectionRange(edit,range){
+ if(!edit||!range)return false;
+ try{edit.focus({preventScroll:true});}catch{edit.focus();}
+ const sel=getSelection();if(!sel)return false;
+ try{sel.removeAllRanges();sel.addRange(range);rememberVisualCursor();return true;}catch{return false;}
+}
+function selectionMovedFrom(sel,node,offset){
+ return !!(sel&&sel.rangeCount&&(sel.anchorNode!==node||sel.anchorOffset!==offset));
+}
+function moveVisualSelectionLine(host,edit,dir){
+ const sel=getSelection();if(!sel||!sel.rangeCount)return false;
+ if(!sel.isCollapsed){
+  try{dir<0?sel.collapseToStart():sel.collapseToEnd();rememberVisualCursor();return true;}catch{}
+ }
+ const original=sel.getRangeAt(0).cloneRange(),node=sel.anchorNode,offset=sel.anchorOffset;
+ if(typeof sel.modify==='function'){
+  try{sel.modify('move',dir<0?'backward':'forward','line');}catch{}
+  const live=currentVisualEditable(host);
+  if(selectionMovedFrom(sel,node,offset)&&live){
+   const keep=sel.getRangeAt(0).cloneRange();
+   if(document.activeElement!==live){
+    try{live.focus({preventScroll:true});}catch{live.focus();}
+    const again=getSelection();if(again){again.removeAllRanges();again.addRange(keep);}
+   }
+   rememberVisualCursor();return true;
+  }
+ }
+ // No valid line move exists inside this editing host. Restore the exact caret
+ // and cross the next semantic Visual target ourselves.
+ restoreSelectionRange(edit,original);
+ if(moveVisualEditableCaret(edit,dir))return true;
+ restoreSelectionRange(edit,original);
+ return true;
+}
+function bindVisualNavigationSpine(host){
+ if(!host||host.dataset.texflowNavigationSpine==='1')return;
+ host.dataset.texflowNavigationSpine='1';
+ host.addEventListener('keydown',e=>{
+  if(e.defaultPrevented||e.shiftKey||e.altKey||e.metaKey||e.ctrlKey||(e.key!=='ArrowUp'&&e.key!=='ArrowDown'))return;
+  const edit=e.target&&e.target.closest?e.target.closest('[contenteditable=true]'):null;
+  if(!edit||!host.contains(edit))return;
+  // Tables retain their explicit same-column Up/Down navigation.
+  if(edit.matches('.doc-table-cell,.table-cell'))return;
+  e.preventDefault();e.stopPropagation();
+  moveVisualSelectionLine(host,edit,e.key==='ArrowUp'?-1:1);
+ },true);
+}
+function bindDocumentTextNavigation(el){
+ el.addEventListener('keydown',e=>{
+  if(e.shiftKey)return;
+  let dir=0,shouldMove=false;
+  if(e.key==='ArrowLeft'){dir=-1;shouldMove=paragraphCaretBoundary(el,'start');}
+  else if(e.key==='ArrowRight'){dir=1;shouldMove=paragraphCaretBoundary(el,'end');}
+  if(shouldMove){
+   moveDocumentTextCaret(el,dir);
+   e.preventDefault();e.stopPropagation();
+  }
+ });
+}
+function usableClientRect(rect){return !!(rect&&Number.isFinite(rect.top)&&Number.isFinite(rect.bottom)&&(rect.height>0||rect.width>0));}
+function caretClientRect(range){
+ const rects=range&&range.getClientRects?[...range.getClientRects()]:[];
+ const live=rects.find(usableClientRect);if(live)return live;
+ const bound=range&&range.getBoundingClientRect?range.getBoundingClientRect():null;if(usableClientRect(bound))return bound;
+ // Chromium sometimes returns an empty rectangle for a collapsed caret at the
+ // edge of a contenteditable. Measure with a temporary zero-width probe and
+ // restore the exact selection immediately; DOM insertion does not trigger an
+ // input event.
+ if(!range||!range.collapsed)return null;
+ const probe=document.createElement('span');probe.textContent='\u200B';probe.style.cssText='display:inline-block;width:0;height:1em;overflow:hidden;padding:0;margin:0;border:0;pointer-events:none';
+ const work=range.cloneRange();try{work.insertNode(probe);}catch{return null;}
+ const rect=probe.getBoundingClientRect(),restore=document.createRange();restore.setStartBefore(probe);restore.collapse(true);probe.remove();
+ const sel=getSelection();if(sel){sel.removeAllRanges();sel.addRange(restore);}
+ return usableClientRect(rect)?rect:null;
+}
+function editableLineRects(el){
+ const range=document.createRange();range.selectNodeContents(el);
+ return [...range.getClientRects()].filter(usableClientRect).sort((a,b)=>Math.abs(a.top-b.top)>2?a.top-b.top:a.left-b.left);
+}
+function caretOnOuterVisualLine(el,which){
+ const sel=getSelection();if(!sel||!sel.rangeCount||!sel.isCollapsed||!el.contains(sel.anchorNode))return false;
+ const r=sel.getRangeAt(0).cloneRange(),cr=caretClientRect(r),lines=editableLineRects(el);
+ if(!cr||!lines.length)return which==='first'?paragraphCaretBoundary(el,'start'):paragraphCaretBoundary(el,'end');
+ const line=Math.max(12,parseFloat(getComputedStyle(el).lineHeight)||16);
+ const firstTop=Math.min(...lines.map(x=>x.top)),lastBottom=Math.max(...lines.map(x=>x.bottom));
+ return which==='first'?cr.top<=firstTop+line*.42:cr.bottom>=lastBottom-line*.42;
+}
 function bindMultiParagraphMouseSelection(host){
  if(host.dataset.multiParagraphSelectionBound==='true')return;host.dataset.multiParagraphSelectionBound='true';
  let drag=null;
@@ -4518,6 +4338,7 @@ function bindMultiParagraphMouseSelection(host){
 }
 function bindDocumentParagraph(el,node){
  attachEditor(el);
+ bindDocumentTextNavigation(el);
  const state=el.__texflowState={lastSentLatex:editableLatex(el)};
  const save=refresh=>{const now=editableLatex(el);if(now===state.lastSentLatex)return;state.lastSentLatex=now;updateDocumentNode(node,paragraphSource(node,now),refresh);};
  el.__texflowCommit=(text,feature='')=>{setEditableLatex(el,text);state.lastSentLatex=editableLatex(el);updateDocumentNode(node,paragraphSource(node,text),true,feature);};
@@ -4526,10 +4347,6 @@ function bindDocumentParagraph(el,node){
  el.addEventListener('keydown',e=>{
   if(e.key==='Backspace'&&paragraphCaretBoundary(el,'start')){const prev=adjacentParagraphElement(el,-1);if(prev){e.preventDefault();if(node.synthetic&&!editableLatex(el).trim()){delete documentFlowById[el.dataset.nodeId];el.remove();placeCaretEnd(prev);}else mergeDocumentParagraphs(prev,el);return;}}
   if(e.key==='Delete'&&paragraphCaretBoundary(el,'end')){const next=adjacentParagraphElement(el,1);if(next){e.preventDefault();mergeDocumentParagraphs(el,next);return;}}
-  if(e.key==='ArrowLeft'&&paragraphCaretBoundary(el,'start')&&!e.shiftKey){if(moveParagraphCaret(el,-1)){e.preventDefault();return;}}
-  if(e.key==='ArrowRight'&&paragraphCaretBoundary(el,'end')&&!e.shiftKey){if(moveParagraphCaret(el,1)){e.preventDefault();return;}}
-  if(e.key==='ArrowUp'&&caretOnOuterVisualLine(el,'first')&&!e.shiftKey){if(moveParagraphCaret(el,-1)){e.preventDefault();return;}}
-  if(e.key==='ArrowDown'&&caretOnOuterVisualLine(el,'last')&&!e.shiftKey){if(moveParagraphCaret(el,1)){e.preventDefault();return;}}
   if(e.key!=='Enter')return;
   e.preventDefault();
   if(e.shiftKey){insertSoftBreak();el.dispatchEvent(new Event('input',{bubbles:true}));return;}
@@ -4546,8 +4363,8 @@ function bindDocumentParagraph(el,node){
 }
 function bindDocumentList(list,node){
  const save=refresh=>updateDocumentNode(node,serializeDocumentList(node,list),refresh);
- list.querySelectorAll('.doc-item-editable').forEach(edit=>{attachEditor(edit);edit.__texflowCommit=text=>{setEditableLatex(edit,text);updateDocumentNode(node,serializeDocumentList(node,list),true);};});
- list.addEventListener('keydown',e=>{const edit=e.target.closest('.doc-item-editable');if(!edit)return;if(e.key==='Tab'){e.preventDefault();if(listIndentOutdent(edit,list,e.shiftKey))save(true);return;}if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();const parts=caretSplit(edit),li=edit.closest('li');setEditableLatex(edit,parts.text);const next=document.createElement('li');next.innerHTML='<div class="doc-item-editable doc-editable" contenteditable="true"></div>';li.after(next);const ne=next.firstChild;setEditableLatex(ne,parts.tail);attachEditor(ne);ne.__texflowCommit=text=>{setEditableLatex(ne,text);updateDocumentNode(node,serializeDocumentList(node,list),true);};placeCaretEnd(ne);save(true);}else if(e.key==='Enter'&&e.shiftKey){e.preventDefault();insertSoftBreak();scheduleSave(list,save);}else if(e.key==='Backspace'&&!editableLatex(edit).trim()){const li=edit.closest('li'),prev=li.previousElementSibling;if(prev){e.preventDefault();li.remove();const target=prev.querySelector('.doc-item-editable');placeCaretEnd(target);save(true);}}});
+ list.querySelectorAll('.doc-item-editable').forEach(edit=>{attachEditor(edit);bindDocumentTextNavigation(edit);edit.__texflowCommit=text=>{setEditableLatex(edit,text);updateDocumentNode(node,serializeDocumentList(node,list),true);};});
+ list.addEventListener('keydown',e=>{const edit=e.target.closest('.doc-item-editable');if(!edit)return;if(e.key==='Tab'){e.preventDefault();if(listIndentOutdent(edit,list,e.shiftKey))save(true);return;}if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();const parts=caretSplit(edit),li=edit.closest('li');setEditableLatex(edit,parts.text);const next=document.createElement('li');next.innerHTML='<div class="doc-item-editable doc-editable" contenteditable="true"></div>';li.after(next);const ne=next.firstChild;setEditableLatex(ne,parts.tail);attachEditor(ne);bindDocumentTextNavigation(ne);ne.__texflowCommit=text=>{setEditableLatex(ne,text);updateDocumentNode(node,serializeDocumentList(node,list),true);};placeCaretEnd(ne);save(true);}else if(e.key==='Enter'&&e.shiftKey){e.preventDefault();insertSoftBreak();scheduleSave(list,save);}else if(e.key==='Backspace'&&!editableLatex(edit).trim()){const li=edit.closest('li'),prev=li.previousElementSibling;if(prev){e.preventDefault();li.remove();const target=prev.querySelector('.doc-item-editable');placeCaretEnd(target);save(true);}}});
  list.addEventListener('input',()=>scheduleSave(list,save));list.addEventListener('focusout',()=>flushSave(list,save));
 }
 function openDocumentMathEditor(node){mathEditing={mode:'doc-edit',node};const modal=document.getElementById('math-modal'),b=node.block,structure=inferMathStructure(b),rawText=String(b.text||'').trim(),overallLabel=structure==='align'?'':String(b.label||'').trim(),text=structure==='align'?rawText:rawText.replace(/\\label\{[^}]+\}/g,'').trim(),numbered=!String(b.env||'').endsWith('*')&&structure!=='display';document.getElementById('math-modal-title').textContent='Edit equation';modal.classList.add('open');modal.setAttribute('aria-hidden','false');renderMathPalette();configureMathStructure(structure,text,numbered,overallLabel);const ta=document.getElementById('math-code');setTimeout(()=>{ta.focus();ta.setSelectionRange(ta.value.length,ta.value.length)},0);}
@@ -4567,8 +4384,9 @@ function serializeRichDocumentBlock(node,text){
 function bindDocumentRichBlock(el,node){const edit=el.querySelector('.doc-rich-edit');let saveEdit=null;if(edit){attachEditor(edit);const save=refresh=>updateDocumentNode(node,serializeRichDocumentBlock(node,editableLatex(edit)),refresh);saveEdit=save;edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}if(node&&node.block&&(node.block.kind==='comment'||node.block.kind==='commentblock')){const key=reviewDocumentKey(node);if(node.block.kind==='commentblock'){const toggle=el.querySelector('.review-edit-source');if(toggle&&edit)toggle.onclick=e=>{e.preventDefault();e.stopPropagation();const editing=el.classList.contains('review-editing');if(editing){if(saveEdit)flushSave(edit,saveEdit);el.classList.remove('review-editing');toggle.textContent='Edit source';toggle.title='Edit the preserved LaTeX inside this commented-out block';}else{reviewCollapsedItems.delete(key);el.classList.remove('review-collapsed');const collapse=el.querySelector('.review-card-collapse');if(collapse){collapse.textContent='−';collapse.title='Collapse';}el.classList.add('review-editing');toggle.textContent='Done';toggle.title='Return to visual preview';edit.focus();}};}bindReviewCardControls(el,key,()=>vscode.postMessage({type:'deleteReviewDocumentNode',start:Number(node.start),end:Number(node.end),expected:String(node.raw||'')}));return;}bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));}
 
 function bindVisualDocument(host){
+ bindVisualNavigationSpine(host);
  const flow=parseDocumentFlow();const byId={};flow.forEach(x=>byId[x.id]=x);
- host.querySelectorAll('.doc-heading[contenteditable=true]').forEach(el=>{const node=byId[el.dataset.nodeId];attachEditor(el);let exiting=false;const save=refresh=>{const text=editableLatex(el).replace(/\n+/g,' ').trim();updateDocumentNode(node,'\\'+node.command+(node.starred?'*':'')+'{'+text+'}',refresh);};el.__texflowSaveNow=()=>save(false);el.addEventListener('input',()=>scheduleSave(el,save));el.addEventListener('blur',()=>{if(exiting){exiting=false;return;}flushSave(el,save);});el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const old=saveTimers.get(el);if(old)clearTimeout(old);exiting=true;save(false);const next=el.nextElementSibling;if(next&&next.classList&&next.classList.contains('doc-paragraph'))focusParagraphStart(next);else createSyntheticParagraphAfter(el,node,'');}});});
+ host.querySelectorAll('.doc-heading[contenteditable=true]').forEach(el=>{const node=byId[el.dataset.nodeId];attachEditor(el);bindDocumentTextNavigation(el);let exiting=false;const save=refresh=>{const text=editableLatex(el).replace(/\n+/g,' ').trim();updateDocumentNode(node,'\\'+node.command+(node.starred?'*':'')+'{'+text+'}',refresh);};el.__texflowSaveNow=()=>save(false);el.addEventListener('input',()=>scheduleSave(el,save));el.addEventListener('blur',()=>{if(exiting){exiting=false;return;}flushSave(el,save);});el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const old=saveTimers.get(el);if(old)clearTimeout(old);exiting=true;save(false);const next=el.nextElementSibling;if(next&&next.classList&&next.classList.contains('doc-paragraph'))focusParagraphStart(next);else createSyntheticParagraphAfter(el,node,'');}});});
  host.querySelectorAll('.doc-paragraph[contenteditable=true]').forEach(el=>bindDocumentParagraph(el,byId[el.dataset.nodeId]));bindMultiParagraphMouseSelection(host);host.querySelectorAll('.doc-toc-row[data-target]').forEach(el=>el.addEventListener('click',()=>{const target=host.querySelector('#'+el.dataset.target)||document.getElementById(el.dataset.target);if(target)target.scrollIntoView({behavior:'smooth',block:'start'});}));
  host.querySelectorAll('.doc-include-open[data-uri]').forEach(el=>el.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();vscode.postMessage({type:'openIncludedSource',uri:el.dataset.uri||'',target:el.dataset.target||''});}));
  host.querySelectorAll('.doc-list').forEach(list=>bindDocumentList(list,byId[list.dataset.nodeId]));
@@ -4594,90 +4412,11 @@ function bindVisualDocument(host){
  renderInlineMaths(host);if(documentLayoutMode==='pages'){requestAnimationFrame(()=>paginateDocumentPages(host));host.addEventListener('input',()=>scheduleDocumentPagination(host));window.addEventListener('resize',()=>scheduleDocumentPagination(host),{passive:true});}
 }
 
-function alignmentFromDirective(raw,current='justify'){
- const text=String(raw||'');
- // Last directive wins, matching normal LaTeX scoping inside the current block.
- const matches=[...text.matchAll(/\\(centering|raggedright|raggedleft|justifying)\b/g)];
- if(!matches.length)return current||'justify';
- const cmd=matches[matches.length-1][1];
- if(cmd==='centering')return 'center';
- if(cmd==='raggedright')return 'left';
- if(cmd==='raggedleft')return 'right';
- return 'justify';
-}
-function isOnlyAlignmentDirective(raw){
- return /^(?:\s|%[^\n]*(?:\n|$))*\\(?:centering|raggedright|raggedleft|justifying)\b\s*(?:%[^\n]*)?\s*$/.test(String(raw||''));
-}
 function alignClass(value,fallback='justify'){
  const align=['left','center','right','justify'].includes(value)?value:fallback;
  return 'align-'+align;
 }
 
-function figureData(raw){
- const graphic=/\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/.exec(String(raw||''));
- const options=graphic&&graphic[1]||'',path=graphic&&graphic[2]&&graphic[2].trim()||'';
- const parts=options.split(',').map(x=>x.trim()).filter(Boolean);
- function dim(name){const token=parts.find(x=>new RegExp('^'+name+'\\s*=').test(x));if(!token)return{};const value=token.slice(token.indexOf('=')+1).trim(),m=/^([0-9]*\.?[0-9]+)\s*(\\(?:textwidth|linewidth|columnwidth|paperwidth|textheight)|[a-zA-Z]+)$/.exec(value);return m?{value:Number(m[1]),unit:m[2]}:{};}
- const captionMatch=/\\caption(?:\[([^\]]*)\])?\{([^}]*)\}/.exec(String(raw||'')),shortCaption=captionMatch?captionMatch[1]||'':'',caption=captionMatch?captionMatch[2]:'',captionPosition=captionMatch&&graphic&&captionMatch.index<graphic.index?'above':'below';
- const label=(/\\label\{([^}]+)\}/.exec(String(raw||''))||[])[1]||'';
- const placement=(/\\begin\{figure\}(?:\[([^\]]*)\])?/.exec(String(raw||''))||[])[1]||'';
- const align=/\\raggedleft|\\begin\{flushright\}/.test(raw)?'right':/\\centering|\\begin\{center\}/.test(raw)?'center':'left';
- const angleToken=parts.find(x=>/^angle\s*=/.test(x));const angle=angleToken?Number(angleToken.slice(angleToken.indexOf('=')+1).trim())||0:0;
- return{path,options,width:dim('width'),height:dim('height'),caption,shortCaption,angle,label,placement,captionPosition,align};
-}
-function tableData(raw){
- const text=String(raw||''),tab=/\\begin\{tabular\}\{([^}]*)\}([\s\S]*?)\\end\{tabular\}/.exec(text),captionMatch=/\\caption(?:\[[^\]]*\])?\{([^}]*)\}/.exec(text),caption=captionMatch?captionMatch[1]:'',captionPosition=captionMatch&&tab&&captionMatch.index<tab.index?'above':'below',label=(/\\label\{([^}]+)\}/.exec(text)||[])[1]||'',placement=(/\\begin\{table\}(?:\[([^\]]*)\])?/.exec(text)||[])[1]||'';
- if(!tab)return{simple:false,columns:[],rows:[],caption,label,placement,captionPosition,tableStyle:'plain'};
- const spec=tab[1].trim(),tableStyle=/\\(?:toprule|midrule|bottomrule)\b/.test(tab[2])?'booktabs':'plain',unsupported=/\\(?:multicolumn|multirow|cline|cmidrule|begin\{|end\{)/.test(tab[2]),columns=[...spec.matchAll(/[lcr]/g)].map(m=>m[0]);
- if(!columns.length||unsupported||spec.replace(/[lcr|\s]/g,'')!=='')return{simple:false,columns,rows:[],caption,label,placement,captionPosition,tableStyle};
- let tbody=tab[2].replace(/^[\s\n]+|[\s\n]+$/g,'').replace(/(^|\n)\s*\\(?:hline|toprule|midrule|bottomrule)\s*(?=\n|$)/g,'$1');
- const rawRows=tbody.split(/\\\\(?:\s*\[[^\]]*\])?/).map(x=>x.trim()).filter(Boolean),rows=rawRows.map(r=>r.split(/(?<!\\)&/).map(c=>c.trim()));
- return{simple:!!rows.length&&rows.every(r=>r.length===columns.length),columns,rows,caption,label,placement,captionPosition,tableStyle};
-}
-
-function parseBlocks(body){
- const out=[];const re=/\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|comment)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;let cur=0,m,n=0,currentAlign='justify';
- function text(s,e){
-  const raw=body.slice(s,e);if(!raw.trim())return;
-  if(s===0){const size=/^((?:(?:[ \t\r\n]+)|(?:[ \t]*%[^\n]*(?:\r?\n|$)))*)\\(?:normalsize|small|footnotesize|scriptsize|tiny)\b[ \t]*(?:%[^\n]*)?(?:\r?\n)?/.exec(raw);if(size){const prefix=String(size[1]||''),commandStart=s+prefix.length,commandEnd=s+size[0].length;if(prefix)text(s,commandStart);out.push({id:'b'+n++,kind:'raw',start:commandStart,end:commandEnd,raw:body.slice(commandStart,commandEnd),text:body.slice(commandStart,commandEnd).trim(),hidden:true,align:currentAlign});if(commandEnd<e)text(commandEnd,e);return;}}
-  const alignmentDirective=/(^|\r?\n)([ \t]*\\(centering|raggedright|raggedleft|justifying)\b[ \t]*(?:%[^\n]*)?)(?=\r?\n|$)/m.exec(raw);
-  if(alignmentDirective){
-   const linePrefix=String(alignmentDirective[1]||''),command=String(alignmentDirective[3]||''),commandStart=s+(alignmentDirective.index||0)+linePrefix.length,commandEnd=commandStart+String(alignmentDirective[2]||'').length;
-   if(commandStart>s)text(s,commandStart);
-   currentAlign=alignmentFromDirective('\\'+command,currentAlign);
-   out.push({id:'b'+n++,kind:'raw',start:commandStart,end:commandEnd,raw:body.slice(commandStart,commandEnd),text:body.slice(commandStart,commandEnd).trim(),hidden:true,align:currentAlign});
-   if(commandEnd<e)text(commandEnd,e);
-   return;
-  }
-  const standaloneComment=/(^|\r?\n)([ \t]*%[^\r\n]*)/.exec(raw);if(standaloneComment){const prefixLength=String(standaloneComment[1]||'').length,commentStart=(standaloneComment.index||0)+prefixLength;let commentEnd=commentStart+String(standaloneComment[2]||'').length;while(commentEnd<raw.length){const next=/^(\r?\n)([ \t]*%[^\r\n]*)/.exec(raw.slice(commentEnd));if(!next)break;commentEnd+=next[0].length;}if(commentStart>0)text(s,s+commentStart);const clean=raw.slice(commentStart,commentEnd),commentNote=/^\s*%\s*TeXFlow note:/i.test(clean),commentText=clean.replace(/^\s*%\s?/gm,'').replace(/^TeXFlow note:\s*/i,'');out.push({id:'b'+n++,kind:'comment',start:s+commentStart,end:s+commentEnd,raw:clean,text:commentText,commentText,commentNote,align:currentAlign});if(commentEnd<raw.length)text(s+commentEnd,e);return;}
-  const trimmedRaw=raw.trim();if(trimmedRaw&&trimmedRaw.split(/\r?\n/).every(line=>/^\s*%/.test(line))){const lead=raw.search(/\S/),trail=(/\s*$/.exec(raw)||[''])[0].length,start=lead<0?s:s+lead,end=e-trail,clean=body.slice(start,end);const commentNote=/^\s*%\s*TeXFlow note:/i.test(clean),commentText=clean.replace(/^\s*%\s?/gm,'').replace(/^TeXFlow note:\s*/i,'');out.push({id:'b'+n++,kind:'comment',start,end,raw:clean,text:commentText,commentText,commentNote,align:currentAlign});return;}
-  // Labels in ordinary document text are structural metadata, not raw visible
-  // LaTeX. Split them out before the safety classification so a heading label
-  // cannot force the following prose/citations into "LaTeX preserved".
-  const labels=[...raw.matchAll(/\\label\{[^}]+\}/g)];
-  if(labels.length){
-   let local=0;
-   for(const lm of labels){const at=lm.index||0;if(at>local)text(s+local,s+at);local=at+lm[0].length;}
-   if(local<raw.length)text(s+local,e);
-   return;
-  }
-  const nextAlign=alignmentFromDirective(raw,currentAlign);
-  if(isOnlyAlignmentDirective(raw)){const lead=raw.search(/\S/),trail=(/\s*$/.exec(raw)||[''])[0].length,start=lead<0?s:s+lead,end=e-trail;out.push({id:'b'+n++,kind:'raw',start,end,raw:body.slice(start,end),text:body.slice(start,end).trim(),hidden:true,align:nextAlign});currentAlign=nextAlign;return;}
-  const unsafe=/^(?:\s*%|\s*\\(?:newpage|clearpage|pagebreak)\b)/m.test(raw)||/\\(begin|end|input|include|hypertarget|label|only|visible|uncover|pause|vspace|includegraphics|tikz)/.test(raw);
-  if(unsafe){const lead=raw.search(/\S/),trail=(/\s*$/.exec(raw)||[''])[0].length,start=lead<0?s:s+lead,end=e-trail,clean=body.slice(start,end);if(clean)out.push({id:'b'+n++,kind:'raw',start,end,raw:clean,text:clean,align:nextAlign});currentAlign=nextAlign;return;}
-  // LaTeX blank lines are paragraph boundaries. Make each paragraph its own
-  // semantic node and keep the blank-line separators outside editable ranges.
-  const sep=/\n[ \t]*\n+/g;let local=0,sm;
-  const pushPara=(a,b)=>{if(b<=a)return;const seg=raw.slice(a,b),lead=seg.search(/\S/);if(lead<0)return;const trail=(/\s*$/.exec(seg)||[''])[0].length,start=s+a+lead,end=s+b-trail;if(end<=start)return;const clean=body.slice(start,end);out.push({id:'b'+n++,kind:'paragraph',start,end,raw:clean,text:clean,align:nextAlign});};
-  while((sm=sep.exec(raw))){pushPara(local,sm.index);local=sep.lastIndex;}pushPara(local,raw.length);currentAlign=nextAlign;
- }
- while((m=re.exec(body))){text(cur,m.index);
-  if(m[0]==='$$'){const ep=body.indexOf('$$',re.lastIndex);if(ep<0)break;const end=ep+2,raw=body.slice(m.index,end),inner=body.slice(re.lastIndex,ep).trim();out.push({id:'b'+n++,kind:'equation',start:m.index,end,raw,env:'$$',text:inner,align:'center'});cur=end;re.lastIndex=end;continue;}
-  if(m[4]!==undefined){const raw=m[0],d=figureData(raw);out.push({id:'b'+n++,kind:'figure',start:m.index,end:re.lastIndex,raw,env:'includegraphics',text:raw,align:d.align,figurePath:d.path,figureOptions:d.options,figureWidth:d.width.value,figureWidthUnit:d.width.unit,figureHeight:d.height.value,figureHeightUnit:d.height.unit,figureCaption:d.caption,figureShortCaption:d.shortCaption,figureAngle:d.angle,figureLabel:d.label,figurePlacement:d.placement,figureCaptionPosition:d.captionPosition});cur=re.lastIndex;continue;}
-  if(m[6]!==undefined){const raw=m[0];out.push({id:'b'+n++,kind:'vspace',start:m.index,end:re.lastIndex,raw,text:raw,spaceAmount:String(m[6]||'').trim(),spaceStarred:m[5]==='*'});cur=re.lastIndex;continue;}
-  if(m[7]!==undefined){const raw=m[0];out.push({id:'b'+n++,kind:'break',start:m.index,end:re.lastIndex,raw,text:raw,breakCommand:String(m[7]||'newpage')});cur=re.lastIndex;continue;}
-  const env=m[1],token='\\end{'+env+'}',match=findMatchingEnvEnd(body,env,re.lastIndex);if(!match)break;const end=match.end,raw=body.slice(m.index,end),inner=raw.slice(m[0].length,raw.length-token.length).trim();let kind='raw';if(env==='itemize'||env==='enumerate')kind='itemize';else if(['block','alertblock','exampleblock'].includes(env))kind='block';else if(/^(equation|align|gather|multline)/.test(env))kind='equation';else if(env==='figure')kind='figure';else if(env==='table')kind='table';else if(env==='columns'||env==='multicols')kind='columns';else if(env==='quote'||env==='quotation')kind='quote';else if(env==='minipage')kind='container';else if(['theorem','lemma','proposition','corollary','definition','proof'].includes(env))kind='theorem';else if(env==='comment')kind='commentblock';else if(['flushleft','center','flushright'].includes(env))kind='paragraph';const effectiveAlign=['flushleft','center','flushright'].includes(env)?(env==='flushleft'?'left':env==='flushright'?'right':'center'):kind==='equation'?'center':kind==='itemize'?(currentAlign==='justify'?'left':currentAlign):currentAlign;const b={id:'b'+n++,kind,start:m.index,end,raw,env,title:m[2]||'',text:inner,align:effectiveAlign};if(kind==='itemize')b.items=splitTopItems(inner);if(kind==='figure'){const d=figureData(raw);Object.assign(b,{align:d.align,figurePath:d.path,figureOptions:d.options,figureWidth:d.width.value,figureWidthUnit:d.width.unit,figureHeight:d.height.value,figureHeightUnit:d.height.unit,figureCaption:d.caption,figureShortCaption:d.shortCaption,figureAngle:d.angle,figureLabel:d.label,figurePlacement:d.placement,figureCaptionPosition:d.captionPosition})}if(kind==='columns'){if(env==='multicols'){b.columnCount=Math.max(2,Math.min(4,Number(m[2])||2));b.columnTexts=inner.split(/\\columnbreak\b/).map(x=>x.trim())}else{const ps=[...inner.matchAll(/\\column\{[^}]+\}([\s\S]*?)(?=\\column\{|$)/g)].map(x=>String(x[1]||'').trim());b.columnTexts=ps.length?ps:[inner];b.columnCount=b.columnTexts.length}}if(kind==='table'){const d=tableData(raw);if(!d.simple)b.kind='raw';else Object.assign(b,{tableSimple:true,tableColumns:d.columns,tableRows:d.rows,tableCaption:d.caption,tableLabel:d.label,tablePlacement:d.placement,tableCaptionPosition:d.captionPosition,tableStyle:d.tableStyle})}out.push(b);cur=end;re.lastIndex=end}text(cur,body.length);return out;
-}
 function applyPresentationStyle(){
  const st=presentationStyle||{};const w=Number(st.aspectWidth)||4,h=Number(st.aspectHeight)||3;
  const root=document.documentElement;root.style.setProperty('--slide-aspect',w+' / '+h);root.style.setProperty('--slide-aspect-number',String(w/h));root.style.setProperty('--slide-body-size',(Number(st.bodyFontPx)||16)+'px');root.style.setProperty('--slide-title-size',(Number(st.titleFontPx)||24.8)+'px');root.style.setProperty('--slide-line-height',String(Number(st.lineHeight)||1.28));
@@ -4718,12 +4457,12 @@ function currentSource(){const f=frames[current];return sources.find(x=>x.uri===
 function sourceEditorHtml(compact=false){const src=currentSource();if(!src)return'<div class="empty">No LaTeX source loaded.</div>';const options=sources.map(x=>'<option value="'+esc(x.uri)+'"'+(x.uri===src.uri?' selected':'')+'>'+esc(x.label)+'</option>').join('');return'<section class="source-shell"><div class="source-head"><select class="source-select">'+options+'</select><button class="source-save">Save source</button></div><textarea class="source-code" spellcheck="false"></textarea></section>';}
 function bindSourceEditor(host){const src=currentSource();if(!src)return;const ta=host.querySelector('.source-code');if(!ta)return;ta.value=src.text;host.querySelector('.source-select').onchange=e=>{const target=sources.find(x=>x.uri===e.target.value);if(target){const fIndex=frames.findIndex(f=>f.sourceUri===target.uri);if(fIndex>=0)current=fIndex;renderWorkspace();}};host.querySelector('.source-save').onclick=()=>vscode.postMessage({type:'saveSource',uri:src.uri,text:ta.value});}
 function visualFrameHtml(f){if(!f)return'<div class="empty">No Beamer frames found.</div>';const v=frameVerticalClass(f),z=frameTextSizeClass(f);if(/\\(?:titlepage|maketitle)\b/.test(f.body))return'<article class="slide title-page align-center'+v+z+'"><div class="blocks-host"><div class="title align-center">'+latexToHtml(metadata.title||'Untitled presentation')+'</div>'+(metadata.subtitle?'<div style="font-size:1.25em;margin:.5em 0 1.6em">'+latexToHtml(metadata.subtitle)+'</div>':'')+'<div style="font-size:1.08em;margin-top:2.5em">'+latexToHtml(metadata.author||'')+'</div>'+(metadata.institute?'<div style="margin-top:.75em;color:var(--muted)">'+latexToHtml(metadata.institute)+'</div>':'')+(metadata.date?'<div style="margin-top:2em">'+latexToHtml(metadata.date)+'</div>':'')+'</div></article>';return'<article class="slide'+v+z+'"><div class="title" contenteditable="true">'+esc(f.title)+'</div><div class="blocks-host"></div></article>';}
-function bindVisualFrame(host,i){const f=frames[i];if(!f||/\\(?:titlepage|maketitle)\b/.test(f.body))return;const title=host.querySelector('.title');attachEditor(title);const saveTitle=refresh=>vscode.postMessage({type:'updateFrameTitle',frameIndex:i,title:editorToLatex(title),refresh});title.addEventListener('input',()=>scheduleSave(title,saveTitle));title.addEventListener('blur',()=>flushSave(title,saveTitle));const blockHost=host.querySelector('.blocks-host');const parsed=parseBlocks(f.body);parsed.forEach(b=>blockHost.appendChild(renderBlock(b,i)));if(!parsed.length){const empty=document.createElement('div');empty.className='block paragraph empty-frame-body';empty.contentEditable='true';empty.dataset.placeholder='Start typing slide content…';attachEditor(empty);const saveEmpty=refresh=>vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text:editorToLatex(empty),refresh});empty.__texflowCommit=(text)=>vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text,refresh:true});empty.__texflowSaveNow=()=>saveEmpty(false);empty.addEventListener('input',()=>scheduleSave(empty,saveEmpty));empty.addEventListener('blur',()=>flushSave(empty,saveEmpty));blockHost.appendChild(empty);}else{const trailing=document.createElement('div');trailing.className='trailing-paragraph editable';trailing.contentEditable='true';trailing.dataset.placeholder='Continue typing…';attachEditor(trailing);let saved='';const saveTrailing=refresh=>{const text=editableLatex(trailing);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh});saved=text;};trailing.__texflowCommit=(text)=>{setEditableLatex(trailing,text);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh:true});saved=text;};trailing.__texflowSaveNow=()=>saveTrailing(false);trailing.addEventListener('input',()=>scheduleSave(trailing,saveTrailing));trailing.addEventListener('blur',()=>flushSave(trailing,saveTrailing));blockHost.appendChild(trailing);}title.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();flushSave(title,saveTitle);const target=blockHost.querySelector('[contenteditable=true]');if(target){target.focus();const r=document.createRange();r.selectNodeContents(target);r.collapse(true);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}}});;const slide=host.querySelector('.slide');if(slide){scheduleSlideFit(slide);slide.addEventListener('input',()=>scheduleSlideFit(slide));}}
+function bindVisualFrame(host,i){const f=frames[i];if(!f||/\\(?:titlepage|maketitle)\b/.test(f.body))return;bindVisualNavigationSpine(host);const title=host.querySelector('.title');attachEditor(title);const saveTitle=refresh=>vscode.postMessage({type:'updateFrameTitle',frameIndex:i,title:editorToLatex(title),refresh});title.addEventListener('input',()=>scheduleSave(title,saveTitle));title.addEventListener('blur',()=>flushSave(title,saveTitle));const blockHost=host.querySelector('.blocks-host');const parsed=parseBlocks(f.body);parsed.forEach(b=>blockHost.appendChild(renderBlock(b,i)));if(!parsed.length){const empty=document.createElement('div');empty.className='block paragraph empty-frame-body';empty.contentEditable='true';empty.dataset.placeholder='Start typing slide content…';attachEditor(empty);const saveEmpty=refresh=>vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text:editorToLatex(empty),refresh});empty.__texflowCommit=(text,feature='')=>{setEditableLatex(empty,text);vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text,refresh:true,feature});};empty.__texflowCommentOutSupported=true;empty.__texflowSaveNow=()=>saveEmpty(false);bindBeamerProseEnter(empty,i);empty.addEventListener('input',()=>scheduleSave(empty,saveEmpty));empty.addEventListener('blur',()=>flushSave(empty,saveEmpty));blockHost.appendChild(empty);}else{const trailing=document.createElement('div');trailing.className='trailing-paragraph editable';trailing.contentEditable='true';trailing.dataset.placeholder='Continue typing…';attachEditor(trailing);let saved='';const saveTrailing=refresh=>{const text=editableLatex(trailing);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh});saved=text;};trailing.__texflowCommit=(text,feature='')=>{setEditableLatex(trailing,text);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh:true,feature});saved=text;};trailing.__texflowCommentOutSupported=true;trailing.__texflowSaveNow=()=>saveTrailing(false);bindBeamerProseEnter(trailing,i);trailing.addEventListener('input',()=>scheduleSave(trailing,saveTrailing));trailing.addEventListener('blur',()=>flushSave(trailing,saveTrailing));blockHost.appendChild(trailing);}title.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();flushSave(title,saveTitle);moveVisualEditableCaret(title,1);}});;const slide=host.querySelector('.slide');if(slide){scheduleSlideFit(slide);slide.addEventListener('input',()=>scheduleSlideFit(slide));}}
 function renderWorkspace(){mode='frames';current=Math.max(0,Math.min(current,frames.length-1));renderNav();updateFrameTextSizeMenu();document.querySelectorAll('.mode-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===viewMode));const c=document.getElementById('content');c.className='workspace';if(viewMode==='source'){c.innerHTML=sourceEditorHtml();bindSourceEditor(c);return;}if(viewMode==='pdf'){const hasPdf=!!pdfUri;const status=pdfBuildState==='building'?'Compiling…':pdfBuildState==='error'?pdfBuildMessage:(hasPdf?(pdfBuildMessage||'PDF ready.'):'No compiled PDF found.');c.innerHTML='<section class="pdf-shell"><div class="pdf-head"><span>Compiled PDF</span><button class="top-action" id="pdf-refresh">Refresh</button>'+(hasPdf?'<button class="top-action" id="pdf-open">Open PDF</button>':'')+'<button class="top-action primary" id="pdf-compile">Compile</button></div><div class="pdf-empty"><div><div style="font-size:28px;margin-bottom:12px">'+(pdfBuildState==='building'?'⏳':pdfBuildState==='error'?'⚠':'✓')+'</div><div>'+esc(status)+'</div>'+(hasPdf?'<div style="margin-top:8px;font-size:12px">TeXFlow uses the native VS Code PDF viewer to avoid the blank grey embedded-PDF bug.</div>':'')+'</div></div></section>';document.getElementById('pdf-refresh').onclick=()=>vscode.postMessage({type:'refreshPdf'});const open=document.getElementById('pdf-open');if(open)open.onclick=()=>vscode.postMessage({type:'openPdf'});document.getElementById('pdf-compile').onclick=()=>vscode.postMessage({type:'compile'});return;}if(!isBeamer){if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane document-pane">'+visualDocumentHtml()+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualDocument(c.querySelector('.visual-pane'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualDocumentHtml();bindVisualDocument(c);return;}if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane">'+visualFrameHtml(frames[current])+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualFrame(c.querySelector('.visual-pane'),current);scheduleSlideFit(c.querySelector('.visual-pane .slide'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualFrameHtml(frames[current]);bindVisualFrame(c,current);scheduleSlideFit(c.querySelector('.slide'));}
 function renderFrame(i){current=i;renderWorkspace();if(window.innerWidth<900&&typeof setNav==='function')setNav(false);}
-function renderBlock(b,fi){const wrap=document.createElement('div');wrap.className='block '+alignClass(b.align,b.kind==='itemize'?'left':'justify');if(b.hidden){wrap.style.display='none';return wrap;}
+function renderBlock(b,fi){const wrap=document.createElement('div');wrap.className='block '+alignClass(b.align,b.kind==='itemize'?'left':'justify');wrap.dataset.blockId=String(b.id||'');if(b.hidden){wrap.style.display='none';return wrap;}
  if(b.kind==='vspace'){wrap.className+=' vspace-block semantic-block';wrap.innerHTML='<span class="vspace-label">vertical '+esc((b.spaceStarred?'* ':'')+(b.spaceAmount||''))+'</span>';bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));return wrap;}
- if(b.kind==='paragraph'){wrap.innerHTML='<div class="editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const e=wrap.firstChild;attachEditor(e);const saveParagraph=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(e)},refresh};vscode.postMessage(msg);};e.__texflowCommit=(text,feature='')=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text},refresh:true,feature};vscode.postMessage(msg);};e.__texflowCommentOutSupported=true;e.__texflowSaveNow=()=>saveParagraph(false);e.addEventListener('input',()=>scheduleSave(e,saveParagraph));e.addEventListener('blur',()=>flushSave(e,saveParagraph));}
+ if(b.kind==='paragraph'){wrap.classList.add('paragraph');wrap.innerHTML='<div class="editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const e=wrap.firstChild;attachEditor(e);const saveParagraph=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(e)},refresh};vscode.postMessage(msg);};e.__texflowCommit=(text,feature='')=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text},refresh:true,feature};vscode.postMessage(msg);};e.__texflowCommentOutSupported=true;e.__texflowSaveNow=()=>saveParagraph(false);bindBeamerProseEnter(e,fi,b.id);e.addEventListener('input',()=>scheduleSave(e,saveParagraph));e.addEventListener('blur',()=>flushSave(e,saveParagraph));}
  else if(b.kind==='itemize'){const list=createVisualList(b.env,b.items||[]);list.classList.add(alignClass(b.align,'left'));const saveList=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh});list.querySelectorAll('.item-text').forEach(edit=>{edit.__texflowCommit=(text)=>{setEditableLatex(edit,text);vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh:true});};});bindListEditing(list,saveList);wrap.appendChild(list)}
  else if(b.kind==='block'){wrap.className+=' beamer-block '+(b.env==='alertblock'?'alert':b.env==='exampleblock'?'example':'');wrap.innerHTML='<div class="head" contenteditable="true">'+latexToHtml(b.title)+'</div><div class="body editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const blockHead=wrap.querySelector('.head'),blockBody=wrap.querySelector('.body');attachEditor(blockHead);attachEditor(blockBody);const saveBlock=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{title:editorToLatex(blockHead),text:editableLatex(blockBody)},refresh};vscode.postMessage(msg);};blockHead.__texflowCommit=(text)=>{setEditableLatex(blockHead,text);saveBlock(true);};blockHead.__texflowSaveNow=()=>saveBlock(false);blockBody.__texflowCommit=(text)=>{setEditableLatex(blockBody,text);saveBlock(true);};blockBody.__texflowSaveNow=()=>saveBlock(false);wrap.addEventListener('focusout',()=>saveBlock(false));}
  else if(b.kind==='equation'){wrap.className+=' math';wrap.innerHTML='<div class="render"></div>';let previewText=String(b.text||'').replace(/\\label\{[^}]+\}/g,'').replace(/\\(?:notag|nonumber)\b/g,'');if(/^align/.test(String(b.env||'')))previewText='\\begin{aligned}'+previewText+'\\end{aligned}';try{katex.render(previewText,wrap.querySelector('.render'),{displayMode:true,throwOnError:false})}catch{}wrap.title='Double-click to edit equation';wrap.addEventListener('dblclick',()=>openMathEditor(b,fi));}
@@ -4753,7 +4492,7 @@ function renderTable(block,frameIndex,wrap){
  const save=(refresh=true)=>vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload:payload(),refresh});
  function focusBeamerCell(target,atEnd=false){if(!target)return;target.focus();const r=document.createRange();r.selectNodeContents(target);r.collapse(!atEnd);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
  function beamerCaretBoundary(cell,which){const sel=getSelection();if(!sel||!sel.rangeCount)return false;const r=sel.getRangeAt(0);if(!r.collapsed||!cell.contains(r.startContainer))return false;const test=r.cloneRange();if(which==='start'){test.selectNodeContents(cell);test.setEnd(r.startContainer,r.startOffset);return test.toString().length===0;}test.selectNodeContents(cell);test.setStart(r.startContainer,r.startOffset);return test.toString().length===0;}
- wrap.querySelectorAll('.table-cell').forEach(cell=>{attachEditor(cell);cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...wrap.querySelectorAll('.table-cell')],i=cells.indexOf(cell),ncols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/ncols),col=i%ncols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&beamerCaretBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&beamerCaretBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&beamerCaretBoundary(cell,'end'))target=cells[(row+1)*ncols+col]||null;else if(e.key==='ArrowUp'&&beamerCaretBoundary(cell,'start')){target=row>0?cells[(row-1)*ncols+col]:null;atEnd=true;}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusBeamerCell(target,atEnd);}});});
+ wrap.querySelectorAll('.table-cell').forEach(cell=>{attachEditor(cell);cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...wrap.querySelectorAll('.table-cell')],i=cells.indexOf(cell),ncols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/ncols),col=i%ncols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&beamerCaretBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&beamerCaretBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&beamerCaretBoundary(cell,'end')){target=cells[(row+1)*ncols+col]||null;if(!target){e.preventDefault();moveVisualEditableCaret(cell,1,wrap);return;}}else if(e.key==='ArrowUp'&&beamerCaretBoundary(cell,'start')){target=row>0?cells[(row-1)*ncols+col]:null;atEnd=true;if(!target){e.preventDefault();moveVisualEditableCaret(cell,-1,wrap);return;}}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusBeamerCell(target,atEnd);}});});
  wrap.querySelectorAll('.table-col-align').forEach(x=>x.onchange=()=>save(true));if(captionInput)captionInput.onchange=()=>save(true);if(labelInput)labelInput.onchange=()=>save(true);if(captionPositionInput)captionPositionInput.onchange=()=>save(true);
  const mutate=(fn)=>{const p=payload();if(fn(p)!==false)vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload:p,refresh:true});};
  wrap.querySelector('.table-add-row').onclick=()=>mutate(p=>p.rows.push(Array.from({length:p.columns.length},()=>'')));
@@ -4861,6 +4600,13 @@ function bindSemanticBlockSelection(el,deleteAction){
  const select=(focus)=>{clearSemanticBlockSelection();el.classList.add('semantic-block-selected');selectedSemanticBlock={el,deleteAction};if(focus)try{el.focus({preventScroll:true})}catch{el.focus();}};
  el.addEventListener('mousedown',e=>{if(e.target===del)return;if(!eventInsideSemanticEditor(e.target))select(false);});
  el.addEventListener('click',e=>{if(e.target===del)return;if(!eventInsideSemanticEditor(e.target))select(true);});
+ el.addEventListener('keydown',e=>{
+  if(e.shiftKey||(e.key!=='ArrowUp'&&e.key!=='ArrowDown'))return;
+  if(eventInsideSemanticEditor(e.target))return;
+  const dir=e.key==='ArrowUp'?-1:1;
+  moveVisualEditableCaret(el,dir,el);
+  e.preventDefault();e.stopPropagation();
+ });
  del.addEventListener('mousedown',e=>{e.preventDefault();e.stopPropagation();});
  del.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();select(false);deleteAction();});
 }
