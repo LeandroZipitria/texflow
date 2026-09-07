@@ -18,7 +18,7 @@ interface FrameInfo {
 
 interface ParsedBlock {
   id: string;
-  kind: 'paragraph' | 'itemize' | 'block' | 'equation' | 'figure' | 'table' | 'vspace' | 'columns' | 'quote' | 'container' | 'break' | 'theorem' | 'comment' | 'raw';
+  kind: 'paragraph' | 'itemize' | 'block' | 'equation' | 'figure' | 'table' | 'vspace' | 'columns' | 'quote' | 'container' | 'break' | 'theorem' | 'comment' | 'commentblock' | 'raw';
   start: number;
   end: number;
   raw: string;
@@ -839,8 +839,19 @@ export function activate(context: vscode.ExtensionContext) {
         if (msg.type === 'updateBlock') {
           postStatus('saving');
           await beginHistoryStep();
-          const ctx = await getFrameContext(msg.frameIndex);
+          let ctx = await getFrameContext(msg.frameIndex);
           if (!ctx) return;
+          if (String(msg.feature || '') === 'commentenv') {
+            await refreshProject();
+            await ensurePackage(project, 'comment');
+            await refreshProject();
+            ctx = await getFrameContext(msg.frameIndex);
+            if (!ctx) return;
+            await ensureBeamerFrameFragile(ctx.document, ctx.frame);
+            await refreshProject();
+            ctx = await getFrameContext(msg.frameIndex);
+            if (!ctx) return;
+          }
           const blocks = parseBlocks(ctx.frame.body);
           const block = blocks.find(b => b.id === msg.blockId);
           if (!block) return;
@@ -931,6 +942,68 @@ export function activate(context: vscode.ExtensionContext) {
           postStatus('saved');
           if (msg.refresh) await sendDocument(msg.frameIndex, false);
         }
+        if (msg.type === 'deleteReviewDocumentNode') {
+          if (project.isBeamer) return;
+          await refreshProject();
+          const start = Number(msg.start);
+          const end = Number(msg.end);
+          const expected = String(msg.expected ?? '');
+          const source = project.root.getText();
+          if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end > source.length || source.slice(start, end) !== expected) {
+            throw new Error('TeXFlow could not safely locate the review item in the LaTeX source.');
+          }
+          const trimmed = expected.trim();
+          const isSourceComment = !!trimmed && trimmed.split(/\r?\n/).every(line => !line.trim() || /^\s*%/.test(line));
+          const isCommentEnvironment = /^\s*\\begin\{comment\}[\s\S]*\\end\{comment\}\s*$/.test(expected);
+          if (!isSourceComment && !isCommentEnvironment) {
+            throw new Error('TeXFlow refused to delete content that is not a recognized review item.');
+          }
+          const confirmed = await vscode.window.showWarningMessage(
+            'Delete this review item from the LaTeX source?',
+            { modal: true },
+            'Delete from source'
+          );
+          if (confirmed !== 'Delete from source') return;
+          postStatus('saving');
+          await beginHistoryStep();
+          updatingFromWebview = true;
+          try {
+            await applyReplacement(project.root, start, end, '');
+          } finally {
+            updatingFromWebview = false;
+          }
+          await sendDocument();
+          postStatus('saved');
+        }
+        if (msg.type === 'deleteReviewBlock') {
+          if (!project.isBeamer) return;
+          const ctx = await getFrameContext(Number(msg.frameIndex));
+          if (!ctx) return;
+          const blocks = parseBlocks(ctx.frame.body);
+          const block = blocks.find(b => b.id === String(msg.blockId || ''));
+          if (!block || (block.kind !== 'comment' && block.kind !== 'commentblock')) {
+            throw new Error('TeXFlow could not safely locate the review item in this frame.');
+          }
+          const confirmed = await vscode.window.showWarningMessage(
+            'Delete this review item from the LaTeX source?',
+            { modal: true },
+            'Delete from source'
+          );
+          if (confirmed !== 'Delete from source') return;
+          postStatus('saving');
+          await beginHistoryStep();
+          const frameBodyOffset = ctx.frame.raw.indexOf(ctx.frame.body);
+          const absStart = ctx.frame.start + frameBodyOffset + block.start;
+          const absEnd = ctx.frame.start + frameBodyOffset + block.end;
+          updatingFromWebview = true;
+          try {
+            await applyReplacement(ctx.document, absStart, absEnd, '');
+          } finally {
+            updatingFromWebview = false;
+          }
+          await sendDocument(Number(msg.frameIndex), false);
+          postStatus('saved');
+        }
         if (msg.type === 'updateDocumentNode') {
           if (project.isBeamer) return;
           // Visual document edits can arrive faster than WorkspaceEdit + save finishes
@@ -948,6 +1021,11 @@ export function activate(context: vscode.ExtensionContext) {
               if (String(msg.feature || '') === 'multicol') {
                 await refreshProject();
                 await ensurePackage(project, 'multicol');
+                await refreshProject();
+              }
+              if (String(msg.feature || '') === 'commentenv') {
+                await refreshProject();
+                await ensurePackage(project, 'comment');
                 await refreshProject();
               }
               postStatus('saved');
@@ -1304,6 +1382,7 @@ export function activate(context: vscode.ExtensionContext) {
             if (feature === 'nomenclature') { await ensurePackage(project, 'nomencl'); await ensurePreambleCommand(project.root, '\\makenomenclature'); }
             if (feature === 'booktabs') await ensurePackage(project, 'booktabs');
             if (feature === 'multicol') await ensurePackage(project, 'multicol');
+            if (feature === 'commentenv') await ensurePackage(project, 'comment');
             await refreshProject();
             await sendDocument();
           });
@@ -1315,6 +1394,7 @@ export function activate(context: vscode.ExtensionContext) {
           let code = String(msg.latex || '').trim();
           if (!code) { postStatus('saved'); return; }
           const feature = String(msg.feature || '');
+          const rootLengthBeforeFeature = project.root.getText().length;
           await beginHistoryStep();
           if (feature === 'link') await ensurePackage(project, 'hyperref');
           if (feature === 'box') await ensurePackage(project, 'graphicx');
@@ -1331,17 +1411,25 @@ export function activate(context: vscode.ExtensionContext) {
             await ensurePackage(project, 'nomencl');
             await ensurePreambleCommand(project.root, '\\makenomenclature');
           }
+          if (feature === 'commentenv') await ensurePackage(project, 'comment');
           await refreshProject();
           if (project.isBeamer) {
-            const ctx = await getFrameContext(Number(msg.frameIndex));
+            let ctx = await getFrameContext(Number(msg.frameIndex));
             if (!ctx) { postStatus('saved'); return; }
+            if (feature === 'commentenv') {
+              await ensureBeamerFrameFragile(ctx.document, ctx.frame);
+              await refreshProject();
+              ctx = await getFrameContext(Number(msg.frameIndex));
+              if (!ctx) { postStatus('saved'); return; }
+            }
             const pos = ctx.frame.end - '\\end{frame}'.length;
             await applyReplacement(ctx.document, pos, pos, `\n\n${code}\n`);
             await sendDocument(ctx.frame.index);
           } else {
             const doc = await vscode.workspace.openTextDocument(rootUri);
             const source = doc.getText(); const docEnd = source.lastIndexOf('\\end{document}');
-            const requested = Number(msg.cursorPos);
+            let requested = Number(msg.cursorPos);
+            if (feature === 'commentenv' && Number.isFinite(requested)) requested += Math.max(0, source.length - rootLengthBeforeFeature);
             const max = docEnd >= 0 ? docEnd : source.length;
             const pos = Number.isFinite(requested) && requested >= 0 && requested <= max ? Math.trunc(requested) : max;
             await applyReplacement(doc, pos, pos, `\n\n${code}\n\n`);
@@ -1620,36 +1708,52 @@ export function activate(context: vscode.ExtensionContext) {
 
 
 function stripLatexCommentsForIncludes(source: string): string {
-  let out = '';
-  let inComment = false;
+  // Preserve character offsets while masking content that LaTeX treats as
+  // comments. Project detection can then reuse positions against the original
+  // source without accidentally activating commented-out code.
+  const chars = source.split('');
+  let inLineComment = false;
 
-  for (let i = 0; i < source.length; i++) {
-    const ch = source[i];
-
-    if (inComment) {
-      if (ch === '\n' || ch === '\r') {
-        inComment = false;
-        out += ch;
-      } else {
-        out += ' ';
-      }
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (inLineComment) {
+      if (ch === '\n' || ch === '\r') inLineComment = false;
+      else chars[i] = ' ';
       continue;
     }
-
     if (ch === '%') {
       let backslashes = 0;
       for (let j = i - 1; j >= 0 && source[j] === '\\'; j--) backslashes++;
       if (backslashes % 2 === 0) {
-        inComment = true;
-        out += ' ';
-        continue;
+        inLineComment = true;
+        chars[i] = ' ';
       }
     }
-
-    out += ch;
   }
 
-  return out;
+  // The comment package excludes everything inside \begin{comment} ...
+  // \end{comment}. Mask those ranges too so \input, \include, headings, etc.
+  // inside a commented-out block never become live TeXFlow structure.
+  const lineMasked = chars.join('');
+  const envToken = /\\(begin|end)\{comment\}/g;
+  const stack: number[] = [];
+  const ranges: Array<{ start: number; end: number }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = envToken.exec(lineMasked))) {
+    if (match[1] === 'begin') stack.push(match.index);
+    else if (stack.length) {
+      const rangeStart = stack.pop()!;
+      if (stack.length === 0) ranges.push({ start: rangeStart, end: envToken.lastIndex });
+    }
+  }
+  if (stack.length) ranges.push({ start: stack[0], end: lineMasked.length });
+
+  for (const range of ranges) {
+    for (let i = range.start; i < range.end; i++) {
+      if (chars[i] !== '\n' && chars[i] !== '\r') chars[i] = ' ';
+    }
+  }
+  return chars.join('');
 }
 
 function extractIncludeReferences(document: vscode.TextDocument, projectRootDir?: string): IncludeReference[] {
@@ -1879,6 +1983,18 @@ async function ensurePackage(project: ProjectModel, packageName: string, options
   const found = packageCommand(project, packageName); if (found) return;
   const root = await vscode.workspace.openTextDocument(project.root.uri); const text = root.getText(); const begin = text.indexOf('\\begin{document}'); if (begin < 0) return;
   await applyReplacement(root, begin, begin, `\\usepackage${options ? `[${options}]` : ''}{${packageName}}\n`);
+}
+
+async function ensureBeamerFrameFragile(document: vscode.TextDocument, frame: FrameInfo) {
+  const source = document.getText();
+  const current = source.slice(frame.start, frame.end);
+  const begin = /^\\begin\{frame\}(?:\[([^\]]*)\])?/.exec(current);
+  if (!begin) return;
+  const options = String(begin[1] || '').split(',').map(x => x.trim()).filter(Boolean);
+  if (options.includes('fragile')) return;
+  options.push('fragile');
+  const replacement = `\\begin{frame}[${options.join(',')}]`;
+  await applyReplacement(document, frame.start, frame.start + begin[0].length, replacement);
 }
 
 async function ensurePreambleCommand(document: vscode.TextDocument, command: string) {
@@ -2572,16 +2688,20 @@ function escapeLatexPlainField(s: string): string {
 
 function parseFrames(source: string, sourceUri = '', sourceFile = ''): FrameInfo[] {
   const frames: FrameInfo[] = [];
+  // Discover Beamer structure only in active LaTeX. The masking helper preserves
+  // character offsets, so frames/sections inside % comments or comment-package
+  // blocks are ignored without changing the ranges used against the real source.
+  const activeSource = stripLatexCommentsForIncludes(source);
   const headings: { pos: number; level: 'chapter' | 'section' | 'subsection'; title: string }[] = [];
   const headingRe = /\\(section|subsection)\*?\{([^}]*)\}/g;
   let hm: RegExpExecArray | null;
-  while ((hm = headingRe.exec(source))) headings.push({ pos: hm.index, level: hm[1] as 'section' | 'subsection', title: hm[2] });
+  while ((hm = headingRe.exec(activeSource))) headings.push({ pos: hm.index, level: hm[1] as 'section' | 'subsection', title: hm[2] });
 
   const startRe = /\\begin\{frame\}(\[[^\]]*\])?(?:\{([^}]*)\})?/g;
   let m: RegExpExecArray | null;
-  while ((m = startRe.exec(source))) {
+  while ((m = startRe.exec(activeSource))) {
     const start = m.index;
-    const close = source.indexOf('\\end{frame}', startRe.lastIndex);
+    const close = activeSource.indexOf('\\end{frame}', startRe.lastIndex);
     if (close < 0) break;
     const end = close + '\\end{frame}'.length;
     const raw = source.slice(start, end);
@@ -2645,7 +2765,7 @@ function parseTableData(raw: string) {
 
 function parseBlocks(body: string): ParsedBlock[] {
   const blocks: ParsedBlock[] = [];
-  const tokenRe = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
+  const tokenRe = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|comment)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
   let cursor = 0;
   let count = 0;
   let m: RegExpExecArray | null;
@@ -2715,6 +2835,29 @@ function parseBlocks(body: string): ParsedBlock[] {
       currentAlign = alignmentFromDirective(`\\${command}`, currentAlign);
 
       if (commandEnd < e) pushText(commandEnd, e);
+      return;
+    }
+
+    // Standalone % comment lines can be interleaved with ordinary prose. Split
+    // the first contiguous run out before generic safety classification so a
+    // source divider/comment never turns the surrounding paragraph into raw LaTeX.
+    // Inline comments (text % comment) are deliberately left untouched for now.
+    const standaloneComment = /(^|\r?\n)([ \t]*%[^\r\n]*)/.exec(raw);
+    if (standaloneComment) {
+      const prefixLength = String(standaloneComment[1] || '').length;
+      const commentStart = (standaloneComment.index ?? 0) + prefixLength;
+      let commentEnd = commentStart + String(standaloneComment[2] || '').length;
+      while (commentEnd < raw.length) {
+        const next = /^(\r?\n)([ \t]*%[^\r\n]*)/.exec(raw.slice(commentEnd));
+        if (!next) break;
+        commentEnd += next[0].length;
+      }
+      if (commentStart > 0) pushText(s, s + commentStart);
+      const cleanRaw = raw.slice(commentStart, commentEnd);
+      const commentNote = /^\s*%\s*TeXFlow note:/i.test(cleanRaw);
+      const commentText = cleanRaw.replace(/^\s*%\s?/gm, '').replace(/^TeXFlow note:\s*/i, '');
+      blocks.push({ id: `b${count++}`, kind: 'comment', start: s + commentStart, end: s + commentEnd, raw: cleanRaw, text: commentText, commentText, commentNote });
+      if (commentEnd < raw.length) pushText(s + commentEnd, e);
       return;
     }
 
@@ -2854,6 +2997,7 @@ function parseBlocks(body: string): ParsedBlock[] {
     else if (env === 'quote' || env === 'quotation') kind = 'quote';
     else if (env === 'minipage') kind = 'container';
     else if (['theorem','lemma','proposition','corollary','definition','proof'].includes(env)) kind = 'theorem';
+    else if (env === 'comment') kind = 'commentblock';
     else if (['flushleft','center','flushright'].includes(env)) kind = 'paragraph';
     const block: ParsedBlock = { id: `b${count++}`, kind, start: m.index, end, raw, env, title: m[2] ?? '', text: inner };
     if (kind === 'paragraph' && ['flushleft','center','flushright'].includes(env)) (block as any).align = env === 'flushleft' ? 'left' : env === 'flushright' ? 'right' : 'center';
@@ -2999,8 +3143,13 @@ function serializeBlock(block: ParsedBlock, payload: any): string {
     return `\\begin{${env}}${block.title ? `{${escapeTitle(payload.title ?? block.title ?? '')}}` : ''}\n${normalizeEditableText(payload.text ?? block.text ?? '')}\n\\end{${env}}`;
   }
   if (block.kind === 'comment') {
-    const text = String(payload.text ?? block.commentText ?? block.text ?? '').replace(/\r?\n/g,' ');
-    return block.commentNote ? `% TeXFlow note: ${text.replace(/^%\s*/, '')}` : `% ${text.replace(/^%\s*/, '')}`;
+    const text = String(payload.text ?? block.commentText ?? block.text ?? '').replace(/\r\n?/g, '\n');
+    const lines = text.split('\n').map(line => line.replace(/^%\s?/, ''));
+    return lines.map((line, index) => block.commentNote && index === 0 ? `% TeXFlow note: ${line}` : `% ${line}`).join('\n');
+  }
+  if (block.kind === 'commentblock') {
+    const text = String(payload.text ?? block.text ?? '').replace(/\r\n?/g, '\n');
+    return `\\begin{comment}\n${text}\n\\end{comment}`;
   }
   if (block.kind === 'columns') {
     const texts = (payload.texts || block.columnTexts || []).map((x: unknown) => String(x ?? '').trim());
@@ -3302,7 +3451,7 @@ body{display:flex;flex-direction:column}
 .topbar-brand .brand-full{display:inline}.topbar-brand .brand-short{display:none}
 @media(max-width:1080px){.topbar-brand{padding:4px 8px}.topbar-brand .brand-full{display:none!important}.topbar-brand .brand-short{display:inline!important}}
 @media(max-width:860px){.topbar-brand{display:none!important}}
-@media(max-width:1050px){#app,body.nav-open #app,body.nav-closed #app{grid-template-columns:0 minmax(0,1fr)}.side{position:fixed;left:0;top:48px;bottom:0;width:min(240px,82vw);z-index:120;box-shadow:12px 0 30px rgba(0,0,0,.32);transform:translateX(-105%);opacity:0;pointer-events:none}.side::-webkit-scrollbar{width:8px}body.nav-open .side{transform:translateX(0);opacity:1;pointer-events:auto}body.nav-closed .side{transform:translateX(-105%);opacity:0;pointer-events:none}.main{min-width:0;width:100%;padding:12px 10px 70px}.slide{width:100%;margin:0;padding:2.15em 2.5em 2.25em;border-radius:8px}.floating-actions,body.nav-open .floating-actions,body.nav-closed .floating-actions{left:10px}.toolbar,body.nav-open .toolbar,body.nav-closed .toolbar{left:10px}}
+@media(max-width:1050px){#app,body.nav-open #app,body.nav-closed #app{grid-template-columns:0 minmax(0,1fr)}.side{position:fixed;left:0;top:48px;bottom:0;width:min(240px,82vw);z-index:120;box-shadow:12px 0 30px rgba(0,0,0,.32);transform:translateX(-105%);opacity:0;pointer-events:none}.side::-webkit-scrollbar{width:8px}body.nav-open .side{transform:translateX(0);opacity:1;pointer-events:auto}body.nav-closed .side{transform:translateX(-105%);opacity:0;pointer-events:none}.main{min-width:0;width:100%;padding:12px 10px 70px}.slide{width:100%;margin:0;padding:2.15em 2.5em 2.25em;border-radius:8px}.floating-actions,body.nav-open .floating-actions,body.nav-closed .floating-actions{left:10px}.toolbar,body.nav-open .toolbar,body.nav-closed .toolbar{left:10px}.comment-inspector{left:0}body.comment-inspector-open .main{padding-bottom:calc(70px + clamp(190px,30vh,330px))}}
 [contenteditable="true"][data-placeholder]:empty:before{content:attr(data-placeholder);color:var(--muted);pointer-events:none;font-style:italic;}
 ::highlight(texflow-spelling){text-decoration-line:underline;text-decoration-style:wavy;text-decoration-thickness:1.25px;text-decoration-color:var(--vscode-editorError-foreground, var(--vscode-errorForeground));}
 /* TeXFlow 0.8 visual refresh */
@@ -3314,7 +3463,35 @@ body{display:flex;flex-direction:column}
 
 .bib-citation{display:inline-flex;align-items:center;gap:.22em;padding:.02em .22em;border-radius:4px;background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--fg);white-space:nowrap}.bib-citation.missing{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent)}.bib-citation-key{font-size:.72em;color:var(--muted);margin-left:.15em}.tex-reference{display:inline-flex;align-items:center;gap:.28em;padding:.02em .26em;border-radius:4px;background:color-mix(in srgb,var(--vscode-symbolIcon-referenceForeground,var(--accent)) 12%,transparent);color:var(--fg);white-space:nowrap}.tex-reference.missing{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent)}.tex-reference-kind{font-size:.72em;font-weight:650;color:var(--muted)}.tex-reference-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.74em}.texflow-label-badge{display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none}.doc-math-wrap{position:relative}.doc-math-wrap .texflow-label-badge{position:absolute;right:0;top:0}.doc-heading-selected,.doc-math-wrap.selected{outline:1px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:4px;border-radius:3px}.doc-heading[data-label]::after{content:attr(data-label);display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none;pointer-events:none}.doc-bibliography{margin:34px 0 10px;padding-top:12px;border-top:1px solid var(--line)}.doc-bibliography h2{font-size:1.45em;margin:0 0 16px}.bib-entry{padding:8px 0;border-bottom:1px solid color-mix(in srgb,var(--line) 65%,transparent);line-height:1.42}.bib-entry:last-child{border-bottom:0}.bib-entry-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.75em;color:var(--muted);margin-left:.45em}.bib-print-placeholder{display:block;margin:14px 0;padding:12px 14px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 95%,var(--accent) 5%);color:var(--muted)}
 .table-editor-body{padding:16px;overflow:auto;display:grid;gap:14px}.table-editor-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.table-field{display:grid;gap:5px}.table-field.wide{grid-column:1/-1}.table-field label{font-size:11px;color:var(--muted);font-weight:650}.table-input,.table-select{width:100%;box-sizing:border-box;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:7px;padding:8px 10px;font:inherit;outline:none}.table-input:focus,.table-select:focus{border-color:var(--vscode-focusBorder)}.table-alignments{display:flex;flex-wrap:wrap;gap:8px}.table-align-control{display:flex;align-items:center;gap:5px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--panel) 90%,transparent)}.table-align-control span{font-size:11px;color:var(--muted)}.table-align-control select{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:5px;padding:4px 6px}.table-preview-shell{border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;background:var(--vscode-editor-background)}.table-preview{border-collapse:collapse;margin:auto;min-width:260px}.table-preview td{border:1px solid var(--line-strong);height:28px;min-width:62px;padding:3px 7px;color:var(--muted);font-size:11px}.table-validation{min-height:16px;font-size:11px;color:var(--vscode-inputValidation-errorForeground,var(--danger))}@media(max-width:640px){.table-editor-grid{grid-template-columns:1fr}.table-field.wide{grid-column:auto}}
-.tex-footnote,.tex-link,.tex-index,.tex-field,.tex-nomenclature{display:inline-flex;align-items:center;gap:.28em;padding:.03em .3em;margin:0 .05em;border:1px solid var(--line);border-radius:4px;background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);color:var(--fg);font-size:.9em;white-space:nowrap;vertical-align:baseline}.tex-footnote:before{content:'fn';font-size:.68em;font-weight:700;color:var(--accent)}.tex-link:before{content:'↗';color:var(--accent)}.tex-index:before{content:'idx';font-size:.65em;color:var(--muted)}.tex-field:before{content:'ƒ';color:var(--muted)}.tex-nomenclature:before{content:'sym';font-size:.65em;color:var(--muted)}.doc-rich-block{position:relative;margin:18px 0;padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:color-mix(in srgb,var(--paper) 97%,var(--accent) 3%)}.doc-rich-block.quote{border-left:4px solid var(--line-strong);font-style:italic}.doc-rich-block.theorem{border-left:4px solid var(--accent)}.doc-rich-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}.doc-break{position:relative;height:28px;margin:18px 0;border-top:1px dashed var(--line-strong);color:var(--muted);font-size:10px;text-align:center;padding-top:5px}.labs-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.labs-form-grid label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:11px}.labs-form-grid label.wide{grid-column:1/-1}.labs-form-grid input,.labs-form-grid textarea,.labs-form-grid select{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:7px 8px;font:inherit}.labs-feature-note{font-size:10px;color:var(--muted);margin-top:8px}
+.tex-footnote,.tex-link,.tex-index,.tex-field,.tex-nomenclature{display:inline-flex;align-items:center;gap:.28em;padding:.03em .3em;margin:0 .05em;border:1px solid var(--line);border-radius:4px;background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);color:var(--fg);font-size:.9em;white-space:nowrap;vertical-align:baseline}.tex-footnote:before{content:'fn';font-size:.68em;font-weight:700;color:var(--accent)}.tex-link:before{content:'↗';color:var(--accent)}.tex-index:before{content:'idx';font-size:.65em;color:var(--muted)}.tex-field:before{content:'ƒ';color:var(--muted)}.tex-nomenclature:before{content:'sym';font-size:.65em;color:var(--muted)}.doc-rich-block{position:relative;margin:18px 0;padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:color-mix(in srgb,var(--paper) 97%,var(--accent) 3%)}.doc-rich-block.comment{border-left:4px solid var(--line-strong);background:color-mix(in srgb,var(--paper) 98%,var(--vscode-editorWidget-background) 2%)}.doc-rich-block.comment.author-note{border-left-color:var(--accent)}.doc-rich-block.comment-block{border-left:4px solid color-mix(in srgb,var(--muted) 65%,var(--line-strong));background:color-mix(in srgb,var(--paper) 96%,var(--vscode-editorWidget-background) 4%)}.commented-preview{opacity:.9}.commented-preview-paragraph{margin:0 0 12px;line-height:1.55}.commented-preview-paragraph:last-child{margin-bottom:0}.commented-preview-heading{font-weight:650;color:var(--vscode-foreground);margin:14px 0 9px;line-height:1.25}.commented-preview-heading.level-chapter{font-size:1.45em}.commented-preview-heading.level-section{font-size:1.28em}.commented-preview-heading.level-subsection{font-size:1.12em}.commented-preview-heading.level-subsubsection,.commented-preview-heading.level-paragraph{font-size:1em}.commented-preview-list{margin:8px 0 14px;padding-left:1.8em}.commented-preview-list li{margin:4px 0}.commented-preview-quote{margin:10px 0;padding:8px 12px;border-left:3px solid var(--line-strong);color:var(--muted)}.commented-preview-include{display:flex;align-items:center;gap:8px;margin:10px 0;padding:7px 9px;border:1px dashed var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.commented-preview-include .commented-preview-include-kind{font-size:.78em;text-transform:uppercase;letter-spacing:.05em;font-weight:700}.commented-preview-include code{color:var(--vscode-foreground)}.commented-source-editor{display:none!important;font-family:var(--vscode-editor-font-family,monospace);font-size:.9em;white-space:pre-wrap;min-height:90px;margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--vscode-editor-background)}.doc-rich-block.comment-block.review-editing .commented-preview{display:none}.doc-rich-block.comment-block.review-editing .commented-source-editor{display:block!important}.doc-rich-block.comment-block.review-editing .review-card-head{margin-bottom:8px}.doc-rich-block.quote{border-left:4px solid var(--line-strong);font-style:italic}.doc-rich-block.theorem{border-left:4px solid var(--accent)}.doc-rich-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}.review-card-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}.review-card-head .doc-rich-label{flex:1;min-width:0;margin-bottom:0}.review-card-actions{display:flex;align-items:center;gap:5px}.review-card-action{appearance:none;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font:inherit;font-size:10px;line-height:1;padding:5px 7px;cursor:pointer;white-space:nowrap}.review-card-action:hover{background:var(--hover);color:var(--vscode-foreground);border-color:var(--line-strong)}.review-card-action.review-hide{font-size:15px;padding:3px 7px}.review-card-action.review-delete-source:hover{color:var(--vscode-errorForeground);border-color:var(--vscode-errorForeground)}.doc-rich-block.review-collapsed .review-card-body{display:none}.doc-rich-block.review-collapsed .review-card-head{margin-bottom:0}
+.comment-anchor{position:relative;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:visible!important;z-index:15;box-shadow:none!important}
+.block.comment-anchor:hover{box-shadow:none!important;background:transparent!important}
+.comment-marker{position:absolute;right:4px;top:-12px;width:24px;height:24px;padding:0;border:1px solid var(--line-strong);border-radius:5px;background:var(--vscode-editorWidget-background);color:var(--vscode-foreground);font:700 11px/1 var(--vscode-font-family);cursor:pointer;display:grid;place-items:center;box-shadow:0 3px 10px rgba(0,0,0,.18);z-index:20}
+.comment-marker:hover,.comment-marker.active{border-color:var(--vscode-focusBorder);background:color-mix(in srgb,var(--vscode-editorWidget-background) 82%,var(--vscode-focusBorder) 18%);color:var(--vscode-textLink-foreground)}
+.comment-marker.author-note{border-left:3px solid var(--vscode-focusBorder)}
+.comment-marker.source-comment{opacity:.78}
+.comment-marker.comment-block{border-left:3px solid var(--muted)}
+.comment-inspector{position:fixed;left:var(--sidebar);right:0;bottom:0;height:clamp(190px,30vh,330px);z-index:115;background:var(--vscode-sideBar-background,var(--panel));border-top:1px solid var(--line-strong);box-shadow:0 -14px 34px rgba(0,0,0,.26);transform:translateY(102%);transition:transform .16s ease,left .16s ease;display:flex;flex-direction:column}
+body.nav-closed .comment-inspector,body.focus-mode .comment-inspector{left:0}
+body.comment-inspector-open .comment-inspector{transform:translateY(0)}
+body.comment-inspector-open .main{padding-bottom:calc(100px + clamp(190px,30vh,330px));scroll-padding-bottom:calc(clamp(190px,30vh,330px) + 24px)}
+@media(max-width:1050px){.comment-inspector{left:0}body.comment-inspector-open .main{padding-bottom:calc(70px + clamp(190px,30vh,330px))}}
+.comment-inspector-head{height:42px;flex:0 0 42px;display:flex;align-items:center;gap:10px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--vscode-editorWidget-background)}
+.comment-inspector-head strong{flex:1;font-size:12px;letter-spacing:.02em}
+.comment-inspector-close{appearance:none;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font:inherit;font-size:16px;line-height:1;padding:4px 8px;cursor:pointer}
+.comment-inspector-close:hover{background:var(--hover);color:var(--vscode-foreground)}
+.comment-inspector-body{flex:1;min-height:0;overflow:auto;padding:16px}
+.comment-inspector-card{border:1px solid var(--line);border-radius:8px;background:color-mix(in srgb,var(--vscode-editorWidget-background) 72%,var(--paper) 28%);padding:14px}
+.comment-inspector-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:12px}
+.comment-inspector-editor{display:block;width:100%;min-height:120px;resize:vertical;background:var(--vscode-input-background,var(--vscode-editor-background));color:var(--vscode-input-foreground,var(--vscode-editor-foreground));border:1px solid var(--vscode-input-border,var(--line-strong));border-radius:6px;padding:10px;font:inherit;line-height:1.5}
+.comment-inspector-source{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;white-space:pre-wrap}
+.comment-inspector-preview{line-height:1.5}
+.comment-inspector-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.comment-inspector-actions button{appearance:none;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--vscode-foreground);font:inherit;font-size:11px;padding:6px 9px;cursor:pointer}
+.comment-inspector-actions button:hover{background:var(--hover);border-color:var(--line-strong)}
+.comment-inspector-actions .danger:hover{color:var(--vscode-errorForeground);border-color:var(--vscode-errorForeground)}
+.comment-inspector-note{color:var(--muted);font-size:11px;margin-top:10px}
+.doc-break{position:relative;height:28px;margin:18px 0;border-top:1px dashed var(--line-strong);color:var(--muted);font-size:10px;text-align:center;padding-top:5px}.labs-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.labs-form-grid label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:11px}.labs-form-grid label.wide{grid-column:1/-1}.labs-form-grid input,.labs-form-grid textarea,.labs-form-grid select{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:7px 8px;font:inherit}.labs-feature-note{font-size:10px;color:var(--muted);margin-top:8px}
 .tex-hspace{display:inline-flex;align-items:center;justify-content:center;min-width:.45em;height:1em;margin:0 .08em;padding:0 .18em;border:1px dashed color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:3px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:.68em;vertical-align:middle;white-space:nowrap}.doc-vspace,.vspace-block{position:relative;min-height:18px;margin:8px 0;border-left:2px dotted color-mix(in srgb,var(--accent) 55%,transparent);background:linear-gradient(to bottom,transparent 45%,color-mix(in srgb,var(--accent) 10%,transparent) 45%,color-mix(in srgb,var(--accent) 10%,transparent) 55%,transparent 55%);border-radius:3px}.doc-vspace .vspace-label,.vspace-block .vspace-label{position:absolute;left:7px;top:50%;transform:translateY(-50%);padding:1px 5px;background:var(--paper,var(--panel));color:var(--muted);font-size:10px;font-family:var(--vscode-editor-font-family,monospace)}.spacing-modal-body{padding:16px;display:grid;gap:13px}.spacing-type-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.spacing-type-row button{padding:10px;border:1px solid var(--line-strong);border-radius:8px;background:var(--input);color:var(--fg);cursor:pointer}.spacing-type-row button.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--input))}.spacing-presets{display:flex;gap:7px;flex-wrap:wrap}.spacing-presets button{padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--fg);cursor:pointer}.spacing-presets button:hover{background:var(--hover)}
 .cite-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.46);display:none;align-items:center;justify-content:center;z-index:260}.cite-modal-backdrop.open{display:flex}.cite-modal{width:min(760px,calc(100vw - 34px));max-height:min(720px,calc(100vh - 34px));display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line-strong);border-radius:14px;box-shadow:0 28px 70px rgba(0,0,0,.42);overflow:hidden}.cite-modal-head,.cite-modal-foot{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}.cite-modal-foot{border-bottom:0;border-top:1px solid var(--line);justify-content:flex-end}.cite-modal-body{padding:14px;overflow:auto}.cite-search-row{display:grid;grid-template-columns:1fr 150px;gap:10px;margin-bottom:12px}.cite-search,.cite-style{width:100%;box-sizing:border-box;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:7px;padding:8px 10px;font:inherit}.cite-results{display:flex;flex-direction:column;gap:7px}.cite-result{display:grid;grid-template-columns:22px 1fr;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer;background:transparent;color:var(--fg);text-align:left}.cite-result:hover{background:var(--hover)}.cite-result.selected{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}.cite-result-main{min-width:0}.cite-result-title{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cite-result-meta{font-size:.82em;color:var(--muted);margin-top:2px}.cite-empty{padding:20px;color:var(--muted);text-align:center}.cite-check{align-self:center}.cite-close,.cite-cancel,.cite-insert,.cite-secondary{border:1px solid var(--line-strong);background:var(--button);color:var(--button-fg);border-radius:7px;padding:7px 11px;cursor:pointer}.cite-insert{background:var(--accent);color:var(--accent-fg);border-color:transparent}.cite-secondary{background:transparent;color:var(--fg)}.cite-secondary:disabled,.cite-insert:disabled{opacity:.45;cursor:default}.cite-preview{font-size:.78em;color:var(--muted);display:block;margin-top:2px}.cite-menu-subtitle{margin-top:8px;padding-top:9px;border-top:1px solid var(--line)}.doc-outline-bibliography{font-weight:650;color:var(--fg);margin-top:9px}.doc-outline-bibliography.pending{color:var(--muted);font-weight:500;font-style:italic}
 
@@ -3324,7 +3501,11 @@ body{display:flex;flex-direction:column}
 ::highlight(texflow-find-current){background:var(--vscode-editor-findMatchBackground,color-mix(in srgb,var(--vscode-focusBorder) 58%,transparent));color:var(--vscode-editor-findMatchForeground,var(--vscode-editor-foreground))}
 .texflow-find{position:fixed;right:18px;top:54px;z-index:120;display:none;align-items:center;gap:5px;padding:6px;background:var(--vscode-editorWidget-background,var(--panel));border:1px solid var(--vscode-widget-border,var(--line-strong));border-radius:8px;box-shadow:0 10px 28px rgba(0,0,0,.28)}
 .texflow-find.open{display:flex}.texflow-find input{width:260px;max-width:34vw;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--line-strong));border-radius:5px;padding:6px 8px;font:inherit;outline:none}.texflow-find input:focus{border-color:var(--vscode-focusBorder);box-shadow:0 0 0 1px var(--vscode-focusBorder)}.texflow-find-count{min-width:58px;text-align:center;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.texflow-find button{width:28px;height:28px;display:grid;place-items:center;border:0;border-radius:5px;background:transparent;color:var(--vscode-foreground);font:inherit;cursor:pointer}.texflow-find button:hover:not(:disabled){background:var(--hover)}.texflow-find button:disabled{opacity:.4;cursor:default}body.focus-mode .texflow-find{top:12px}@media(max-width:700px){.texflow-find{left:10px;right:10px}.texflow-find input{width:auto;max-width:none;flex:1}}
-</style></head><body class="nav-open"><header class="topbar"><div class="topbar-brand" aria-label="TeXFlow"><span class="brand-full">TeXFlow</span><span class="brand-short">TF</span></div><div class="top-menu" id="file-menu"><button class="top-action menu-label" id="file-menu-button">File ▾</button><div class="top-menu-panel"><button id="new-document">New document…</button><span class="menu-divider"></span><button id="open-file" title="Open (Ctrl/Cmd+O)">Open…</button><button id="save-file" title="Save (Ctrl/Cmd+S)">Save</button><button id="save-as" title="Save as (Ctrl/Cmd+Shift+S)">Save as…</button></div></div><div class="top-menu" id="edit-menu"><button class="top-action menu-label" id="edit-menu-button">Edit ▾</button><div class="top-menu-panel"><button id="undo" title="Undo">↶ Undo</button><button id="redo" title="Redo">↷ Redo</button><span class="menu-divider"></span><button id="find-document" title="Find (Ctrl/Cmd+F)">Find…</button><button id="labs-find-replace">Find / Replace…</button><span class="menu-divider"></span><div class="menu-title">Selected object</div><button id="labs-copy-object">Copy object</button><button id="labs-paste-object">Paste object</button><button id="labs-duplicate-object">Duplicate object</button><button id="labs-move-up">Move up</button><button id="labs-move-down">Move down</button></div></div><div class="top-menu" id="structure-menu"><button class="top-action menu-label" id="structure-menu-button">Structure ▾</button><div class="top-menu-panel wide-menu" id="structure-menu-panel"></div></div><div class="top-menu" id="insert-menu"><button class="top-action menu-label" id="insert-menu-button">Insert ▾</button><div class="top-menu-panel wide-menu" id="insert-menu-panel"></div></div><div class="top-menu" id="format-menu"><button class="top-action menu-label" id="format-menu-button">Format ▾</button><div class="top-menu-panel"><div class="menu-title">Text</div><button class="format" data-format="bold"><b>B</b>&nbsp;&nbsp;Bold</button><button class="format" data-format="italic"><i>I</i>&nbsp;&nbsp;Italic</button><button class="format" data-format="underline"><u>U</u>&nbsp;&nbsp;Underline</button><button class="format" data-format="key">K&nbsp;&nbsp;Key</button><button class="format" data-format="alert">!&nbsp;&nbsp;Alert</button><span class="menu-divider"></span><div class="menu-title">Paragraph alignment</div><button class="insert" data-action="alignleft">Align left</button><button class="insert" data-action="aligncenter">Center</button><button class="insert" data-action="alignright">Align right</button><button class="insert" data-action="alignjustify">Justify / normal</button><span class="menu-divider"></span><div class="menu-title">Text color</div><div class="color-grid top-color-grid"><button class="color-swatch" data-color="black" title="black" style="background:black"></button><button class="color-swatch" data-color="gray" title="gray" style="background:gray"></button><button class="color-swatch" data-color="red" title="red" style="background:red"></button><button class="color-swatch" data-color="orange" title="orange" style="background:orange"></button><button class="color-swatch" data-color="yellow" title="yellow" style="background:yellow"></button><button class="color-swatch" data-color="green" title="green" style="background:green"></button><button class="color-swatch" data-color="blue" title="blue" style="background:blue"></button><button class="color-swatch" data-color="cyan" title="cyan" style="background:cyan"></button><button class="color-swatch" data-color="magenta" title="magenta" style="background:magenta"></button><button class="color-swatch" data-color="purple" title="purple" style="background:purple"></button><button class="color-swatch" data-color="brown" title="brown" style="background:brown"></button></div></div></div><div class="top-menu" id="references-menu"><button class="top-action menu-label" id="references-menu-button">References ▾</button><div class="top-menu-panel wide-menu" id="references-menu-panel"></div></div><div class="top-menu" id="layout-menu-top"><button class="top-action menu-label" id="layout-menu-button">Layout ▾</button><div class="top-menu-panel wide-menu" id="layout-menu-panel"></div></div><div class="top-menu" id="language-menu-top"><button class="top-action menu-label" id="language-menu-button">Language ▾</button><div class="top-menu-panel"><button id="spell-language-automatic">Automatic</button><button id="spell-language-english">English</button><button id="spell-language-spanish">Español</button><span class="menu-divider"></span><button id="spell-check-toggle">Spell checking</button></div></div><div class="top-menu beamer-only" id="beamer-menu-top"><button class="top-action menu-label" id="beamer-menu-button">Beamer ▾</button><div class="top-menu-panel"><button class="insert" data-action="frame">New frame</button><span class="menu-divider"></span><div class="menu-title">Blocks</div><button class="insert" data-action="beamerblock">Block</button><button class="insert" data-action="beameralert">Alert block</button><button class="insert" data-action="beamerexample">Example block</button><span class="menu-divider"></span><div class="menu-title">Frame text size</div><button class="frame-size-option" data-frame-size="normal">✓ Normal</button><button class="frame-size-option" data-frame-size="small">Small</button><button class="frame-size-option" data-frame-size="footnotesize">Footnotesize</button><button class="frame-size-option" data-frame-size="scriptsize">Scriptsize</button><button class="frame-size-option" data-frame-size="tiny">Tiny</button><span class="menu-divider"></span><button class="insert" data-action="frameoptions">Frame options…</button></div></div><div class="top-menu" id="view-menu"><button class="top-action menu-label" id="view-menu-button">View ▾</button><div class="top-menu-panel"><button class="document-only" id="view-continuous">✓ Continuous</button><button class="document-only" id="view-pages">Pages</button><span class="menu-divider document-only"></span><button id="toggle-nav">Index / outline</button><button id="focus-mode">Focus mode</button><span class="menu-divider"></span><button id="project-diagnostics">Project diagnostics</button></div></div><span class="top-separator"></span><nav class="mode-tabs"><button class="mode-tab active" data-view="visual">Visual</button><button class="mode-tab" data-view="source">Source</button><button class="mode-tab" data-view="split">Split</button><button class="mode-tab" data-view="pdf">PDF</button></nav><span class="top-spacer topbar-spacer"></span><button class="top-action primary" id="top-compile">▶ Compile</button><span class="save-status" id="save-status">Saved</span></header><div class="texflow-find" id="texflow-find" role="search"><input id="texflow-find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in document"><span class="texflow-find-count" id="texflow-find-count">0 of 0</span><button id="texflow-find-prev" type="button" title="Previous match (Shift+Enter)">↑</button><button id="texflow-find-next" type="button" title="Next match (Enter)">↓</button><button id="texflow-find-close" type="button" title="Close (Esc)">×</button></div><div class="floating-actions"><button class="floating-btn focus-exit" id="exit-focus" title="Exit focus mode">⛶</button></div><div id="app"><aside class="side"><div class="brand"><span class="brand-mark">T</span><span>Document</span></div><div id="nav"></div></aside><main class="main"><div id="content" class="empty">Loading…</div></main></div>
+</style></head><body class="nav-open"><header class="topbar"><div class="topbar-brand" aria-label="TeXFlow"><span class="brand-full">TeXFlow</span><span class="brand-short">TF</span></div><div class="top-menu" id="file-menu"><button class="top-action menu-label" id="file-menu-button">File ▾</button><div class="top-menu-panel"><button id="new-document">New document…</button><span class="menu-divider"></span><button id="open-file" title="Open (Ctrl/Cmd+O)">Open…</button><button id="save-file" title="Save (Ctrl/Cmd+S)">Save</button><button id="save-as" title="Save as (Ctrl/Cmd+Shift+S)">Save as…</button></div></div><div class="top-menu" id="edit-menu"><button class="top-action menu-label" id="edit-menu-button">Edit ▾</button><div class="top-menu-panel"><button id="undo" title="Undo">↶ Undo</button><button id="redo" title="Redo">↷ Redo</button><span class="menu-divider"></span><button id="find-document" title="Find (Ctrl/Cmd+F)">Find…</button><button id="labs-find-replace">Find / Replace…</button><span class="menu-divider"></span><div class="menu-title">Selected object</div><button id="labs-copy-object">Copy object</button><button id="labs-paste-object">Paste object</button><button id="labs-duplicate-object">Duplicate object</button><button id="labs-move-up">Move up</button><button id="labs-move-down">Move down</button></div></div><div class="top-menu" id="structure-menu"><button class="top-action menu-label" id="structure-menu-button">Structure ▾</button><div class="top-menu-panel wide-menu" id="structure-menu-panel"></div></div><div class="top-menu" id="insert-menu"><button class="top-action menu-label" id="insert-menu-button">Insert ▾</button><div class="top-menu-panel wide-menu" id="insert-menu-panel"></div></div><div class="top-menu" id="format-menu"><button class="top-action menu-label" id="format-menu-button">Format ▾</button><div class="top-menu-panel"><div class="menu-title">Text</div><button class="format" data-format="bold"><b>B</b>&nbsp;&nbsp;Bold</button><button class="format" data-format="italic"><i>I</i>&nbsp;&nbsp;Italic</button><button class="format" data-format="underline"><u>U</u>&nbsp;&nbsp;Underline</button><button class="format" data-format="key">K&nbsp;&nbsp;Key</button><button class="format" data-format="alert">!&nbsp;&nbsp;Alert</button><span class="menu-divider"></span><div class="menu-title">Paragraph alignment</div><button class="insert" data-action="alignleft">Align left</button><button class="insert" data-action="aligncenter">Center</button><button class="insert" data-action="alignright">Align right</button><button class="insert" data-action="alignjustify">Justify / normal</button><span class="menu-divider"></span><div class="menu-title">Text color</div><div class="color-grid top-color-grid"><button class="color-swatch" data-color="black" title="black" style="background:black"></button><button class="color-swatch" data-color="gray" title="gray" style="background:gray"></button><button class="color-swatch" data-color="red" title="red" style="background:red"></button><button class="color-swatch" data-color="orange" title="orange" style="background:orange"></button><button class="color-swatch" data-color="yellow" title="yellow" style="background:yellow"></button><button class="color-swatch" data-color="green" title="green" style="background:green"></button><button class="color-swatch" data-color="blue" title="blue" style="background:blue"></button><button class="color-swatch" data-color="cyan" title="cyan" style="background:cyan"></button><button class="color-swatch" data-color="magenta" title="magenta" style="background:magenta"></button><button class="color-swatch" data-color="purple" title="purple" style="background:purple"></button><button class="color-swatch" data-color="brown" title="brown" style="background:brown"></button></div></div></div><div class="top-menu" id="references-menu"><button class="top-action menu-label" id="references-menu-button">References ▾</button><div class="top-menu-panel wide-menu" id="references-menu-panel"></div></div><div class="top-menu" id="layout-menu-top"><button class="top-action menu-label" id="layout-menu-button">Layout ▾</button><div class="top-menu-panel wide-menu" id="layout-menu-panel"></div></div><div class="top-menu" id="language-menu-top"><button class="top-action menu-label" id="language-menu-button">Language ▾</button><div class="top-menu-panel"><button id="spell-language-automatic">Automatic</button><button id="spell-language-english">English</button><button id="spell-language-spanish">Español</button><span class="menu-divider"></span><button id="spell-check-toggle">Spell checking</button></div></div><div class="top-menu beamer-only" id="beamer-menu-top"><button class="top-action menu-label" id="beamer-menu-button">Beamer ▾</button><div class="top-menu-panel"><button class="insert" data-action="frame">New frame</button><span class="menu-divider"></span><div class="menu-title">Blocks</div><button class="insert" data-action="beamerblock">Block</button><button class="insert" data-action="beameralert">Alert block</button><button class="insert" data-action="beamerexample">Example block</button><span class="menu-divider"></span><div class="menu-title">Frame text size</div><button class="frame-size-option" data-frame-size="normal">✓ Normal</button><button class="frame-size-option" data-frame-size="small">Small</button><button class="frame-size-option" data-frame-size="footnotesize">Footnotesize</button><button class="frame-size-option" data-frame-size="scriptsize">Scriptsize</button><button class="frame-size-option" data-frame-size="tiny">Tiny</button><span class="menu-divider"></span><button class="insert" data-action="frameoptions">Frame options…</button></div></div><div class="top-menu" id="view-menu"><button class="top-action menu-label" id="view-menu-button">View ▾</button><div class="top-menu-panel"><button class="document-only" id="view-continuous">✓ Continuous</button><button class="document-only" id="view-pages">Pages</button><span class="menu-divider document-only"></span><button id="toggle-nav">Index / outline</button><button id="focus-mode">Focus mode</button><span class="menu-divider"></span><div class="menu-title">Comments</div><button id="view-source-comments">Show source comments</button><button id="view-author-notes">Show author notes</button><button id="view-comment-blocks">Show commented-out blocks</button><button id="view-hidden-comments" style="display:none">Show hidden comments</button><span class="menu-divider"></span><button id="project-diagnostics">Project diagnostics</button></div></div><span class="top-separator"></span><nav class="mode-tabs"><button class="mode-tab active" data-view="visual">Visual</button><button class="mode-tab" data-view="source">Source</button><button class="mode-tab" data-view="split">Split</button><button class="mode-tab" data-view="pdf">PDF</button></nav><span class="top-spacer topbar-spacer"></span><button class="top-action primary" id="top-compile">▶ Compile</button><span class="save-status" id="save-status">Saved</span></header><div class="texflow-find" id="texflow-find" role="search"><input id="texflow-find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in document"><span class="texflow-find-count" id="texflow-find-count">0 of 0</span><button id="texflow-find-prev" type="button" title="Previous match (Shift+Enter)">↑</button><button id="texflow-find-next" type="button" title="Next match (Enter)">↓</button><button id="texflow-find-close" type="button" title="Close (Esc)">×</button></div><div class="floating-actions"><button class="floating-btn focus-exit" id="exit-focus" title="Exit focus mode">⛶</button></div><div id="app"><aside class="side"><div class="brand"><span class="brand-mark">T</span><span>Document</span></div><div id="nav"></div></aside><main class="main"><div id="content" class="empty">Loading…</div></main></div>
+<aside class="comment-inspector" id="comment-inspector" aria-hidden="true">
+  <div class="comment-inspector-head"><strong>Comments</strong><button type="button" class="comment-inspector-close" id="comment-inspector-close" title="Close">×</button></div>
+  <div class="comment-inspector-body" id="comment-inspector-body"><div class="comment-inspector-note">Select a C marker to open a comment.</div></div>
+</aside>
 <div class="math-modal-backdrop" id="math-modal" aria-hidden="true">
   <section class="math-modal" role="dialog" aria-modal="true" aria-labelledby="math-modal-title">
     <header class="math-modal-head">
@@ -3446,6 +3627,53 @@ body{display:flex;flex-direction:column}
 <script nonce="${nonce}" src="${katexJs}"></script>
 <script nonce="${nonce}">
 const vscode=acquireVsCodeApi();let frames=[],current=0,isBeamer=false,documentClass='',documentSource='',metadata={},documentSettings={},documentLayoutMode='continuous',preambleOriginalText='',preambleDirty=false,presentationStyle={aspectWidth:4,aspectHeight:3,aspectLabel:'4:3',baseFontPt:11,bodyFontPx:16,titleFontPx:24.8,lineHeight:1.28},preambles=[],currentPreamble='root-preamble',mode='frames',viewMode='visual',sources=[],projectIncludes=[],rootUri='',pdfUri='',figureResources={},bibliographyEntries=[],bibliographyResources=[],bibliographyByKey={};
+const reviewVisibility={sourceComments:localStorage.getItem('texflow-review-source-comments')==='1',authorNotes:localStorage.getItem('texflow-review-author-notes')!=='0',commentBlocks:localStorage.getItem('texflow-review-comment-blocks')!=='0'};
+const reviewHiddenItems=new Set(),reviewCollapsedItems=new Set();
+let activeCommentInspectorKey='';
+function closeCommentInspector(){
+ activeCommentInspectorKey='';
+ document.body.classList.remove('comment-inspector-open');
+ const panel=document.getElementById('comment-inspector');if(panel)panel.setAttribute('aria-hidden','true');
+ document.querySelectorAll('.comment-marker.active').forEach(x=>x.classList.remove('active'));
+}
+function commentMarkerHtml(key,nodeId,kind,title){
+ const cls=kind==='commentblock'?'comment-block':kind==='authornote'?'author-note':'source-comment';
+ return '<div class="comment-anchor" data-review-key="'+esc(key)+'" data-node-id="'+esc(nodeId||'')+'"><button type="button" class="comment-marker '+cls+'" data-review-key="'+esc(key)+'" data-node-id="'+esc(nodeId||'')+'" title="'+esc(title||'Comment')+'" aria-label="'+esc(title||'Comment')+'">C</button></div>';
+}
+function openCommentInspectorShell(key,marker,title,innerHtml){
+ activeCommentInspectorKey=String(key||'');
+ document.querySelectorAll('.comment-marker.active').forEach(x=>x.classList.remove('active'));
+ if(marker)marker.classList.add('active');
+ const panel=document.getElementById('comment-inspector'),bodyEl=document.getElementById('comment-inspector-body');
+ if(!panel||!bodyEl)return null;
+ panel.setAttribute('aria-hidden','false');document.body.classList.add('comment-inspector-open');
+ const head=panel.querySelector('.comment-inspector-head strong');if(head)head.textContent=title||'Comments';
+ bodyEl.innerHTML=innerHtml;
+ renderInlineMaths(bodyEl);
+ return bodyEl;
+}
+function inspectorHideComment(key){
+ reviewHiddenItems.add(String(key||''));reviewCollapsedItems.delete(String(key||''));updateCommentViewMenu();closeCommentInspector();renderWorkspace();texflowFindScheduleRefresh(true);
+}
+
+function reviewBlockVisible(block){if(!block)return true;if(block.kind==='comment')return block.commentNote?reviewVisibility.authorNotes:reviewVisibility.sourceComments;if(block.kind==='commentblock')return reviewVisibility.commentBlocks;return true;}
+function reviewHash(value){let h=2166136261;const s=String(value||'');for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0).toString(36);}
+function reviewItemKey(block,context){const raw=String(block&&block.raw||block&&block.text||'');return String(context||'review')+'|'+String(block&&block.kind||'review')+'|'+String(block&&Number.isFinite(Number(block.start))?Number(block.start):0)+'|'+reviewHash(raw);}
+function reviewDocumentKey(node){return reviewItemKey(node&&node.block,'doc:'+String(node&&node.start||0));}
+function reviewFrameKey(block,frameIndex){const f=frames[Number(frameIndex)]||{};return reviewItemKey(block,'frame:'+String(f.sourceUri||'')+':'+String(f.start||frameIndex));}
+function reviewItemHidden(key){return reviewHiddenItems.has(String(key||''));}
+function reviewItemCollapsed(key){return reviewCollapsedItems.has(String(key||''));}
+function updateCommentViewMenu(){
+ const source=document.getElementById('view-source-comments'),notes=document.getElementById('view-author-notes'),blocks=document.getElementById('view-comment-blocks'),hidden=document.getElementById('view-hidden-comments');
+ if(source)source.textContent=(reviewVisibility.sourceComments?'✓ ':'')+'Show source comments';
+ if(notes)notes.textContent=(reviewVisibility.authorNotes?'✓ ':'')+'Show author notes';
+ if(blocks)blocks.textContent=(reviewVisibility.commentBlocks?'✓ ':'')+'Show commented-out blocks';
+ if(hidden){hidden.textContent='Show hidden comments'+(reviewHiddenItems.size?' ('+reviewHiddenItems.size+')':'');hidden.style.display=reviewHiddenItems.size?'':'none';}
+}
+function toggleReviewVisibility(key){reviewVisibility[key]=!reviewVisibility[key];const storageKey=key==='sourceComments'?'source-comments':key==='authorNotes'?'author-notes':'comment-blocks';localStorage.setItem('texflow-review-'+storageKey,reviewVisibility[key]?'1':'0');updateCommentViewMenu();if(mode!=='preamble')renderWorkspace();texflowFindScheduleRefresh(true);}
+function restoreHiddenReviewItems(){reviewHiddenItems.clear();updateCommentViewMenu();if(mode!=='preamble')renderWorkspace();texflowFindScheduleRefresh(true);}
+function bindReviewCardControls(el,key,deleteAction){if(!el)return;const collapse=el.querySelector('.review-card-collapse'),hide=el.querySelector('.review-hide'),del=el.querySelector('.review-delete-source');const syncCollapse=()=>{const collapsed=reviewItemCollapsed(key);el.classList.toggle('review-collapsed',collapsed);if(collapse){collapse.textContent=collapsed?'+':'−';collapse.title=collapsed?'Expand':'Collapse';collapse.setAttribute('aria-label',collapse.title);}};syncCollapse();if(collapse)collapse.onclick=e=>{e.preventDefault();e.stopPropagation();if(reviewItemCollapsed(key))reviewCollapsedItems.delete(key);else reviewCollapsedItems.add(key);syncCollapse();texflowFindScheduleRefresh(true);};if(hide)hide.onclick=e=>{e.preventDefault();e.stopPropagation();reviewHiddenItems.add(key);reviewCollapsedItems.delete(key);updateCommentViewMenu();renderWorkspace();texflowFindScheduleRefresh(true);};if(del)del.onclick=e=>{e.preventDefault();e.stopPropagation();reviewHiddenItems.delete(key);reviewCollapsedItems.delete(key);if(deleteAction)deleteAction();};}
+
 window.addEventListener('error',e=>{const c=document.getElementById('content');if(c)c.innerHTML='<div class="empty">TeXFlow error: '+esc(e.message||'unknown error')+'</div>';});
 let pdfBuildState='idle',pdfBuildMessage='';
 const TEXFLOW_SPELL_HIGHLIGHT='texflow-spelling';
@@ -3461,7 +3689,7 @@ function texflowClearSpellHighlights(){if(texflowSpellState.supported&&CSS.highl
 function texflowApplySpellHighlights(blocks){if(!texflowSpellState.supported)return;texflowClearSpellHighlights();const list=[];for(const [id,items] of Object.entries(blocks||{})){texflowSpellIssuesById.set(id,items||[]);const el=document.querySelector('[data-spell-block-id="'+CSS.escape(id)+'"]');if(!el)continue;const rangeMap=el.__texflowSpellRanges||[];for(const issue of items||[]){for(const segment of rangeMap){const start=segment.start,end=segment.end;if(issue.offset>=end||issue.offset+issue.length<=start)continue;const r=document.createRange();const from=Math.max(issue.offset,start),to=Math.min(issue.offset+issue.length,end);try{r.setStart(segment.node,from-start);r.setEnd(segment.node,to-start);list.push(r);texflowSpellIssueRanges.push({blockId:id,issue,range:r,from,to});}catch{}}}}if(list.length){CSS.highlights.set(TEXFLOW_SPELL_HIGHLIGHT,new Highlight(...list));}}
 function texflowUpdateLanguageMenu(){const a=document.getElementById('spell-language-automatic'),b=document.getElementById('spell-language-english'),c=document.getElementById('spell-language-spanish'),t=document.getElementById('spell-check-toggle');if(a)a.textContent=(texflowSpellState.language==='auto'?'✓ ':'')+'Automatic';if(b)b.textContent=(texflowSpellState.language==='en'?'✓ ':'')+'English';if(c)c.textContent=(texflowSpellState.language==='es'?'✓ ':'')+'Español';if(t)t.textContent='Spell checking '+(texflowSpellState.enabled?'on':'off');}
 function texflowResolveSpellLanguage(){const docLang=String(documentSettings&&documentSettings.language||'').toLowerCase().replace(/_/g,'-');if(texflowSpellState.language==='en'||texflowSpellState.language==='es')return texflowSpellState.language;if(/^(spanish|es|es-es|es-mx|es-ar|es-cl|es-co|es-pe|es-419)$/.test(docLang))return'es';if(/^(english|american|british|en|en-us|en-gb|en-au|en-ca|en-nz)$/.test(docLang))return'en';return'en';}
-function texflowCollectSpellBlocks(){const editors=[...document.querySelectorAll('[contenteditable="true"]')].filter(el=>!el.closest('.math-code,.structured-source,.tex-footnote,.tex-link,.tex-reference,.bib-citation,.tex-index,.tex-nomenclature,.tex-field,.tex-hspace,.doc-table-cell[contenteditable="true"] textarea, input, textarea'));return editors.map((el,i)=>{const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,{acceptNode(node){const p=node.parentElement;if(!p)return NodeFilter.FILTER_REJECT;if(p.closest('[contenteditable="false"],.math-caret-anchor,.display-math,.inline-math,.tex-footnote,.tex-link,.tex-reference,.bib-citation,.tex-index,.tex-nomenclature,.tex-field,.tex-hspace,.texflow-label-badge'))return NodeFilter.FILTER_REJECT;return node.nodeValue&&node.nodeValue.trim()?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_REJECT;}});const segments=[];let text='';let n;while((n=walker.nextNode())){const start=text.length;const value=n.nodeValue||'';text+=value;segments.push({node:n,start,end:text.length});}el.__texflowSpellRanges=segments;const id=el.dataset.spellBlockId||el.dataset.nodeId||('block-'+i);el.dataset.spellBlockId=id;return{id,text};}).filter(block=>block.text.trim().length);}
+function texflowCollectSpellBlocks(){const editors=[...document.querySelectorAll('[contenteditable="true"]')].filter(el=>!el.closest('.math-code,.structured-source,.tex-footnote,.tex-link,.tex-reference,.bib-citation,.tex-index,.tex-nomenclature,.tex-field,.tex-hspace,.doc-table-cell[contenteditable="true"] textarea, input, textarea'));return editors.map((el,i)=>{const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,{acceptNode(node){const p=node.parentElement;if(!p)return NodeFilter.FILTER_REJECT;if(p.closest('[contenteditable="false"],.math-caret-anchor,.display-math,.inline-math,.tex-footnote,.tex-link,.tex-reference,.bib-citation,.tex-index,.tex-nomenclature,.tex-field,.tex-hspace,.texflow-label-badge,.commented-source'))return NodeFilter.FILTER_REJECT;return node.nodeValue&&node.nodeValue.trim()?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_REJECT;}});const segments=[];let text='';let n;while((n=walker.nextNode())){const start=text.length;const value=n.nodeValue||'';text+=value;segments.push({node:n,start,end:text.length});}el.__texflowSpellRanges=segments;const id=el.dataset.spellBlockId||el.dataset.nodeId||('block-'+i);el.dataset.spellBlockId=id;return{id,text};}).filter(block=>block.text.trim().length);}
 function texflowRequestSpellcheck(){if(!texflowSpellState.enabled){texflowClearSpellHighlights();return;}if(!texflowSpellState.supported){texflowClearSpellHighlights();return;}const blocks=texflowCollectSpellBlocks();const requestId=String(++texflowSpellState.requestSeq);texflowSpellState.pendingRequestId=requestId;vscode.postMessage({type:'spellcheckRequest',requestId,language:texflowResolveSpellLanguage(),blocks});}
 function texflowScheduleSpellcheck(){if(texflowSpellState.requestTimer)clearTimeout(texflowSpellState.requestTimer);texflowSpellState.requestTimer=setTimeout(texflowRequestSpellcheck,500);}
 function texflowIssueAtPoint(x,y){for(let i=texflowSpellIssueRanges.length-1;i>=0;i--){const item=texflowSpellIssueRanges[i];for(const rect of item.range.getClientRects()){if(x>=rect.left&&x<=rect.right&&y>=rect.top&&y<=rect.bottom)return item;}}return null;}
@@ -3475,7 +3703,7 @@ const texflowFindState={open:false,query:'',index:-1,matches:[],visibleMatches:[
 function texflowFindClearHighlights(){if(texflowFindState.supported&&CSS.highlights){CSS.highlights.delete(TEXFLOW_FIND_MATCH_HIGHLIGHT);CSS.highlights.delete(TEXFLOW_FIND_CURRENT_HIGHLIGHT);}texflowFindState.visibleMatches=[];}
 function texflowFindCountOccurrences(text,query){const hay=String(text||'').toLowerCase(),needle=String(query||'').toLowerCase();if(!needle)return 0;let count=0,from=0;while(from<=hay.length-needle.length){const at=hay.indexOf(needle,from);if(at<0)break;count++;from=at+Math.max(1,needle.length);}return count;}
 function texflowFindPlainLatex(value){const holder=document.createElement('div');holder.innerHTML=latexToHtml(String(value||''));return holder.textContent||'';}
-function texflowFindFrameText(frame){if(!frame)return'';if(/\\(?:titlepage|maketitle)\b/.test(String(frame.body||'')))return[metadata.title,metadata.subtitle,metadata.author,metadata.institute,metadata.date].map(texflowFindPlainLatex).join('\n');const parts=[frame.title||''];for(const b of parseBlocks(String(frame.body||''))){if(b.hidden)continue;if(b.kind==='paragraph')parts.push(b.text||'');else if(b.kind==='block')parts.push(b.title||'',b.text||'');else if(b.kind==='comment')parts.push(b.commentText||b.text||'');else if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem')parts.push(b.text||'');else if(b.kind==='raw')parts.push(b.raw||b.text||'');else if(b.kind==='itemize')for(const item of b.items||[])parts.push(typeof item==='string'?item:(item&&item.text)||'');else if(b.kind==='columns')for(const text of b.columnTexts||[])parts.push(text||'');else if(b.kind==='table')for(const row of b.tableRows||[])for(const cell of row||[])parts.push(cell||'');else if(b.kind==='figure'&&b.figureCaption)parts.push(b.figureCaption);}return parts.map(texflowFindPlainLatex).join('\n');}
+function texflowFindFrameText(frame){if(!frame)return'';if(/\\(?:titlepage|maketitle)\b/.test(String(frame.body||'')))return[metadata.title,metadata.subtitle,metadata.author,metadata.institute,metadata.date].map(texflowFindPlainLatex).join('\n');const parts=[frame.title||''],frameIndex=Math.max(0,frames.indexOf(frame));for(const b of parseBlocks(String(frame.body||''))){if(b.hidden)continue;if(b.kind==='paragraph')parts.push(b.text||'');else if(b.kind==='block')parts.push(b.title||'',b.text||'');else if(b.kind==='comment'){if(reviewBlockVisible(b)&&!reviewItemHidden(reviewFrameKey(b,frameIndex)))parts.push(b.commentText||b.text||'');}else if(b.kind==='commentblock'){if(reviewBlockVisible(b)&&!reviewItemHidden(reviewFrameKey(b,frameIndex)))parts.push(b.text||'');}else if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem')parts.push(b.text||'');else if(b.kind==='raw')parts.push(b.raw||b.text||'');else if(b.kind==='itemize')for(const item of b.items||[])parts.push(typeof item==='string'?item:(item&&item.text)||'');else if(b.kind==='columns')for(const text of b.columnTexts||[])parts.push(text||'');else if(b.kind==='table')for(const row of b.tableRows||[])for(const cell of row||[])parts.push(cell||'');else if(b.kind==='figure'&&b.figureCaption)parts.push(b.figureCaption);}return parts.map(texflowFindPlainLatex).join('\n');}
 function texflowFindBuildBeamerMatches(query){const matches=[];frames.forEach((frame,frameIndex)=>{const count=texflowFindCountOccurrences(texflowFindFrameText(frame),query);for(let ordinal=0;ordinal<count;ordinal++)matches.push({frameIndex,ordinal});});return matches;}
 function texflowFindVisibleRoot(){const content=document.getElementById('content');if(!content)return null;if(isBeamer)return content.querySelector('.visual-pane .slide')||content.querySelector('.slide');return content.querySelector('.visual-pane .document-pages')||content.querySelector('.visual-pane .document-continuous')||content.querySelector('.document-pages')||content.querySelector('.document-continuous');}
 function texflowFindSearchElements(root){if(!root)return[];const selector='[contenteditable="true"],.doc-title h1,.doc-title>div,.doc-include-path,.doc-raw pre,.raw pre,.figure-caption,.bib-entry,.cite-empty,.doc-toc-row,.title:not([contenteditable="true"]),.title-page .blocks-host>div';const all=[...root.querySelectorAll(selector)];const unique=[];const seen=new Set();for(const el of all){if(seen.has(el))continue;seen.add(el);unique.push(el);}return unique.filter((el,i,list)=>!list.some((other,j)=>i!==j&&other.contains(el)));}
@@ -3799,7 +4027,7 @@ function makeThumb(f,i){
  card.onclick=()=>renderFrame(i);return card;
 }
 function collapsibleGroup(label,cls,key){
- const group=document.createElement('div');group.className=cls;const title=document.createElement('div');title.className=cls==='nav-group'?'nav-group-title':'nav-subgroup-title';const store='texflow-collapse-'+key;const collapsed=localStorage.getItem(store)==='1';if(collapsed)group.classList.add('collapsed');title.innerHTML='<span class="chev">'+(collapsed?'▸':'▾')+'</span><span>'+esc(label)+'</span>';title.onclick=()=>{group.classList.toggle('collapsed');const c=group.classList.contains('collapsed');title.querySelector('.chev').textContent=c?'▸':'▾';localStorage.setItem(store,c?'1':'0')};const body=document.createElement('div');body.className=cls==='nav-group'?'nav-group-body':'nav-subgroup-body';group.append(title,body);return{group,body};
+ const group=document.createElement('div');group.className=cls;const title=document.createElement('div');title.className=cls==='nav-group'?'nav-group-title':'nav-subgroup-title';const store='texflow-collapse-'+key;const collapsed=localStorage.getItem(store)==='1';if(collapsed)group.classList.add('collapsed');title.innerHTML='<span class="chev">'+(collapsed?'+':'−')+'</span><span>'+esc(label)+'</span>';title.onclick=()=>{group.classList.toggle('collapsed');const c=group.classList.contains('collapsed');title.querySelector('.chev').textContent=c?'▸':'▾';localStorage.setItem(store,c?'1':'0')};const body=document.createElement('div');body.className=cls==='nav-group'?'nav-group-body':'nav-subgroup-body';group.append(title,body);return{group,body};
 }
 function renderNav(){
  const nav=document.getElementById('nav');nav.innerHTML='';
@@ -3837,7 +4065,7 @@ function parseDocumentChunk(raw,base,out,nextId){
     out.push(node);
    });
   }
-  while((m=display.exec(source))&&m.index<b){if(display.lastIndex>b)break;pushPlain(cur,m.index);const rawEq=m[0];out.push({kind:'block',id:'doc-b'+nextId(),start:base+m.index,end:base+display.lastIndex,raw:rawEq,block:{id:'doc-eq',kind:'equation',raw:rawEq,env:'display',text:String(m[1]||'').trim(),align:'center'}});cur=display.lastIndex;}
+  while((m=display.exec(source))&&m.index<b){if(display.lastIndex>b)break;if(documentTokenIsCommented(source,m.index))continue;pushPlain(cur,m.index);const rawEq=m[0];out.push({kind:'block',id:'doc-b'+nextId(),start:base+m.index,end:base+display.lastIndex,raw:rawEq,block:{id:'doc-eq',kind:'equation',raw:rawEq,env:'display',text:String(m[1]||'').trim(),align:'center'}});cur=display.lastIndex;}
   pushPlain(cur,b);
  }
  let cur=0,m;const title=/\\maketitle\b/g;
@@ -3845,15 +4073,25 @@ function parseDocumentChunk(raw,base,out,nextId){
  parseSegment(cur,source.length);
 }
 function documentTokenIsCommented(source,pos){
- const lineStart=Math.max(source.lastIndexOf('\n',Math.max(0,pos-1))+1,0);
- const prefix=source.slice(lineStart,pos);let escaped=false;
- for(let i=0;i<prefix.length;i++){
-  if(prefix[i]==='\\'){escaped=!escaped;continue;}
-  if(prefix[i]==='%'&&!escaped)return true;
-  escaped=false;
- }
- return false;
+ const lineCommented=at=>{
+  const lineStart=Math.max(source.lastIndexOf('\n',Math.max(0,at-1))+1,0);
+  const prefix=source.slice(lineStart,at);let escaped=false;
+  for(let i=0;i<prefix.length;i++){
+   if(prefix[i]==='\\'){escaped=!escaped;continue;}
+   if(prefix[i]==='%'&&!escaped)return true;
+   escaped=false;
+  }
+  return false;
+ };
+ if(lineCommented(pos))return true;
+ // The comment package environment is also non-active source. Ignore any
+ // structural token that falls inside a \begin{comment} ... \end{comment} range.
+ // begin/end strings that themselves occur in % comments do not change depth.
+ const token=/\\(begin|end)\{comment\}/g;let depth=0,m;
+ while((m=token.exec(source))&&m.index<pos){if(lineCommented(m.index))continue;if(m[1]==='begin')depth++;else depth=Math.max(0,depth-1);}
+ return depth>0;
 }
+
 function parseDocumentFlow(){
  const info=documentBodyInfo(),body=info.source,out=[];let cur=0,n=0;const nextId=()=>n++;
  // Structural tokens are parsed in document order. Matter switches are preserved in Source
@@ -3914,6 +4152,7 @@ function parseDocumentFlow(){
  out.forEach(x=>{documentFlowById[x.id]=x;if(x.kind==='block'&&x.block&&x.block.kind==='equation'){const b=x.block;if(/^equation/.test(String(b.env||''))){equationNumber+=1;b.eqNumber=equationNumber;}}});
  const labelRe=/\\label\{([^}]+)\}/g;let lm;
  while((lm=labelRe.exec(body))){
+  if(documentTokenIsCommented(body,lm.index))continue;
   const key=String(lm[1]||'').trim(),abs=info.start+lm.index;if(!key)continue;let target=null;
   for(const node of out){if(Number(node.start)<=abs&&abs<Number(node.end)){if(node.kind==='block'&&node.block&&['equation','figure','table'].includes(node.block.kind))target=node;break;}}
   if(!target){for(let i=out.length-1;i>=0;i--){const node=out[i],eligible=node.kind==='heading'||(node.kind==='block'&&node.block&&['equation','figure','table'].includes(node.block.kind));if(!eligible||Number(node.end)>abs)continue;const between=documentSource.slice(Number(node.end),abs);if(/^\s*$/.test(between))target=node;break;}}
@@ -4046,6 +4285,93 @@ function documentIncludeHtml(node){
  const action=!missing&&node.targetUri?'<button class="doc-include-open" data-uri="'+esc(node.targetUri)+'" data-target="'+esc(displayTarget)+'">Open source</button>':'';
  return '<div class="doc-include'+(missing?' missing':'')+'" data-node-id="'+node.id+'"><div class="doc-include-main"><div class="doc-include-kind">'+(missing?'Missing included file':'Included file')+'</div><div class="doc-include-path">'+esc(displayTarget||target)+'</div><div class="doc-include-meta">\\'+esc(command)+' · source preserved</div></div>'+action+'</div>';
 }
+function findMatchingEnvEnd(source,env,from){
+ // Shared webview helper used by commented-block previews and the block parser.
+ // Literal scanning avoids escaping issues and supports nested copies of the same environment.
+ const open='\\begin{'+String(env)+'}';
+ const close='\\end{'+String(env)+'}';
+ let depth=1,pos=from;
+ while(pos<source.length){
+  const nextOpen=source.indexOf(open,pos);
+  const nextClose=source.indexOf(close,pos);
+  if(nextClose<0)return null;
+  if(nextOpen>=0&&nextOpen<nextClose){depth+=1;pos=nextOpen+open.length;continue;}
+  depth-=1;
+  if(depth===0)return{start:nextClose,end:nextClose+close.length};
+  pos=nextClose+close.length;
+ }
+ return null;
+}
+function commentedBlockPreviewHtml(text){
+ const source=String(text||'').replace(/\r\n?/g,'\n');
+ function paragraphHtml(raw){
+  return String(raw||'').split(/\n\s*\n+/).map(part=>part.trim()).filter(Boolean).map(part=>{
+   if(part.split('\n').every(line=>/^\s*%/.test(line)))return '<div class="commented-preview-paragraph" style="color:var(--muted)">'+esc(part.replace(/^\s*%\s?/gm,''))+'</div>';
+   return '<div class="commented-preview-paragraph">'+latexToHtml(part.replace(/\n+/g,' '))+'</div>';
+  }).join('');
+ }
+ function plainHtml(raw){
+  const chunk=String(raw||'');let html='',cur=0,m;
+  const token=/\\(chapter|section|subsection|subsubsection|paragraph)\*?\{([^}]*)\}|\\(input|include)\s*\{([^}]+)\}/g;
+  while((m=token.exec(chunk))){html+=paragraphHtml(chunk.slice(cur,m.index));if(m[1])html+='<div class="commented-preview-heading level-'+esc(m[1])+'">'+latexToHtml(m[2]||'')+'</div>';else{const target=String(m[4]||'').trim(),display=target+(target&&!/\.[A-Za-z0-9]+$/.test(target)?'.tex':'');html+='<div class="commented-preview-include"><span class="commented-preview-include-kind">'+esc(String(m[3]||'input'))+' · commented out</span><code>'+esc(display||target)+'</code></div>';}cur=token.lastIndex;}
+  html+=paragraphHtml(chunk.slice(cur));return html;
+ }
+ function listHtml(inner,ordered){
+  const parts=String(inner||'').split(/\\item(?:<[^>]*>)?(?:\[[^\]]*\])?/).slice(1).map(x=>x.trim()).filter(Boolean);
+  if(!parts.length)return plainHtml(inner);
+  const tag=ordered?'ol':'ul';return '<'+tag+' class="commented-preview-list">'+parts.map(item=>'<li>'+latexToHtml(item.replace(/\n+/g,' '))+'</li>').join('')+'</'+tag+'>';
+ }
+ let html='',cur=0,m;const env=/\\begin\{(equation\*?|align\*?|gather\*?|multline\*?|itemize|enumerate|quote|quotation)\}/g;
+ while((m=env.exec(source))){const match=findMatchingEnvEnd(source,m[1],env.lastIndex);if(!match)break;html+=plainHtml(source.slice(cur,m.index));const inner=source.slice(env.lastIndex,match.start).trim(),name=String(m[1]||'');if(/^(?:equation|align|gather|multline)/.test(name)){let math=inner.replace(/\\label\{[^}]+\}/g,'').replace(/\\(?:notag|nonumber)\b/g,'').trim();if(/^align/.test(name))math='\\begin{aligned}'+math+'\\end{aligned}';html+='<div class="display-math commented-preview-math" contenteditable="false" data-math="'+encodeURIComponent(math)+'"></div>';}else if(name==='itemize'||name==='enumerate')html+=listHtml(inner,name==='enumerate');else html+='<div class="commented-preview-quote">'+plainHtml(inner)+'</div>';cur=match.end;env.lastIndex=match.end;}
+ html+=plainHtml(source.slice(cur));return html||'<div class="commented-preview-paragraph" style="color:var(--muted)">Empty commented-out block</div>';
+}
+
+function openDocumentCommentInspector(node,marker){
+ if(!node||!node.block)return;const b=node.block,key=reviewDocumentKey(node),isBlock=b.kind==='commentblock',title=isBlock?'Commented-out block':(b.commentNote?'Author note':'Source comment');
+ let html='<div class="comment-inspector-card"><div class="comment-inspector-label">'+esc(title)+' · not in PDF</div>';
+ if(isBlock){
+  html+='<div class="comment-inspector-preview">'+commentedBlockPreviewHtml(b.text||'')+'</div>';
+  html+='<textarea class="comment-inspector-editor comment-inspector-source" spellcheck="false" style="display:none">'+esc(b.text||'')+'</textarea>';
+ }else{
+  html+='<textarea class="comment-inspector-editor">'+esc(b.commentText||b.text||'')+'</textarea>';
+ }
+ html+='<div class="comment-inspector-actions">'+(isBlock?'<button type="button" class="comment-inspector-edit-source">Edit source</button>':'')+'<button type="button" class="comment-inspector-hide">Hide marker</button><button type="button" class="comment-inspector-delete danger">Delete source</button></div><div class="comment-inspector-note">This comment is stored in the LaTeX source and does not appear in the PDF.</div></div>';
+ const host=openCommentInspectorShell(key,marker,title,html);if(!host)return;
+ const edit=host.querySelector('.comment-inspector-editor');
+ if(edit){
+  let last=String(edit.value||'');
+  const save=()=>{const now=String(edit.value||'');if(now===last)return;last=now;updateDocumentNode(node,serializeRichDocumentBlock(node,now),false);};
+  edit.addEventListener('input',()=>{const old=saveTimers.get(edit);if(old)clearTimeout(old);saveTimers.set(edit,setTimeout(save,420));});
+  edit.addEventListener('blur',save);
+ }
+ const toggle=host.querySelector('.comment-inspector-edit-source'),preview=host.querySelector('.comment-inspector-preview');
+ if(toggle&&edit&&preview)toggle.onclick=()=>{const editing=edit.style.display!=='none';if(editing){edit.dispatchEvent(new Event('blur'));edit.style.display='none';preview.style.display='';preview.innerHTML=commentedBlockPreviewHtml(edit.value||'');renderInlineMaths(preview);toggle.textContent='Edit source';}else{preview.style.display='none';edit.style.display='block';toggle.textContent='Done';edit.focus();}};
+ const hide=host.querySelector('.comment-inspector-hide');if(hide)hide.onclick=()=>inspectorHideComment(key);
+ const del=host.querySelector('.comment-inspector-delete');if(del)del.onclick=()=>{reviewHiddenItems.delete(key);closeCommentInspector();vscode.postMessage({type:'deleteReviewDocumentNode',start:Number(node.start),end:Number(node.end),expected:String(node.raw||'')});};
+}
+function openFrameCommentInspector(block,frameIndex,marker){
+ if(!block)return;const key=reviewFrameKey(block,frameIndex),isBlock=block.kind==='commentblock',title=isBlock?'Commented-out block':(block.commentNote?'Author note':'Source comment');
+ let html='<div class="comment-inspector-card"><div class="comment-inspector-label">'+esc(title)+' · not in PDF</div>';
+ if(isBlock){
+  html+='<div class="comment-inspector-preview">'+commentedBlockPreviewHtml(block.text||'')+'</div>';
+  html+='<textarea class="comment-inspector-editor comment-inspector-source" spellcheck="false" style="display:none">'+esc(block.text||'')+'</textarea>';
+ }else{
+  html+='<textarea class="comment-inspector-editor">'+esc(block.commentText||block.text||'')+'</textarea>';
+ }
+ html+='<div class="comment-inspector-actions">'+(isBlock?'<button type="button" class="comment-inspector-edit-source">Edit source</button>':'')+'<button type="button" class="comment-inspector-hide">Hide marker</button><button type="button" class="comment-inspector-delete danger">Delete source</button></div><div class="comment-inspector-note">This comment is stored in the LaTeX source and does not appear in the PDF.</div></div>';
+ const host=openCommentInspectorShell(key,marker,title,html);if(!host)return;
+ const edit=host.querySelector('.comment-inspector-editor');
+ if(edit){
+  let last=String(edit.value||'');
+  const save=()=>{const now=String(edit.value||'');if(now===last)return;last=now;vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload:{text:now},refresh:false});};
+  edit.addEventListener('input',()=>{const old=saveTimers.get(edit);if(old)clearTimeout(old);saveTimers.set(edit,setTimeout(save,420));});
+  edit.addEventListener('blur',save);
+ }
+ const toggle=host.querySelector('.comment-inspector-edit-source'),preview=host.querySelector('.comment-inspector-preview');
+ if(toggle&&edit&&preview)toggle.onclick=()=>{const editing=edit.style.display!=='none';if(editing){edit.dispatchEvent(new Event('blur'));edit.style.display='none';preview.style.display='';preview.innerHTML=commentedBlockPreviewHtml(edit.value||'');renderInlineMaths(preview);toggle.textContent='Edit source';}else{preview.style.display='none';edit.style.display='block';toggle.textContent='Done';edit.focus();}};
+ const hide=host.querySelector('.comment-inspector-hide');if(hide)hide.onclick=()=>inspectorHideComment(key);
+ const del=host.querySelector('.comment-inspector-delete');if(del)del.onclick=()=>{reviewHiddenItems.delete(key);closeCommentInspector();vscode.postMessage({type:'deleteReviewBlock',frameIndex,blockId:block.id});};
+}
 function documentBlockHtml(node){
  const b=node.block;
  if(b.kind==='paragraph')return '<div class="doc-paragraph doc-editable '+alignClass(b.align,'justify')+'" data-node-id="'+node.id+'"'+(node.synthetic?' data-synthetic="true" data-placeholder="Start typing…"':'')+' contenteditable="true">'+latexToHtml(b.text||'')+'</div>';
@@ -4056,7 +4382,8 @@ function documentBlockHtml(node){
  if(b.kind==='columns'){const texts=b.columnTexts||[b.text||''],count=Math.max(2,Math.min(4,Number(b.columnCount)||texts.length||2));if(b.env==='multicols')return '<div class="doc-columns-flow semantic-block" data-node-id="'+node.id+'"><div class="columns-head"><span class="tag">'+count+' columns · flowing text</span></div><div class="doc-column-flow doc-editable" contenteditable="true" style="column-count:'+count+'">'+latexToHtml(texts[0]||'')+'</div></div>';return '<div class="doc-columns semantic-block" data-node-id="'+node.id+'" style="grid-template-columns:repeat('+count+',minmax(0,1fr))">'+Array.from({length:count},(_,i)=>'<div class="doc-column doc-editable" contenteditable="true" data-col="'+i+'">'+latexToHtml(texts[i]||'')+'</div>').join('')+'</div>'; }
  if(b.kind==='vspace')return '<div class="doc-vspace semantic-block" data-node-id="'+node.id+'"><span class="vspace-label">vertical '+esc((b.spaceStarred?'* ':'')+(b.spaceAmount||''))+'</span></div>';
  if(b.kind==='break')return '<div class="doc-break semantic-block" data-node-id="'+node.id+'">'+esc(b.breakCommand||'newpage')+'</div>';
- if(b.kind==='comment')return '<div class="doc-rich-block semantic-block comment" data-node-id="'+node.id+'"><div class="doc-rich-label">'+(b.commentNote?'Author note':'Source comment')+' · not in PDF</div><div class="doc-rich-edit doc-editable" contenteditable="true">'+esc(b.commentText||b.text||'')+'</div></div>';
+ if(b.kind==='comment'){const reviewKey=reviewDocumentKey(node);if(!reviewBlockVisible(b)||reviewItemHidden(reviewKey))return '';return commentMarkerHtml(reviewKey,node.id,b.commentNote?'authornote':'comment',b.commentNote?'Author note':'Source comment');}
+ if(b.kind==='commentblock'){const reviewKey=reviewDocumentKey(node);if(!reviewBlockVisible(b)||reviewItemHidden(reviewKey))return '';return commentMarkerHtml(reviewKey,node.id,'commentblock','Commented-out block');}
  if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem'){const cls=b.kind==='quote'?'quote':b.kind==='theorem'?'theorem':'container',label=b.kind==='theorem'?(b.env||'theorem'):(b.kind==='container'?'minipage':(b.env||'quote'));return '<div class="doc-rich-block semantic-block '+cls+'" data-node-id="'+node.id+'"><div class="doc-rich-label">'+esc(label)+'</div><div class="doc-rich-edit doc-editable" contenteditable="true">'+latexToHtml(b.text||'')+'</div></div>';}
  return '<div class="doc-raw" data-node-id="'+node.id+'"><span>LaTeX preserved</span><pre>'+esc(b.raw||'')+'</pre></div>';
 }
@@ -4088,7 +4415,7 @@ function documentTocHtml(flow){
  }).join('');
  return '<section class="doc-toc"><h2>Contents</h2>'+rows+'<div class="doc-toc-note">Page numbers are shown in the compiled PDF.</div></section>';
 }
-function isAtomicDocumentBlockNode(x){return !!(x&&x.kind==='block'&&x.block&&['equation','figure','table','vspace','columns','quote','container','break','theorem','comment'].includes(x.block.kind));}
+function isAtomicDocumentBlockNode(x){if(!(x&&x.kind==='block'&&x.block))return false;if((x.block.kind==='comment'||x.block.kind==='commentblock')&&!reviewBlockVisible(x.block))return false;return ['equation','figure','table','vspace','columns','quote','container','break','theorem','comment','commentblock'].includes(x.block.kind);}
 function documentAfterBlockSlotHtml(node){return '<div class="doc-after-block-slot" data-after-node-id="'+node.id+'" tabindex="0" aria-label="Start a paragraph after this object"></div>'; }
 function documentFlowInnerHtml(){
  const flow=parseDocumentFlow();let html='';
@@ -4193,7 +4520,8 @@ function bindDocumentParagraph(el,node){
  attachEditor(el);
  const state=el.__texflowState={lastSentLatex:editableLatex(el)};
  const save=refresh=>{const now=editableLatex(el);if(now===state.lastSentLatex)return;state.lastSentLatex=now;updateDocumentNode(node,paragraphSource(node,now),refresh);};
- el.__texflowCommit=text=>{setEditableLatex(el,text);state.lastSentLatex=editableLatex(el);updateDocumentNode(node,paragraphSource(node,text),true);};
+ el.__texflowCommit=(text,feature='')=>{setEditableLatex(el,text);state.lastSentLatex=editableLatex(el);updateDocumentNode(node,paragraphSource(node,text),true,feature);};
+ el.__texflowCommentOutSupported=true;
  el.__texflowSaveNow=()=>save(false);
  el.addEventListener('keydown',e=>{
   if(e.key==='Backspace'&&paragraphCaretBoundary(el,'start')){const prev=adjacentParagraphElement(el,-1);if(prev){e.preventDefault();if(node.synthetic&&!editableLatex(el).trim()){delete documentFlowById[el.dataset.nodeId];el.remove();placeCaretEnd(prev);}else mergeDocumentParagraphs(prev,el);return;}}
@@ -4232,10 +4560,11 @@ function serializeRichDocumentBlock(node,text){
  if(b.kind==='quote'){const env=b.env==='quotation'?'quotation':'quote';return '\\begin{'+env+'}\n'+body+'\n\\end{'+env+'}';}
  if(b.kind==='container')return '\\begin{minipage}{0.9\\linewidth}\n'+body+'\n\\end{minipage}';
  if(b.kind==='theorem'){const env=b.env||'theorem';return '\\begin{'+env+'}\n'+body+'\n\\end{'+env+'}';}
- if(b.kind==='comment')return (b.commentNote?'% TeXFlow note: ':'% ')+body.replace(/\r?\n/g,' ');
+ if(b.kind==='comment'){const lines=String(text||'').replace(/\r\n?/g,'\n').split('\n').map(line=>line.replace(/^%\s?/,''));return lines.map((line,i)=>(b.commentNote&&i===0?'% TeXFlow note: ':'% ')+line).join('\n');}
+ if(b.kind==='commentblock')return '\\begin{comment}\n'+String(text||'').replace(/\r\n?/g,'\n')+'\n\\end{comment}';
  return node.raw||'';
 }
-function bindDocumentRichBlock(el,node){const edit=el.querySelector('.doc-rich-edit');if(edit){attachEditor(edit);const save=refresh=>updateDocumentNode(node,serializeRichDocumentBlock(node,editableLatex(edit)),refresh);edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));}
+function bindDocumentRichBlock(el,node){const edit=el.querySelector('.doc-rich-edit');let saveEdit=null;if(edit){attachEditor(edit);const save=refresh=>updateDocumentNode(node,serializeRichDocumentBlock(node,editableLatex(edit)),refresh);saveEdit=save;edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}if(node&&node.block&&(node.block.kind==='comment'||node.block.kind==='commentblock')){const key=reviewDocumentKey(node);if(node.block.kind==='commentblock'){const toggle=el.querySelector('.review-edit-source');if(toggle&&edit)toggle.onclick=e=>{e.preventDefault();e.stopPropagation();const editing=el.classList.contains('review-editing');if(editing){if(saveEdit)flushSave(edit,saveEdit);el.classList.remove('review-editing');toggle.textContent='Edit source';toggle.title='Edit the preserved LaTeX inside this commented-out block';}else{reviewCollapsedItems.delete(key);el.classList.remove('review-collapsed');const collapse=el.querySelector('.review-card-collapse');if(collapse){collapse.textContent='−';collapse.title='Collapse';}el.classList.add('review-editing');toggle.textContent='Done';toggle.title='Return to visual preview';edit.focus();}};}bindReviewCardControls(el,key,()=>vscode.postMessage({type:'deleteReviewDocumentNode',start:Number(node.start),end:Number(node.end),expected:String(node.raw||'')}));return;}bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));}
 
 function bindVisualDocument(host){
  const flow=parseDocumentFlow();const byId={};flow.forEach(x=>byId[x.id]=x);
@@ -4251,7 +4580,7 @@ function bindVisualDocument(host){
  host.querySelectorAll('.doc-columns[data-node-id],.doc-columns-flow[data-node-id]').forEach(el=>bindDocumentColumns(el,byId[el.dataset.nodeId]));
  host.querySelectorAll('.doc-vspace[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));});
  host.querySelectorAll('.doc-break[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));});
- host.querySelectorAll('.doc-rich-block[data-node-id]').forEach(el=>bindDocumentRichBlock(el,byId[el.dataset.nodeId]));
+ host.querySelectorAll('.doc-rich-block[data-node-id]').forEach(el=>bindDocumentRichBlock(el,byId[el.dataset.nodeId]));host.querySelectorAll('.comment-marker[data-node-id]').forEach(marker=>{const node=byId[marker.dataset.nodeId];if(node)marker.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();openDocumentCommentInspector(node,marker);});});
  host.querySelectorAll('.doc-after-block-slot[data-after-node-id]').forEach(slot=>{
   const node=byId[slot.dataset.afterNodeId];if(!node)return;
   const activate=initialText=>{const ref=host.querySelector('[data-node-id="'+node.id+'"]');if(!ref)return;const p=createSyntheticParagraphAfter(ref,node,initialText||'');slot.remove();return p;};
@@ -4307,24 +4636,7 @@ function tableData(raw){
 }
 
 function parseBlocks(body){
- function findMatchingEnvEnd(source,env,from){
-  // Use literal scanning instead of a dynamically-built RegExp. This avoids
-  // webview escaping bugs and correctly handles nested copies of the same env.
-  const open='\\begin{'+String(env)+'}';
-  const close='\\end{'+String(env)+'}';
-  let depth=1,pos=from;
-  while(pos<source.length){
-   const nextOpen=source.indexOf(open,pos);
-   const nextClose=source.indexOf(close,pos);
-   if(nextClose<0)return null;
-   if(nextOpen>=0&&nextOpen<nextClose){depth+=1;pos=nextOpen+open.length;continue;}
-   depth-=1;
-   if(depth===0)return{start:nextClose,end:nextClose+close.length};
-   pos=nextClose+close.length;
-  }
-  return null;
- }
- const out=[];const re=/\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;let cur=0,m,n=0,currentAlign='justify';
+ const out=[];const re=/\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|comment)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;let cur=0,m,n=0,currentAlign='justify';
  function text(s,e){
   const raw=body.slice(s,e);if(!raw.trim())return;
   if(s===0){const size=/^((?:(?:[ \t\r\n]+)|(?:[ \t]*%[^\n]*(?:\r?\n|$)))*)\\(?:normalsize|small|footnotesize|scriptsize|tiny)\b[ \t]*(?:%[^\n]*)?(?:\r?\n)?/.exec(raw);if(size){const prefix=String(size[1]||''),commandStart=s+prefix.length,commandEnd=s+size[0].length;if(prefix)text(s,commandStart);out.push({id:'b'+n++,kind:'raw',start:commandStart,end:commandEnd,raw:body.slice(commandStart,commandEnd),text:body.slice(commandStart,commandEnd).trim(),hidden:true,align:currentAlign});if(commandEnd<e)text(commandEnd,e);return;}}
@@ -4337,6 +4649,7 @@ function parseBlocks(body){
    if(commandEnd<e)text(commandEnd,e);
    return;
   }
+  const standaloneComment=/(^|\r?\n)([ \t]*%[^\r\n]*)/.exec(raw);if(standaloneComment){const prefixLength=String(standaloneComment[1]||'').length,commentStart=(standaloneComment.index||0)+prefixLength;let commentEnd=commentStart+String(standaloneComment[2]||'').length;while(commentEnd<raw.length){const next=/^(\r?\n)([ \t]*%[^\r\n]*)/.exec(raw.slice(commentEnd));if(!next)break;commentEnd+=next[0].length;}if(commentStart>0)text(s,s+commentStart);const clean=raw.slice(commentStart,commentEnd),commentNote=/^\s*%\s*TeXFlow note:/i.test(clean),commentText=clean.replace(/^\s*%\s?/gm,'').replace(/^TeXFlow note:\s*/i,'');out.push({id:'b'+n++,kind:'comment',start:s+commentStart,end:s+commentEnd,raw:clean,text:commentText,commentText,commentNote,align:currentAlign});if(commentEnd<raw.length)text(s+commentEnd,e);return;}
   const trimmedRaw=raw.trim();if(trimmedRaw&&trimmedRaw.split(/\r?\n/).every(line=>/^\s*%/.test(line))){const lead=raw.search(/\S/),trail=(/\s*$/.exec(raw)||[''])[0].length,start=lead<0?s:s+lead,end=e-trail,clean=body.slice(start,end);const commentNote=/^\s*%\s*TeXFlow note:/i.test(clean),commentText=clean.replace(/^\s*%\s?/gm,'').replace(/^TeXFlow note:\s*/i,'');out.push({id:'b'+n++,kind:'comment',start,end,raw:clean,text:commentText,commentText,commentNote,align:currentAlign});return;}
   // Labels in ordinary document text are structural metadata, not raw visible
   // LaTeX. Split them out before the safety classification so a heading label
@@ -4363,7 +4676,7 @@ function parseBlocks(body){
   if(m[4]!==undefined){const raw=m[0],d=figureData(raw);out.push({id:'b'+n++,kind:'figure',start:m.index,end:re.lastIndex,raw,env:'includegraphics',text:raw,align:d.align,figurePath:d.path,figureOptions:d.options,figureWidth:d.width.value,figureWidthUnit:d.width.unit,figureHeight:d.height.value,figureHeightUnit:d.height.unit,figureCaption:d.caption,figureShortCaption:d.shortCaption,figureAngle:d.angle,figureLabel:d.label,figurePlacement:d.placement,figureCaptionPosition:d.captionPosition});cur=re.lastIndex;continue;}
   if(m[6]!==undefined){const raw=m[0];out.push({id:'b'+n++,kind:'vspace',start:m.index,end:re.lastIndex,raw,text:raw,spaceAmount:String(m[6]||'').trim(),spaceStarred:m[5]==='*'});cur=re.lastIndex;continue;}
   if(m[7]!==undefined){const raw=m[0];out.push({id:'b'+n++,kind:'break',start:m.index,end:re.lastIndex,raw,text:raw,breakCommand:String(m[7]||'newpage')});cur=re.lastIndex;continue;}
-  const env=m[1],token='\\end{'+env+'}',match=findMatchingEnvEnd(body,env,re.lastIndex);if(!match)break;const end=match.end,raw=body.slice(m.index,end),inner=raw.slice(m[0].length,raw.length-token.length).trim();let kind='raw';if(env==='itemize'||env==='enumerate')kind='itemize';else if(['block','alertblock','exampleblock'].includes(env))kind='block';else if(/^(equation|align|gather|multline)/.test(env))kind='equation';else if(env==='figure')kind='figure';else if(env==='table')kind='table';else if(env==='columns'||env==='multicols')kind='columns';else if(env==='quote'||env==='quotation')kind='quote';else if(env==='minipage')kind='container';else if(['theorem','lemma','proposition','corollary','definition','proof'].includes(env))kind='theorem';else if(['flushleft','center','flushright'].includes(env))kind='paragraph';const effectiveAlign=['flushleft','center','flushright'].includes(env)?(env==='flushleft'?'left':env==='flushright'?'right':'center'):kind==='equation'?'center':kind==='itemize'?(currentAlign==='justify'?'left':currentAlign):currentAlign;const b={id:'b'+n++,kind,start:m.index,end,raw,env,title:m[2]||'',text:inner,align:effectiveAlign};if(kind==='itemize')b.items=splitTopItems(inner);if(kind==='figure'){const d=figureData(raw);Object.assign(b,{align:d.align,figurePath:d.path,figureOptions:d.options,figureWidth:d.width.value,figureWidthUnit:d.width.unit,figureHeight:d.height.value,figureHeightUnit:d.height.unit,figureCaption:d.caption,figureShortCaption:d.shortCaption,figureAngle:d.angle,figureLabel:d.label,figurePlacement:d.placement,figureCaptionPosition:d.captionPosition})}if(kind==='columns'){if(env==='multicols'){b.columnCount=Math.max(2,Math.min(4,Number(m[2])||2));b.columnTexts=inner.split(/\\columnbreak\b/).map(x=>x.trim())}else{const ps=[...inner.matchAll(/\\column\{[^}]+\}([\s\S]*?)(?=\\column\{|$)/g)].map(x=>String(x[1]||'').trim());b.columnTexts=ps.length?ps:[inner];b.columnCount=b.columnTexts.length}}if(kind==='table'){const d=tableData(raw);if(!d.simple)b.kind='raw';else Object.assign(b,{tableSimple:true,tableColumns:d.columns,tableRows:d.rows,tableCaption:d.caption,tableLabel:d.label,tablePlacement:d.placement,tableCaptionPosition:d.captionPosition,tableStyle:d.tableStyle})}out.push(b);cur=end;re.lastIndex=end}text(cur,body.length);return out;
+  const env=m[1],token='\\end{'+env+'}',match=findMatchingEnvEnd(body,env,re.lastIndex);if(!match)break;const end=match.end,raw=body.slice(m.index,end),inner=raw.slice(m[0].length,raw.length-token.length).trim();let kind='raw';if(env==='itemize'||env==='enumerate')kind='itemize';else if(['block','alertblock','exampleblock'].includes(env))kind='block';else if(/^(equation|align|gather|multline)/.test(env))kind='equation';else if(env==='figure')kind='figure';else if(env==='table')kind='table';else if(env==='columns'||env==='multicols')kind='columns';else if(env==='quote'||env==='quotation')kind='quote';else if(env==='minipage')kind='container';else if(['theorem','lemma','proposition','corollary','definition','proof'].includes(env))kind='theorem';else if(env==='comment')kind='commentblock';else if(['flushleft','center','flushright'].includes(env))kind='paragraph';const effectiveAlign=['flushleft','center','flushright'].includes(env)?(env==='flushleft'?'left':env==='flushright'?'right':'center'):kind==='equation'?'center':kind==='itemize'?(currentAlign==='justify'?'left':currentAlign):currentAlign;const b={id:'b'+n++,kind,start:m.index,end,raw,env,title:m[2]||'',text:inner,align:effectiveAlign};if(kind==='itemize')b.items=splitTopItems(inner);if(kind==='figure'){const d=figureData(raw);Object.assign(b,{align:d.align,figurePath:d.path,figureOptions:d.options,figureWidth:d.width.value,figureWidthUnit:d.width.unit,figureHeight:d.height.value,figureHeightUnit:d.height.unit,figureCaption:d.caption,figureShortCaption:d.shortCaption,figureAngle:d.angle,figureLabel:d.label,figurePlacement:d.placement,figureCaptionPosition:d.captionPosition})}if(kind==='columns'){if(env==='multicols'){b.columnCount=Math.max(2,Math.min(4,Number(m[2])||2));b.columnTexts=inner.split(/\\columnbreak\b/).map(x=>x.trim())}else{const ps=[...inner.matchAll(/\\column\{[^}]+\}([\s\S]*?)(?=\\column\{|$)/g)].map(x=>String(x[1]||'').trim());b.columnTexts=ps.length?ps:[inner];b.columnCount=b.columnTexts.length}}if(kind==='table'){const d=tableData(raw);if(!d.simple)b.kind='raw';else Object.assign(b,{tableSimple:true,tableColumns:d.columns,tableRows:d.rows,tableCaption:d.caption,tableLabel:d.label,tablePlacement:d.placement,tableCaptionPosition:d.captionPosition,tableStyle:d.tableStyle})}out.push(b);cur=end;re.lastIndex=end}text(cur,body.length);return out;
 }
 function applyPresentationStyle(){
  const st=presentationStyle||{};const w=Number(st.aspectWidth)||4,h=Number(st.aspectHeight)||3;
@@ -4410,7 +4723,7 @@ function renderWorkspace(){mode='frames';current=Math.max(0,Math.min(current,fra
 function renderFrame(i){current=i;renderWorkspace();if(window.innerWidth<900&&typeof setNav==='function')setNav(false);}
 function renderBlock(b,fi){const wrap=document.createElement('div');wrap.className='block '+alignClass(b.align,b.kind==='itemize'?'left':'justify');if(b.hidden){wrap.style.display='none';return wrap;}
  if(b.kind==='vspace'){wrap.className+=' vspace-block semantic-block';wrap.innerHTML='<span class="vspace-label">vertical '+esc((b.spaceStarred?'* ':'')+(b.spaceAmount||''))+'</span>';bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));return wrap;}
- if(b.kind==='paragraph'){wrap.innerHTML='<div class="editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const e=wrap.firstChild;attachEditor(e);const saveParagraph=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(e)},refresh};vscode.postMessage(msg);};e.__texflowCommit=(text)=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text},refresh:true};vscode.postMessage(msg);};e.__texflowSaveNow=()=>saveParagraph(false);e.addEventListener('input',()=>scheduleSave(e,saveParagraph));e.addEventListener('blur',()=>flushSave(e,saveParagraph));}
+ if(b.kind==='paragraph'){wrap.innerHTML='<div class="editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const e=wrap.firstChild;attachEditor(e);const saveParagraph=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(e)},refresh};vscode.postMessage(msg);};e.__texflowCommit=(text,feature='')=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text},refresh:true,feature};vscode.postMessage(msg);};e.__texflowCommentOutSupported=true;e.__texflowSaveNow=()=>saveParagraph(false);e.addEventListener('input',()=>scheduleSave(e,saveParagraph));e.addEventListener('blur',()=>flushSave(e,saveParagraph));}
  else if(b.kind==='itemize'){const list=createVisualList(b.env,b.items||[]);list.classList.add(alignClass(b.align,'left'));const saveList=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh});list.querySelectorAll('.item-text').forEach(edit=>{edit.__texflowCommit=(text)=>{setEditableLatex(edit,text);vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh:true});};});bindListEditing(list,saveList);wrap.appendChild(list)}
  else if(b.kind==='block'){wrap.className+=' beamer-block '+(b.env==='alertblock'?'alert':b.env==='exampleblock'?'example':'');wrap.innerHTML='<div class="head" contenteditable="true">'+latexToHtml(b.title)+'</div><div class="body editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const blockHead=wrap.querySelector('.head'),blockBody=wrap.querySelector('.body');attachEditor(blockHead);attachEditor(blockBody);const saveBlock=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{title:editorToLatex(blockHead),text:editableLatex(blockBody)},refresh};vscode.postMessage(msg);};blockHead.__texflowCommit=(text)=>{setEditableLatex(blockHead,text);saveBlock(true);};blockHead.__texflowSaveNow=()=>saveBlock(false);blockBody.__texflowCommit=(text)=>{setEditableLatex(blockBody,text);saveBlock(true);};blockBody.__texflowSaveNow=()=>saveBlock(false);wrap.addEventListener('focusout',()=>saveBlock(false));}
  else if(b.kind==='equation'){wrap.className+=' math';wrap.innerHTML='<div class="render"></div>';let previewText=String(b.text||'').replace(/\\label\{[^}]+\}/g,'').replace(/\\(?:notag|nonumber)\b/g,'');if(/^align/.test(String(b.env||'')))previewText='\\begin{aligned}'+previewText+'\\end{aligned}';try{katex.render(previewText,wrap.querySelector('.render'),{displayMode:true,throwOnError:false})}catch{}wrap.title='Double-click to edit equation';wrap.addEventListener('dblclick',()=>openMathEditor(b,fi));}
@@ -4418,10 +4731,11 @@ function renderBlock(b,fi){const wrap=document.createElement('div');wrap.classNa
  else if(b.kind==='table'){renderTable(b,fi,wrap);}
  else if(b.kind==='columns'){renderColumns(b,fi,wrap);}
  else if(b.kind==='break'){wrap.className+=' doc-break';wrap.textContent=b.breakCommand||'newpage';}
- else if(b.kind==='comment'){wrap.className+=' doc-rich-block comment';wrap.innerHTML='<div class="doc-rich-label">'+(b.commentNote?'Author note':'Source comment')+' · not in PDF</div><div class="editable doc-rich-edit" contenteditable="true">'+esc(b.commentText||b.text||'')+'</div>';const edit=wrap.querySelector('.doc-rich-edit');attachEditor(edit);const save=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(edit)},refresh};vscode.postMessage(msg);};edit.__texflowCommit=text=>{setEditableLatex(edit,text);save(true);};edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}
+ else if(b.kind==='comment'){const reviewKey=reviewFrameKey(b,fi);if(!reviewBlockVisible(b)||reviewItemHidden(reviewKey)){wrap.style.display='none';return wrap;}wrap.className+=' comment-anchor';wrap.dataset.reviewKey=reviewKey;wrap.innerHTML='<button type="button" class="comment-marker '+(b.commentNote?'author-note':'source-comment')+'" title="'+(b.commentNote?'Author note':'Source comment')+'">C</button>';const marker=wrap.querySelector('.comment-marker');marker.onclick=e=>{e.preventDefault();e.stopPropagation();openFrameCommentInspector(b,fi,marker);};}
+ else if(b.kind==='commentblock'){const reviewKey=reviewFrameKey(b,fi);if(!reviewBlockVisible(b)||reviewItemHidden(reviewKey)){wrap.style.display='none';return wrap;}wrap.className+=' comment-anchor';wrap.dataset.reviewKey=reviewKey;wrap.innerHTML='<button type="button" class="comment-marker comment-block" title="Commented-out block">C</button>';const marker=wrap.querySelector('.comment-marker');marker.onclick=e=>{e.preventDefault();e.stopPropagation();openFrameCommentInspector(b,fi,marker);};}
  else if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem'){wrap.className+=' doc-rich-block '+b.kind;wrap.innerHTML='<div class="doc-rich-label">'+esc(b.env||b.kind)+'</div><div class="editable doc-rich-edit" contenteditable="true">'+latexToHtml(b.text||'')+'</div>';const edit=wrap.querySelector('.doc-rich-edit');attachEditor(edit);const save=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(edit)},refresh};vscode.postMessage(msg);};edit.__texflowCommit=text=>{setEditableLatex(edit,text);save(true);};edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}
  else {wrap.className+=' '+b.kind;wrap.innerHTML='<div class="tag">'+esc(b.kind)+' — preserved as LaTeX</div><pre>'+esc(b.raw)+'</pre>'}
- if(['equation','figure','table','columns','break','quote','container','theorem','comment'].includes(b.kind))bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));
+ if(['equation','figure','table','columns','break','quote','container','theorem'].includes(b.kind))bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));
  return wrap;}
 
 function renderColumns(block,frameIndex,wrap){
@@ -4471,7 +4785,7 @@ const mathSymbols={
  Arrows:[['→','\\rightarrow'],['←','\\leftarrow'],['↔','\\leftrightarrow'],['⇒','\\Rightarrow'],['⇐','\\Leftarrow'],['⇔','\\Leftrightarrow'],['↦','\\mapsto'],['↑','\\uparrow'],['↓','\\downarrow'],['↗','\\nearrow'],['↘','\\searrow']],
  Sets:[['∅','\\emptyset'],['ℝ','\\mathbb{R}'],['ℕ','\\mathbb{N}'],['ℤ','\\mathbb{Z}'],['ℚ','\\mathbb{Q}'],['ℂ','\\mathbb{C}'],['∪','\\cup'],['∩','\\cap'],['\\','\\setminus'],['∀','\\forall'],['∃','\\exists'],['¬','\\neg'],['∧','\\land'],['∨','\\lor']]
 };
-let mathEditing=null,mathCategory='Greek',lastVisualCursor=null,lastMathStructuredField=null;
+let mathEditing=null,mathCategory='Greek',lastVisualCursor=null,lastVisualSelection=null,lastMathStructuredField=null;
 let mathMatrixRows=2,mathMatrixCols=2;
 function mathStructure(){return document.getElementById('math-structure').value||'display';}
 function mathCleanLabel(value){return String(value||'').trim().replace(/[{}\\\s]/g,'');}
@@ -4493,7 +4807,15 @@ function rememberVisualCursor(){
  const range=sel.getRangeAt(0);let node=range.startContainer.nodeType===Node.ELEMENT_NODE?range.startContainer:range.startContainer.parentElement;
  const editable=node&&node.closest?node.closest('.slide .editable[contenteditable=true], .slide .empty-frame-body[contenteditable=true], .document-sheet .doc-editable[contenteditable=true], .document-continuous .doc-editable[contenteditable=true]'):null;
  if(!editable||!editable.__texflowCommit)return;
- try{lastVisualCursor={editable,range:range.cloneRange(),frameIndex:current};}catch{}
+ try{
+  const saved={editable,range:range.cloneRange(),frameIndex:current};
+  lastVisualCursor=saved;
+  // Keep a dedicated non-collapsed selection snapshot. Opening a top menu can
+  // move focus away from the editor, but Comment out selection must still act
+  // on the text the user selected immediately before opening the menu.
+  if(range.collapsed) lastVisualSelection=null;
+  else lastVisualSelection={editable,range:range.cloneRange(),frameIndex:current};
+ }catch{}
 }
 document.addEventListener('selectionchange',rememberVisualCursor);
 function insertMathAtRememberedCursor(kind,text,anchor){
@@ -4604,6 +4926,26 @@ function openCitationPicker(){citationAnchor=snapshotVisualCursor();citationSele
 function closeCitationPicker(){const modal=document.getElementById('cite-modal');modal.classList.remove('open');modal.setAttribute('aria-hidden','true');citationSelection.clear();citationAnchor=null;}
 function rememberedStructuralCursorPos(explicitCtx=null){const ctx=explicitCtx||citationAnchor||lastVisualCursor;if(!ctx||!ctx.editable||!ctx.editable.isConnected)return null;const host=ctx.editable.closest('[data-node-id]')||ctx.editable;const id=host&&host.dataset?host.dataset.nodeId:null;const node=id?documentFlowById[id]:null;return node&&Number.isFinite(node.end)?Number(node.end):null;}
 function rangePartLatex(editable,range,part){const r=document.createRange();r.selectNodeContents(editable);if(part==='before')r.setEnd(range.startContainer,range.startOffset);else if(part==='selected'){r.setStart(range.startContainer,range.startOffset);r.setEnd(range.endContainer,range.endOffset);}else r.setStart(range.endContainer,range.endOffset);const box=document.createElement('div');box.appendChild(r.cloneContents());return editorToLatex(box);}
+function commentOutSelectedText(){
+ // Prefer the last real text selection over the generic cursor snapshot.
+ // Clicking Insert/Review can move browser focus to the menu while the user
+ // still expects the previously highlighted text to be transformed.
+ const ctx=(lastVisualSelection&&lastVisualSelection.editable&&lastVisualSelection.editable.isConnected)
+  ?lastVisualSelection
+  :((lastVisualCursor&&lastVisualCursor.editable&&lastVisualCursor.editable.isConnected&&!lastVisualCursor.range.collapsed)?lastVisualCursor:null);
+ if(!ctx||!ctx.editable||!ctx.range||!ctx.editable.__texflowCommentOutSupported){vscode.postMessage({type:'showWarning',message:'Select text inside a normal paragraph before using Comment out selection.'});return false;}
+ const editable=ctx.editable,range=ctx.range.cloneRange();
+ if(range.collapsed||!editable.contains(range.startContainer)||!editable.contains(range.endContainer)){vscode.postMessage({type:'showWarning',message:'Select text inside a single paragraph before using Comment out selection.'});return false;}
+ const before=rangePartLatex(editable,range,'before').trimEnd(),selected=rangePartLatex(editable,range,'selected').trim(),after=rangePartLatex(editable,range,'after').trimStart();
+ if(!selected){vscode.postMessage({type:'showWarning',message:'The current selection is empty.'});return false;}
+ const block='\\begin{comment}\n'+selected+'\n\\end{comment}',replacement=(before?before+'\n\n':'')+block+(after?'\n\n'+after:'');
+ reviewVisibility.commentBlocks=true;localStorage.setItem('texflow-review-comment-blocks','1');
+ // Clear the stored selection before the DOM is re-rendered so a second
+ // invocation can never apply accidentally to stale text.
+ lastVisualSelection=null;
+ editable.__texflowCommit(replacement,'commentenv');
+ return true;
+}
 function insertLocalColumns(count){count=Math.max(2,Math.min(4,Number(count)||2));if(isBeamer){vscode.postMessage({type:'insertLayoutColumns',frameIndex:current,count});return;}const ctx=(lastVisualCursor&&lastVisualCursor.editable&&lastVisualCursor.editable.isConnected)?lastVisualCursor:snapshotVisualCursor();if(ctx&&ctx.editable&&ctx.range&&ctx.editable.classList.contains('doc-paragraph')){const node=documentFlowById[ctx.editable.dataset.nodeId],range=ctx.range.cloneRange();if(node&&ctx.editable.contains(range.startContainer)&&ctx.editable.contains(range.endContainer)){const before=rangePartLatex(ctx.editable,range,'before').trimEnd(),selected=range.collapsed?'':rangePartLatex(ctx.editable,range,'selected').trim(),after=rangePartLatex(ctx.editable,range,'after').trimStart(),block='\\begin{multicols}{'+count+'}\n'+selected+'\n\\end{multicols}',replacement=(before?before+'\n\n':'')+block+(after?'\n\n'+after:'');updateDocumentNode(node,replacement,true,'multicol');return;}}vscode.postMessage({type:'insertLayoutColumns',frameIndex:current,count,cursorPos:rememberedStructuralCursorPos()});}
 function normalizeAtomicInsertionRange(editable,range){
  if(!range||!editable.contains(range.startContainer))return null;
@@ -4737,8 +5079,10 @@ function openLabsSubfigures(data){
  },'Experimental: uses the subcaption package. Up to six selected images are preserved as standard LaTeX subfigures.');
 }
 function openLabsSpecial(){openLabsDialog('Insert special character',[{id:'char',label:'Character',type:'select',options:[['%','% — percent'],['&','& — ampersand'],['#','# — hash'],['_','_ — underscore'],['$','$ — dollar'],['{','{ — left brace'],['}','} — right brace'],['~','~ — tilde'],['^','^ — caret']]}],(v,a)=>{const map={'%':'\\%','&':'\\&','#':'\\#','_':'\\_','$':'\\$','{':'\\{','}':'\\}','~':'\\textasciitilde{}','^':'\\textasciicircum{}'};return labsInsertInline(map[v.char]||v.char,a);});}
-function openLabsAuthorNote(){openLabsDialog('Insert author note',[{id:'text',label:'Note',type:'textarea',rows:4}],(v,a)=>v.text.trim()?labsInsertBlock('% TeXFlow note: '+v.text.replace(/\r?\n/g,' '),'comment',a):false,'Author notes are source comments marked by TeXFlow and never appear in the PDF.');}
-function openLabsComment(){openLabsDialog('Insert source comment',[{id:'text',label:'Comment',type:'textarea',rows:4}],(v,a)=>v.text.trim()?labsInsertBlock('% '+v.text.replace(/\r?\n/g,' '),'comment',a):false,'Comments stay out of the compiled PDF.');}
+function labsCommentLatex(value,note=false){const lines=String(value||'').replace(/\r\n?/g,'\n').split('\n').map(line=>line.replace(/^%\s?/,''));if(!lines.some(line=>line.trim()))return'';return lines.map((line,i)=>(note&&i===0?'% TeXFlow note: ':'% ')+line).join('\n');}
+function openLabsAuthorNote(){openLabsDialog('Insert author note',[{id:'text',label:'Note',type:'textarea',rows:5}],(v,a)=>{const code=labsCommentLatex(v.text,true);if(!code)return false;reviewVisibility.authorNotes=true;localStorage.setItem('texflow-review-author-notes','1');return labsInsertBlock(code,'comment',a);},'Author notes are ordinary LaTeX source comments marked by TeXFlow and never appear in the PDF.');}
+function openLabsComment(){openLabsDialog('Insert source comment',[{id:'text',label:'Comment',type:'textarea',rows:5}],(v,a)=>{const code=labsCommentLatex(v.text,false);if(!code)return false;reviewVisibility.sourceComments=true;localStorage.setItem('texflow-review-source-comments','1');return labsInsertBlock(code,'comment',a);},'Source comments are preserved as % lines and never appear in the compiled PDF.');}
+function openLabsCommentBlock(){openLabsDialog('Insert commented-out block',[{id:'text',label:'Commented-out LaTeX',type:'textarea',rows:8}],(v,a)=>{const text=String(v.text||'').replace(/\r\n?/g,'\n');if(!text.trim())return false;reviewVisibility.commentBlocks=true;localStorage.setItem('texflow-review-comment-blocks','1');return labsInsertBlock('\\begin{comment}\n'+text+'\n\\end{comment}','commentenv',a);},'Uses the LaTeX comment package. Everything inside the block is preserved as source but excluded from the PDF and from TeXFlow project/document semantics.');}
 function openLabsQuote(env='quote'){openLabsDialog(env==='quotation'?'Insert quotation':'Insert quote',[{id:'text',label:'Text',type:'textarea',rows:6}],(v,a)=>v.text.trim()?labsInsertBlock('\\begin{'+env+'}\n'+v.text+'\n\\end{'+env+'}','quote',a):false);}
 function openLabsMinipage(){openLabsDialog('Insert minipage',[{id:'width',label:'Width',value:'0.9\\linewidth'},{id:'text',label:'Content',type:'textarea',rows:6}],(v,a)=>labsInsertBlock('\\begin{minipage}{'+(v.width.trim()||'0.9\\linewidth')+'}\n'+v.text+'\n\\end{minipage}','box',a),'A visual container; unsupported nested structures remain preserved.');}
 function openLabsTheorem(){openLabsDialog('Insert theorem / proof',[{id:'env',label:'Environment',type:'select',options:['theorem','lemma','proposition','corollary','definition','proof']},{id:'text',label:'Content',type:'textarea',rows:6}],(v,a)=>v.text.trim()?labsInsertBlock('\\begin{'+v.env+'}\n'+v.text+'\n\\end{'+v.env+'}','theorem',a):false,'TeXFlow adds amsthm and standard theorem definitions when needed.');}
@@ -4872,11 +5216,11 @@ function updateDocumentViewMenu(){
  const continuous=document.getElementById('view-continuous'),pages=document.getElementById('view-pages');if(!continuous||!pages)return;
  continuous.textContent=(documentLayoutMode==='continuous'?'✓ ':'')+'Continuous';pages.textContent=(documentLayoutMode==='pages'?'✓ ':'')+'Pages';
 }
-const cursorMenuButtons=['structure-menu-button','insert-menu-button','format-menu-button','references-menu-button','layout-menu-button'].map(id=>document.getElementById(id)).filter(Boolean);cursorMenuButtons.forEach(btn=>btn.addEventListener('mousedown',e=>{rememberVisualCursor();e.preventDefault();}));const topMenus=[...document.querySelectorAll('.top-menu')];function moveLanguageMenuToFormat(){const menu=document.getElementById('language-menu-top');const panel=document.querySelector('#format-menu .top-menu-panel');if(!menu||!panel)return;const divider=document.createElement('span');divider.className='menu-divider';const title=document.createElement('div');title.className='menu-title';title.textContent='Language';panel.appendChild(divider);panel.appendChild(title);['spell-language-automatic','spell-language-english','spell-language-spanish'].forEach(id=>{const btn=document.getElementById(id);if(btn)panel.appendChild(btn);});const toggleDivider=document.createElement('span');toggleDivider.className='menu-divider';panel.appendChild(toggleDivider);const toggle=document.getElementById('spell-check-toggle');if(toggle)panel.appendChild(toggle);menu.remove();}moveLanguageMenuToFormat();function closeTopMenus(except){topMenus.forEach(m=>{if(m!==except)m.classList.remove('open')})}topMenus.forEach(menu=>{const trigger=menu.querySelector(':scope > .top-action');trigger.onclick=e=>{e.stopPropagation();const wasOpen=menu.classList.contains('open');closeTopMenus();if(menu.id==='beamer-menu-top')updateFrameTextSizeMenu();menu.classList.toggle('open',!wasOpen);};});document.querySelectorAll('.frame-size-option').forEach(btn=>{btn.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};btn.onclick=()=>{const size=String(btn.dataset.frameSize||'normal');closeTopMenus();vscode.postMessage({type:'updateFrameFontSize',frameIndex:current,size});};});function runTopMenuAction(action){closeTopMenus();if(action==='title'||action==='author')vscode.postMessage({type:'setMetadata',field:action});else if(action==='abstract')vscode.postMessage({type:'insertAbstract'});else if(action==='frame')vscode.postMessage({type:'insertFrame',frameIndex:current});else if(action==='chapter')vscode.postMessage({type:'insertChapter',frameIndex:current});else if(action==='section')vscode.postMessage({type:'insertSection',frameIndex:current});else if(action==='subsection')vscode.postMessage({type:'insertSubsection',frameIndex:current});else if(action==='subsubsection')vscode.postMessage({type:'insertSubsubsection',frameIndex:current});else if(action==='paragraphHeading')vscode.postMessage({type:'insertParagraphHeading',frameIndex:current});else if(action==='paragraph')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'paragraph'});else if(action==='bullets')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'itemize'});else if(action==='numbered')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'enumerate'});else if(action==='inlinemath')openMathInsert('inlinemath',current);else if(action==='displaymath')openMathInsert('displaymath',current);else if(action==='equation')openMathInsert('equation',current);else if(action==='alignmath')openMathInsert('alignmath',current);else if(action==='gathermath')openMathInsert('gathermath',current);else if(action==='multlinemath')openMathInsert('multlinemath',current);else if(action==='casesmath')openMathInsert('casesmath',current);else if(action==='matrixmath')openMathInsert('matrixmath',current);else if(action==='citation')openCitationPicker();else if(action==='addbibliography')vscode.postMessage({type:'addBibliography',resumeCitation:false,cursorPos:rememberedStructuralCursorPos()});else if(action==='referencessection')vscode.postMessage({type:'addReferencesSection',cursorPos:rememberedStructuralCursorPos()});else if(action==='openbibliography')vscode.postMessage({type:'openBibliography'});else if(action==='label')openLabelPicker();else if(action==='reference')openReferencePicker();else if(action==='footnote')openLabsFootnote();else if(action==='link')openLabsLink();else if(action==='special')openLabsSpecial();else if(action==='index')openLabsIndex();else if(action==='nomenclature')openLabsNomenclature();else if(action==='field')openLabsField();else if(action==='newpage')labsInsertBlock('\\newpage','break');else if(action==='clearpage')labsInsertBlock('\\clearpage','break');else if(action==='quote')openLabsQuote('quote');else if(action==='quotation')openLabsQuote('quotation');else if(action==='minipage')openLabsMinipage();else if(action==='theorem')openLabsTheorem();else if(action==='comment')openLabsComment();else if(action==='authornote')openLabsAuthorNote();else if(action==='printindex')labsInsertBlock('\\printindex','index');else if(action==='printnomenclature')labsInsertBlock('\\printnomenclature','nomenclature');else if(action==='figure')vscode.postMessage({type:'insertFigure',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='subfigures')vscode.postMessage({type:'chooseSubfigures',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='table')openTableEditor();else if(action==='tabledata')openLabsTableData();else if(action==='spacing')openSpacingEditor();else if(action==='documentsettings')renderPreamble(currentPreamble);else if(action==='columns2')insertLocalColumns(2);else if(action==='columns3')insertLocalColumns(3);}
+const cursorMenuButtons=['structure-menu-button','insert-menu-button','format-menu-button','references-menu-button','layout-menu-button'].map(id=>document.getElementById(id)).filter(Boolean);cursorMenuButtons.forEach(btn=>btn.addEventListener('mousedown',e=>{rememberVisualCursor();e.preventDefault();}));const topMenus=[...document.querySelectorAll('.top-menu')];function moveLanguageMenuToFormat(){const menu=document.getElementById('language-menu-top');const panel=document.querySelector('#format-menu .top-menu-panel');if(!menu||!panel)return;const divider=document.createElement('span');divider.className='menu-divider';const title=document.createElement('div');title.className='menu-title';title.textContent='Language';panel.appendChild(divider);panel.appendChild(title);['spell-language-automatic','spell-language-english','spell-language-spanish'].forEach(id=>{const btn=document.getElementById(id);if(btn)panel.appendChild(btn);});const toggleDivider=document.createElement('span');toggleDivider.className='menu-divider';panel.appendChild(toggleDivider);const toggle=document.getElementById('spell-check-toggle');if(toggle)panel.appendChild(toggle);menu.remove();}moveLanguageMenuToFormat();function closeTopMenus(except){topMenus.forEach(m=>{if(m!==except)m.classList.remove('open')})}topMenus.forEach(menu=>{const trigger=menu.querySelector(':scope > .top-action');trigger.onclick=e=>{e.stopPropagation();const wasOpen=menu.classList.contains('open');closeTopMenus();if(menu.id==='beamer-menu-top')updateFrameTextSizeMenu();menu.classList.toggle('open',!wasOpen);};});document.querySelectorAll('.frame-size-option').forEach(btn=>{btn.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};btn.onclick=()=>{const size=String(btn.dataset.frameSize||'normal');closeTopMenus();vscode.postMessage({type:'updateFrameFontSize',frameIndex:current,size});};});function runTopMenuAction(action){closeTopMenus();if(action==='title'||action==='author')vscode.postMessage({type:'setMetadata',field:action});else if(action==='abstract')vscode.postMessage({type:'insertAbstract'});else if(action==='frame')vscode.postMessage({type:'insertFrame',frameIndex:current});else if(action==='chapter')vscode.postMessage({type:'insertChapter',frameIndex:current});else if(action==='section')vscode.postMessage({type:'insertSection',frameIndex:current});else if(action==='subsection')vscode.postMessage({type:'insertSubsection',frameIndex:current});else if(action==='subsubsection')vscode.postMessage({type:'insertSubsubsection',frameIndex:current});else if(action==='paragraphHeading')vscode.postMessage({type:'insertParagraphHeading',frameIndex:current});else if(action==='paragraph')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'paragraph'});else if(action==='bullets')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'itemize'});else if(action==='numbered')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'enumerate'});else if(action==='inlinemath')openMathInsert('inlinemath',current);else if(action==='displaymath')openMathInsert('displaymath',current);else if(action==='equation')openMathInsert('equation',current);else if(action==='alignmath')openMathInsert('alignmath',current);else if(action==='gathermath')openMathInsert('gathermath',current);else if(action==='multlinemath')openMathInsert('multlinemath',current);else if(action==='casesmath')openMathInsert('casesmath',current);else if(action==='matrixmath')openMathInsert('matrixmath',current);else if(action==='citation')openCitationPicker();else if(action==='addbibliography')vscode.postMessage({type:'addBibliography',resumeCitation:false,cursorPos:rememberedStructuralCursorPos()});else if(action==='referencessection')vscode.postMessage({type:'addReferencesSection',cursorPos:rememberedStructuralCursorPos()});else if(action==='openbibliography')vscode.postMessage({type:'openBibliography'});else if(action==='label')openLabelPicker();else if(action==='reference')openReferencePicker();else if(action==='footnote')openLabsFootnote();else if(action==='link')openLabsLink();else if(action==='special')openLabsSpecial();else if(action==='index')openLabsIndex();else if(action==='nomenclature')openLabsNomenclature();else if(action==='field')openLabsField();else if(action==='newpage')labsInsertBlock('\\newpage','break');else if(action==='clearpage')labsInsertBlock('\\clearpage','break');else if(action==='quote')openLabsQuote('quote');else if(action==='quotation')openLabsQuote('quotation');else if(action==='minipage')openLabsMinipage();else if(action==='theorem')openLabsTheorem();else if(action==='comment')openLabsComment();else if(action==='authornote')openLabsAuthorNote();else if(action==='commentblock')openLabsCommentBlock();else if(action==='commentoutselection')commentOutSelectedText();else if(action==='toggleSourceComments')toggleReviewVisibility('sourceComments');else if(action==='toggleAuthorNotes')toggleReviewVisibility('authorNotes');else if(action==='toggleCommentBlocks')toggleReviewVisibility('commentBlocks');else if(action==='showHiddenReviewItems')restoreHiddenReviewItems();else if(action==='printindex')labsInsertBlock('\\printindex','index');else if(action==='printnomenclature')labsInsertBlock('\\printnomenclature','nomenclature');else if(action==='figure')vscode.postMessage({type:'insertFigure',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='subfigures')vscode.postMessage({type:'chooseSubfigures',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='table')openTableEditor();else if(action==='tabledata')openLabsTableData();else if(action==='spacing')openSpacingEditor();else if(action==='documentsettings')renderPreamble(currentPreamble);else if(action==='columns2')insertLocalColumns(2);else if(action==='columns3')insertLocalColumns(3);}
 function renderTopMenu(panelId,sections){const panel=document.getElementById(panelId);if(!panel)return;panel.innerHTML='';const addTitle=t=>{const d=document.createElement('div');d.className='menu-title';d.textContent=t;panel.appendChild(d);};const addDivider=()=>{const d=document.createElement('span');d.className='menu-divider';panel.appendChild(d);};const add=(label,action)=>{const b=document.createElement('button');b.textContent=label;b.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};b.onclick=()=>runTopMenuAction(action);panel.appendChild(b);};sections.forEach((section,i)=>{if(i)addDivider();if(section.title)addTitle(section.title);section.items.forEach(item=>{if(item.when===false)return;add(item.label,item.action);});});}
-function renderTopMenus(){renderTopMenu('structure-menu-panel',[{title:'Document structure',items:[{label:'Normal text',action:'paragraph'},{label:'Title',action:'title'},{label:'Author',action:'author'},{label:'Abstract',action:'abstract',when:!isBeamer},{label:'Chapter',action:'chapter',when:['book','report'].includes(documentClass)},{label:'Section',action:'section'},{label:'Subsection',action:'subsection'},{label:'Subsubsection',action:'subsubsection',when:!isBeamer},{label:'Paragraph heading',action:'paragraphHeading',when:!isBeamer}]},{title:'Lists',items:[{label:'Bulleted list',action:'bullets'},{label:'Numbered list',action:'numbered'}]},{title:'Blocks & containers',items:[{label:'Quote…',action:'quote'},{label:'Quotation…',action:'quotation'},{label:'Minipage…',action:'minipage'},{label:'Theorem / proof…',action:'theorem'},{label:'Source comment…',action:'comment'},{label:'Author note…',action:'authornote'},{label:'Two-column block…',action:'columns2'},{label:'Three-column block…',action:'columns3'}]}]);renderTopMenu('insert-menu-panel',[{title:'Math',items:[{label:'Inline math',action:'inlinemath'},{label:'Display math',action:'displaymath'},{label:'Numbered equation…',action:'equation'},{label:'Aligned equations…',action:'alignmath'},{label:'Gathered equations…',action:'gathermath'},{label:'Multiline equation…',action:'multlinemath'},{label:'Cases / system…',action:'casesmath'},{label:'Matrix…',action:'matrixmath'}]},{title:'Figures',items:[{label:'Figure…',action:'figure'},{label:'Subfigures…',action:'subfigures'}]},{title:'Tables',items:[{label:'Table…',action:'table'},{label:'Table from CSV / TSV…',action:'tabledata'}]},{title:'Inline objects',items:[{label:'Link / URL…',action:'link'},{label:'Special character…',action:'special'},{label:'Field…',action:'field'}]}]);renderTopMenu('references-menu-panel',[{title:'Citations & bibliography',items:[{label:'Insert citation…',action:'citation'},{label:'Add / change bibliography…',action:'addbibliography'},{label:'Insert bibliography…',action:'referencessection'},{label:'Open .bib',action:'openbibliography'}]},{title:'Cross-references',items:[{label:'Add label to selected object…',action:'label'},{label:'Insert cross-reference…',action:'reference'}]},{title:'Notes & indexes',items:[{label:'Footnote…',action:'footnote'},{label:'Index entry…',action:'index'},{label:'Print index',action:'printindex'},{label:'Nomenclature entry…',action:'nomenclature'},{label:'Print nomenclature',action:'printnomenclature'}]}]);renderTopMenu('layout-menu-panel',[{title:'Document',items:[{label:'Document settings / preamble…',action:'documentsettings'}]},{title:'Spacing',items:[{label:'Horizontal / vertical spacing…',action:'spacing'}]},{title:'Breaks',items:[{label:'Page break',action:'newpage'},{label:'Clear page',action:'clearpage'}]}]);} document.getElementById('view-continuous').onclick=()=>{documentLayoutMode='continuous';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-pages').onclick=()=>{documentLayoutMode='pages';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.addEventListener('click',e=>{if(!e.target.closest('.top-menu'))closeTopMenus();});document.querySelectorAll('.mode-tab').forEach(btn=>btn.onclick=()=>{viewMode=btn.dataset.view;renderWorkspace();});document.getElementById('new-document').onclick=()=>{closeTopMenus();vscode.postMessage({type:'newDocument'});};document.getElementById('open-file').onclick=()=>{closeTopMenus();vscode.postMessage({type:'open'});};document.getElementById('save-file').onclick=()=>{closeTopMenus();const el=document.getElementById('save-status');el.textContent='Saving…';vscode.postMessage({type:'save'});};document.getElementById('save-as').onclick=()=>{closeTopMenus();vscode.postMessage({type:'saveAs'});};document.getElementById('undo').onclick=()=>vscode.postMessage({type:'undo'});document.getElementById('redo').onclick=()=>vscode.postMessage({type:'redo'});document.getElementById('find-document').onclick=()=>texflowOpenFind();document.getElementById('labs-find-replace').onclick=()=>{closeTopMenus();openLabsFindReplace();};document.getElementById('labs-copy-object').onclick=()=>{closeTopMenus();labsCopyObject();};document.getElementById('labs-paste-object').onclick=()=>{closeTopMenus();labsPasteObject();};document.getElementById('labs-duplicate-object').onclick=()=>{closeTopMenus();labsDuplicateObject();};document.getElementById('labs-move-up').onclick=()=>{closeTopMenus();labsMoveObject(-1);};document.getElementById('labs-move-down').onclick=()=>{closeTopMenus();labsMoveObject(1);};document.getElementById('project-diagnostics').onclick=()=>{closeTopMenus();vscode.postMessage({type:'showProjectDiagnostics'});};document.getElementById('top-compile').onclick=()=>vscode.postMessage({type:'compile'});document.getElementById('spell-language-automatic').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'auto'});document.getElementById('spell-language-english').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'en'});document.getElementById('spell-language-spanish').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'es'});document.getElementById('spell-check-toggle').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'enabled',value:!texflowSpellState.enabled});const body=document.body;const toggleNav=document.getElementById('toggle-nav');const focusBtn=document.getElementById('focus-mode');const exitFocus=document.getElementById('exit-focus');const findInput=document.getElementById('texflow-find-input'),findPrev=document.getElementById('texflow-find-prev'),findNext=document.getElementById('texflow-find-next'),findClose=document.getElementById('texflow-find-close');if(findInput){findInput.addEventListener('input',()=>{texflowFindState.query=findInput.value||'';texflowFindRefresh(true,true);});findInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();texflowFindNavigate(e.shiftKey?-1:1);}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();texflowCloseFind();}});}if(findPrev)findPrev.onclick=()=>texflowFindNavigate(-1);if(findNext)findNext.onclick=()=>texflowFindNavigate(1);if(findClose)findClose.onclick=()=>texflowCloseFind();const texflowFindObserver=new MutationObserver(()=>texflowFindScheduleRefresh(false));const texflowFindContent=document.getElementById('content');if(texflowFindContent)texflowFindObserver.observe(texflowFindContent,{subtree:true,childList:true,characterData:true});function setNav(open){body.classList.toggle('nav-open',open);body.classList.toggle('nav-closed',!open);localStorage.setItem('texflow-nav',open?'open':'closed');}function setFocus(on){body.classList.toggle('focus-mode',on);localStorage.setItem('texflow-focus',on?'on':'off');}// Every TeXFlow document starts with its navigator visible on desktop.
+function renderTopMenus(){renderTopMenu('structure-menu-panel',[{title:'Document structure',items:[{label:'Normal text',action:'paragraph'},{label:'Title',action:'title'},{label:'Author',action:'author'},{label:'Abstract',action:'abstract',when:!isBeamer},{label:'Chapter',action:'chapter',when:['book','report'].includes(documentClass)},{label:'Section',action:'section'},{label:'Subsection',action:'subsection'},{label:'Subsubsection',action:'subsubsection',when:!isBeamer},{label:'Paragraph heading',action:'paragraphHeading',when:!isBeamer}]},{title:'Lists',items:[{label:'Bulleted list',action:'bullets'},{label:'Numbered list',action:'numbered'}]},{title:'Blocks & containers',items:[{label:'Quote…',action:'quote'},{label:'Quotation…',action:'quotation'},{label:'Minipage…',action:'minipage'},{label:'Theorem / proof…',action:'theorem'},{label:'Two-column block…',action:'columns2'},{label:'Three-column block…',action:'columns3'}]}]);renderTopMenu('insert-menu-panel',[{title:'Comments & notes',items:[{label:'Source comment…',action:'comment'},{label:'Author note…',action:'authornote'},{label:'Commented-out block…',action:'commentblock'},{label:'Comment out selection',action:'commentoutselection'}]},{title:'Math',items:[{label:'Inline math',action:'inlinemath'},{label:'Display math',action:'displaymath'},{label:'Numbered equation…',action:'equation'},{label:'Aligned equations…',action:'alignmath'},{label:'Gathered equations…',action:'gathermath'},{label:'Multiline equation…',action:'multlinemath'},{label:'Cases / system…',action:'casesmath'},{label:'Matrix…',action:'matrixmath'}]},{title:'Figures',items:[{label:'Figure…',action:'figure'},{label:'Subfigures…',action:'subfigures'}]},{title:'Tables',items:[{label:'Table…',action:'table'},{label:'Table from CSV / TSV…',action:'tabledata'}]},{title:'Inline objects',items:[{label:'Link / URL…',action:'link'},{label:'Special character…',action:'special'},{label:'Field…',action:'field'}]}]);renderTopMenu('references-menu-panel',[{title:'Citations & bibliography',items:[{label:'Insert citation…',action:'citation'},{label:'Add / change bibliography…',action:'addbibliography'},{label:'Insert bibliography…',action:'referencessection'},{label:'Open .bib',action:'openbibliography'}]},{title:'Cross-references',items:[{label:'Add label to selected object…',action:'label'},{label:'Insert cross-reference…',action:'reference'}]},{title:'Notes & indexes',items:[{label:'Footnote…',action:'footnote'},{label:'Index entry…',action:'index'},{label:'Print index',action:'printindex'},{label:'Nomenclature entry…',action:'nomenclature'},{label:'Print nomenclature',action:'printnomenclature'}]}]);renderTopMenu('layout-menu-panel',[{title:'Document',items:[{label:'Document settings / preamble…',action:'documentsettings'}]},{title:'Spacing',items:[{label:'Horizontal / vertical spacing…',action:'spacing'}]},{title:'Breaks',items:[{label:'Page break',action:'newpage'},{label:'Clear page',action:'clearpage'}]}]);} document.getElementById('view-continuous').onclick=()=>{documentLayoutMode='continuous';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-pages').onclick=()=>{documentLayoutMode='pages';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-source-comments').onclick=()=>{toggleReviewVisibility('sourceComments');};document.getElementById('view-author-notes').onclick=()=>{toggleReviewVisibility('authorNotes');};document.getElementById('view-comment-blocks').onclick=()=>{toggleReviewVisibility('commentBlocks');};document.getElementById('view-hidden-comments').onclick=()=>{restoreHiddenReviewItems();};updateCommentViewMenu();const commentInspectorClose=document.getElementById('comment-inspector-close');if(commentInspectorClose)commentInspectorClose.onclick=()=>closeCommentInspector();document.addEventListener('click',e=>{if(!e.target.closest('.top-menu'))closeTopMenus();});document.querySelectorAll('.mode-tab').forEach(btn=>btn.onclick=()=>{viewMode=btn.dataset.view;renderWorkspace();});document.getElementById('new-document').onclick=()=>{closeTopMenus();vscode.postMessage({type:'newDocument'});};document.getElementById('open-file').onclick=()=>{closeTopMenus();vscode.postMessage({type:'open'});};document.getElementById('save-file').onclick=()=>{closeTopMenus();const el=document.getElementById('save-status');el.textContent='Saving…';vscode.postMessage({type:'save'});};document.getElementById('save-as').onclick=()=>{closeTopMenus();vscode.postMessage({type:'saveAs'});};document.getElementById('undo').onclick=()=>vscode.postMessage({type:'undo'});document.getElementById('redo').onclick=()=>vscode.postMessage({type:'redo'});document.getElementById('find-document').onclick=()=>texflowOpenFind();document.getElementById('labs-find-replace').onclick=()=>{closeTopMenus();openLabsFindReplace();};document.getElementById('labs-copy-object').onclick=()=>{closeTopMenus();labsCopyObject();};document.getElementById('labs-paste-object').onclick=()=>{closeTopMenus();labsPasteObject();};document.getElementById('labs-duplicate-object').onclick=()=>{closeTopMenus();labsDuplicateObject();};document.getElementById('labs-move-up').onclick=()=>{closeTopMenus();labsMoveObject(-1);};document.getElementById('labs-move-down').onclick=()=>{closeTopMenus();labsMoveObject(1);};document.getElementById('project-diagnostics').onclick=()=>{closeTopMenus();vscode.postMessage({type:'showProjectDiagnostics'});};document.getElementById('top-compile').onclick=()=>vscode.postMessage({type:'compile'});document.getElementById('spell-language-automatic').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'auto'});document.getElementById('spell-language-english').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'en'});document.getElementById('spell-language-spanish').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'es'});document.getElementById('spell-check-toggle').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'enabled',value:!texflowSpellState.enabled});const body=document.body;const toggleNav=document.getElementById('toggle-nav');const focusBtn=document.getElementById('focus-mode');const exitFocus=document.getElementById('exit-focus');const findInput=document.getElementById('texflow-find-input'),findPrev=document.getElementById('texflow-find-prev'),findNext=document.getElementById('texflow-find-next'),findClose=document.getElementById('texflow-find-close');if(findInput){findInput.addEventListener('input',()=>{texflowFindState.query=findInput.value||'';texflowFindRefresh(true,true);});findInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();texflowFindNavigate(e.shiftKey?-1:1);}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();texflowCloseFind();}});}if(findPrev)findPrev.onclick=()=>texflowFindNavigate(-1);if(findNext)findNext.onclick=()=>texflowFindNavigate(1);if(findClose)findClose.onclick=()=>texflowCloseFind();const texflowFindObserver=new MutationObserver(()=>texflowFindScheduleRefresh(false));const texflowFindContent=document.getElementById('content');if(texflowFindContent)texflowFindObserver.observe(texflowFindContent,{subtree:true,childList:true,characterData:true});function setNav(open){body.classList.toggle('nav-open',open);body.classList.toggle('nav-closed',!open);localStorage.setItem('texflow-nav',open?'open':'closed');}function setFocus(on){body.classList.toggle('focus-mode',on);localStorage.setItem('texflow-focus',on?'on':'off');}// Every TeXFlow document starts with its navigator visible on desktop.
 // On narrow panes it starts closed and the Index button opens it as an overlay.
-setNav(window.innerWidth>=900);setFocus(localStorage.getItem('texflow-focus')==='on');toggleNav.onclick=()=>{setNav(body.classList.contains('nav-closed'));closeTopMenus();};focusBtn.onclick=()=>{setFocus(!body.classList.contains('focus-mode'));closeTopMenus();};exitFocus.onclick=()=>setFocus(false);document.addEventListener('click',e=>{if(window.innerWidth<900&&body.classList.contains('nav-open')&&!e.target.closest('.side')&&!e.target.closest('#toggle-nav'))setNav(false);});window.addEventListener('resize',()=>{if(window.innerWidth<900&&body.classList.contains('nav-open'))setNav(false);});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(texflowFindState.open){e.preventDefault();texflowCloseFind();return;}closeTopMenus();if(body.classList.contains('focus-mode'))setFocus(false);}if(e.ctrlKey||e.metaKey){const k=e.key.toLowerCase();if(k==='f'){e.preventDefault();texflowOpenFind();}else if(k==='s'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'saveAs':'save'});}else if(k==='o'){e.preventDefault();vscode.postMessage({type:'open'});}else if(k==='z'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'redo':'undo'});}}});vscode.postMessage({type:'ready'});
+setNav(window.innerWidth>=900);setFocus(localStorage.getItem('texflow-focus')==='on');toggleNav.onclick=()=>{setNav(body.classList.contains('nav-closed'));closeTopMenus();};focusBtn.onclick=()=>{setFocus(!body.classList.contains('focus-mode'));closeTopMenus();};exitFocus.onclick=()=>setFocus(false);document.addEventListener('click',e=>{if(window.innerWidth<900&&body.classList.contains('nav-open')&&!e.target.closest('.side')&&!e.target.closest('#toggle-nav'))setNav(false);});window.addEventListener('resize',()=>{if(window.innerWidth<900&&body.classList.contains('nav-open'))setNav(false);});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(texflowFindState.open){e.preventDefault();texflowCloseFind();return;}if(body.classList.contains('comment-inspector-open')){e.preventDefault();closeCommentInspector();return;}closeTopMenus();if(body.classList.contains('focus-mode'))setFocus(false);}if(e.ctrlKey||e.metaKey){const k=e.key.toLowerCase();if(k==='f'){e.preventDefault();texflowOpenFind();}else if(k==='s'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'saveAs':'save'});}else if(k==='o'){e.preventDefault();vscode.postMessage({type:'open'});}else if(k==='z'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'redo':'undo'});}}});vscode.postMessage({type:'ready'});
 </script></body></html>`;
 }
 
