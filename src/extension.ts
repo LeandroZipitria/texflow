@@ -973,9 +973,7 @@ export function activate(context: vscode.ExtensionContext) {
           if (!expected || raw !== expected || !/^\\begin\{tikzpicture\}/.test(expected.trim()) || !/\\end\{tikzpicture\}$/.test(expected.trim())) {
             throw new Error('TeXFlow could not safely locate this TikZ picture. Refresh Visual and try again.');
           }
-          const replacement = project.isBeamer
-            ? `\\begin{figure}\n\\centering\n${expected.trim()}\n\\end{figure}`
-            : `\\begin{figure}[htbp]\n\\centering\n${expected.trim()}\n\\end{figure}`;
+          const replacement = tikzPictureFigureLatex(expected, project.isBeamer);
           postStatus('saving');
           await beginHistoryStep();
           updatingFromWebview = true;
@@ -3045,6 +3043,13 @@ async function chooseMultipleFigureFiles(rootDocument: vscode.TextDocument): Pro
   return out;
 }
 
+function tikzPictureFigureLatex(source: string, beamer: boolean): string {
+  const picture = String(source ?? '').trim();
+  return beamer
+    ? `\\begin{figure}\n\\centering\n${picture}\n\\end{figure}`
+    : `\\begin{figure}[htbp]\n\\centering\n${picture}\n\\end{figure}`;
+}
+
 function figureBlockLatex(latexPath: string, caption: string, label: string, placement: string, beamer: boolean, captionPosition: 'above' | 'below' = 'below', align: string = 'center', widthPercent: number = 70, shortCaption: string = '', angle: number = 0): string {
   const begin = beamer ? '\\begin{figure}' : `\\begin{figure}${placement ? `[${placement}]` : ''}`;
   const directive = align === 'left' ? '\\raggedright' : align === 'right' ? '\\raggedleft' : '\\centering';
@@ -3268,6 +3273,14 @@ function normalizeEditableText(value: unknown): string {
   return text.trim();
 }
 
+function serializeCommentSource(value: unknown, commentNote = false, commentTag?: 'TODO' | 'FIXME'): string {
+  const text = String(value ?? '').replace(/\r\n?/g, '\n');
+  const lines = text.split('\n').map(line => line.replace(/^%\s?/, ''));
+  if (commentTag && lines.length) lines[0] = lines[0].replace(/^(?:TODO|FIXME)\b\s*/i, '');
+  const first = commentNote ? '% TeXFlow note: ' : commentTag === 'TODO' ? '% TODO ' : commentTag === 'FIXME' ? '% FIXME ' : '% ';
+  return lines.map((line, index) => (index === 0 ? first : '% ') + line).join('\n');
+}
+
 function serializeBlock(block: ParsedBlock, payload: any): string {
   if (block.kind === 'paragraph') { const text=normalizeEditableText(payload.text); const requested=String(payload.align||''); if(requested==='justify') return text; const env=requested==='left'?'flushleft':requested==='right'?'flushright':requested==='center'?'center':(['flushleft','center','flushright'].includes(String(block.env||''))?String(block.env):''); return env?`\\begin{${env}}\n${text}\n\\end{${env}}`:text; }
   if (block.kind === 'itemize') {
@@ -3315,9 +3328,7 @@ function serializeBlock(block: ParsedBlock, payload: any): string {
     return `\\begin{${env}}${block.title ? `{${escapeTitle(payload.title ?? block.title ?? '')}}` : ''}\n${normalizeEditableText(payload.text ?? block.text ?? '')}\n\\end{${env}}`;
   }
   if (block.kind === 'comment') {
-    const text = String(payload.text ?? block.commentText ?? block.text ?? '').replace(/\r\n?/g, '\n');
-    const lines = text.split('\n').map(line => line.replace(/^%\s?/, ''));
-    return lines.map((line, index) => block.commentNote && index === 0 ? `% TeXFlow note: ${line}` : `% ${line}`).join('\n');
+    return serializeCommentSource(payload.text ?? block.commentText ?? block.text ?? '', !!block.commentNote, block.commentTag);
   }
   if (block.kind === 'commentblock') {
     const text = String(payload.text ?? block.text ?? '').replace(/\r\n?/g, '\n');
@@ -5046,16 +5057,17 @@ function serializeRichDocumentBlock(node,text){
  if(b.kind==='container')return '\\begin{minipage}{0.9\\linewidth}\n'+body+'\n\\end{minipage}';
  if(b.kind==='theorem'){const env=b.env||'theorem';return '\\begin{'+env+'}\n'+body+'\n\\end{'+env+'}';}
  if(b.kind==='customenv'){const env=String(b.env||'').trim();return env?'\\begin{'+env+'}\n'+body+'\n\\end{'+env+'}':(node.raw||'');}
- if(b.kind==='comment'){const lines=String(text||'').replace(/\r\n?/g,'\n').split('\n').map(line=>line.replace(/^%\s?/,''));return lines.map((line,i)=>(b.commentNote&&i===0?'% TeXFlow note: ':'% ')+line).join('\n');}
+ if(b.kind==='comment'){const lines=String(text||'').replace(/\r\n?/g,'\n').split('\n').map(line=>line.replace(/^%\s?/,''));if(b.commentTag&&lines.length)lines[0]=lines[0].replace(/^(?:TODO|FIXME)\b\s*/i,'');const first=b.commentNote?'% TeXFlow note: ':b.commentTag==='TODO'?'% TODO ':b.commentTag==='FIXME'?'% FIXME ':'% ';return lines.map((line,i)=>(i===0?first:'% ')+line).join('\n');}
  if(b.kind==='commentblock')return '\\begin{comment}\n'+String(text||'').replace(/\r\n?/g,'\n')+'\n\\end{comment}';
  return node.raw||'';
 }
 function bindDocumentRichBlock(el,node){const edit=el.querySelector('.doc-rich-edit');let saveEdit=null;if(edit){attachEditor(edit);const save=refresh=>updateDocumentNode(node,serializeRichDocumentBlock(node,editableLatex(edit)),refresh);saveEdit=save;edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}if(node&&node.block&&(node.block.kind==='comment'||node.block.kind==='commentblock')){const key=reviewDocumentKey(node);if(node.block.kind==='commentblock'){const toggle=el.querySelector('.review-edit-source');if(toggle&&edit)toggle.onclick=e=>{e.preventDefault();e.stopPropagation();const editing=el.classList.contains('review-editing');if(editing){if(saveEdit)flushSave(edit,saveEdit);el.classList.remove('review-editing');toggle.textContent='Edit source';toggle.title='Edit the preserved LaTeX inside this commented-out block';}else{reviewCollapsedItems.delete(key);el.classList.remove('review-collapsed');const collapse=el.querySelector('.review-card-collapse');if(collapse){collapse.textContent='−';collapse.title='Collapse';}el.classList.add('review-editing');toggle.textContent='Done';toggle.title='Return to visual preview';edit.focus();}};}bindReviewCardControls(el,key,()=>vscode.postMessage({type:'deleteReviewDocumentNode',start:Number(node.start),end:Number(node.end),expected:String(node.raw||'')}));return;}bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));}
 
+function headingLatex(command,starred,title){return '\\'+String(command||'section')+(starred?'*':'')+'{'+String(title||'')+'}';}
 function bindVisualDocument(host){
  bindVisualNavigationSpine(host);
  const flow=parseDocumentFlow();const byId={};flow.forEach(x=>byId[x.id]=x);
- host.querySelectorAll('.doc-heading[contenteditable=true]').forEach(el=>{const node=byId[el.dataset.nodeId];attachEditor(el);bindDocumentTextNavigation(el);let exiting=false;const save=(refresh,feature='')=>{const text=editableLatex(el).replace(/\n+/g,' ').trim();updateDocumentNode(node,'\\'+node.command+(node.starred?'*':'')+'{'+text+'}',refresh,feature);};el.__texflowSaveNow=()=>save(false);const toggle=el.querySelector('.doc-heading-numbered-toggle');if(toggle){toggle.addEventListener('mousedown',e=>{e.stopPropagation();});toggle.addEventListener('click',e=>{e.stopPropagation();});toggle.addEventListener('change',e=>{e.stopPropagation();const wantsNumber=!!toggle.checked;if(!wantsNumber&&node.label){toggle.checked=true;vscode.postMessage({type:'showWarning',message:'This heading has label '+node.label+'. Remove the label before making the heading unnumbered.'});return;}node.starred=!wantsNumber;save(true,'heading-numbering');});}el.addEventListener('input',e=>{if(e.target&&e.target.closest&&e.target.closest('[data-texflow-ui="true"]'))return;scheduleSave(el,save);});el.addEventListener('blur',()=>{if(exiting){exiting=false;return;}flushSave(el,save);});el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const old=saveTimers.get(el);if(old)clearTimeout(old);exiting=true;save(false);const next=el.nextElementSibling;if(next&&next.classList&&next.classList.contains('doc-paragraph'))focusParagraphStart(next);else createSyntheticParagraphAfter(el,node,'');}});});
+ host.querySelectorAll('.doc-heading[contenteditable=true]').forEach(el=>{const node=byId[el.dataset.nodeId];attachEditor(el);bindDocumentTextNavigation(el);let exiting=false;const save=(refresh,feature='')=>{const text=editableLatex(el).replace(/\n+/g,' ').trim();updateDocumentNode(node,headingLatex(node.command,node.starred,text),refresh,feature);};el.__texflowSaveNow=()=>save(false);const toggle=el.querySelector('.doc-heading-numbered-toggle');if(toggle){toggle.addEventListener('mousedown',e=>{e.stopPropagation();});toggle.addEventListener('click',e=>{e.stopPropagation();});toggle.addEventListener('change',e=>{e.stopPropagation();const wantsNumber=!!toggle.checked;if(!wantsNumber&&node.label){toggle.checked=true;vscode.postMessage({type:'showWarning',message:'This heading has label '+node.label+'. Remove the label before making the heading unnumbered.'});return;}node.starred=!wantsNumber;save(true,'heading-numbering');});}el.addEventListener('input',e=>{if(e.target&&e.target.closest&&e.target.closest('[data-texflow-ui="true"]'))return;scheduleSave(el,save);});el.addEventListener('blur',()=>{if(exiting){exiting=false;return;}flushSave(el,save);});el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const old=saveTimers.get(el);if(old)clearTimeout(old);exiting=true;save(false);const next=el.nextElementSibling;if(next&&next.classList&&next.classList.contains('doc-paragraph'))focusParagraphStart(next);else createSyntheticParagraphAfter(el,node,'');}});});
  host.querySelectorAll('.doc-paragraph[contenteditable=true]').forEach(el=>bindDocumentParagraph(el,byId[el.dataset.nodeId]));bindMultiParagraphMouseSelection(host);host.querySelectorAll('.doc-toc-row[data-target]').forEach(el=>el.addEventListener('click',()=>{const target=host.querySelector('#'+el.dataset.target)||document.getElementById(el.dataset.target);if(target)target.scrollIntoView({behavior:'smooth',block:'start'});}));
  host.querySelectorAll('.doc-include-open[data-uri]').forEach(el=>el.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();vscode.postMessage({type:'openIncludedSource',uri:el.dataset.uri||'',target:el.dataset.target||''});}));
  host.querySelectorAll('.doc-list').forEach(list=>bindDocumentList(list,byId[list.dataset.nodeId]));
