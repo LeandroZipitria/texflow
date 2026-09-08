@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.20.0 — 2026-09-08
+
+### Added
+
+- Project-aware Visual editing across `\input` and `\include` files while preserving every `.tex` file separately.
+- Explicit master-document and active-document behavior for multi-file editing and compilation.
+- Project-wide label/reference indexing with navigation and missing, duplicate, and unused-label diagnostics.
+- Project-wide bibliography indexing with search by key, author/editor, title, and year/date.
+- Citation ↔ bibliography navigation plus missing, duplicate, and unused bibliography diagnostics.
+- **View → Project Issues** as a user-facing project-wide issue list.
+- Compact **Equation...**, **Matrix...**, and **System...** insertion/editing workflows.
+- Semantic numbered/unnumbered transformations including safe `align` ↔ `align*` and `section` ↔ `section*` round trips.
+- Conservative configurable custom-environment support through `texflow.customEnvironments`.
+- Beamer frame duplication, move up/down, disable, and restore operations.
+- TikZ semantic support with **Insert → TikZ figure...**, inline source editing, PDF preview, Source navigation, Figure properties, and **Make figure** for bare `tikzpicture` environments.
+- Comment types for Comment, TODO, FIXME, and Author note, with previous/next navigation.
+- Location-aware Visual ↔ Source switching, **Visual here**, and **Open in VS Code** source navigation.
+- Focus mode and persistent resizable project/document sidebar.
+- Behavioral regression coverage for numbered math, starred headings, TikZ wrapping, TODO/FIXME serialization, active-vs-master edits, and TikZ temporary lifecycle.
+
+### Improved
+
+- Project Navigator now shows real project files separately from active-document structure and displays paths relative to the master-project folder.
+- Project-index construction is faster for label-heavy projects without introducing a cache or changing index semantics.
+- Article presentation is cleaner and less card-like.
+- Beamer Visual mode reads more like a slide while retaining explicit overflow feedback when needed.
+- Top-level menus are simpler: the separate **Layout** and **Language** menus were removed, with Document settings moved to **File**, spacing/breaks to **Insert**, and language/spell checking to **Format**.
+- **View** now exposes clearer Document outline and Focus state.
+- Figure/Table/Structure entry points were simplified while preserving conservative source behavior.
+- TODO/FIXME edits now preserve their source tag instead of degrading to ordinary comments.
+- Visual edits to included files continue to target the active document while project-wide metadata and PDF compilation use the master document where appropriate.
+
+### Architecture and lifecycle
+
+- Removed the deprecated `ProjectModel.root` compatibility alias and all `project.root` usage.
+- Preserved a single shared semantic `parseBlocks` implementation; no parallel parser or universal AST was introduced.
+- TikZ preview temporaries are now session-scoped and cleaned conservatively.
+- TeXFlow waits for in-flight TikZ preview compilation and preserves temporary PDFs while they remain open in VS Code.
+- Startup cleanup only removes recognizable abandoned TeXFlow preview directories and does not delete unrelated temporary files.
+
+### Performance and packaging
+
+- Build D profiling identified the project index as the only clear optimization target; parser, spellcheck, activation, TikZ caching, and memory behavior were left unchanged where measurements did not justify extra complexity.
+- Pre-release packaging remained approximately 2.4 MB with about 1,174 files before final documentation/version deltas.
+- Only the English and Spanish cspell dictionaries are packaged.
+- The generic `vsce` bundling warning was evaluated, but no new bundler was introduced because the measured package/runtime trade-off did not justify the added build complexity.
+
+### Notes
+
+TeXFlow `0.20.0` is the first release in which multi-file project awareness, project-wide LaTeX intelligence, structured object editing, Beamer frame operations, TikZ integration, and source-aware navigation are designed to work together as one coherent editor. The `.tex` and `.bib` files remain canonical throughout.
+
+
 ## 0.19.0 — 2026-09-06
 
 ### Added
