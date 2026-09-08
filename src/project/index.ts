@@ -145,30 +145,38 @@ function splitKeys(value: string): string[] {
   return String(value || '').split(',').map(x => x.trim()).filter(Boolean);
 }
 
-function labelTargetKind(masked: string, key: string, start: number): string {
+interface LabelEnvironmentContext {
+  index: number;
+  command: 'begin' | 'end';
+  environment: string;
+}
+
+interface LabelHeadingContext {
+  index: number;
+  end: number;
+  command: string;
+}
+
+function labelTargetKind(
+  masked: string,
+  key: string,
+  start: number,
+  lastEnvironment?: LabelEnvironmentContext,
+  lastHeading?: LabelHeadingContext
+): string {
   const prefix = String(key || '').split(':', 1)[0].toLowerCase();
   if (['eq', 'equation'].includes(prefix)) return 'equation';
   if (['fig', 'figure'].includes(prefix)) return 'figure';
   if (['tab', 'table'].includes(prefix)) return 'table';
   if (['sec', 'section', 'subsec', 'chap', 'chapter'].includes(prefix)) return 'section';
 
-  const before = masked.slice(0, start);
-  const envMatches = [...before.matchAll(/\\(begin|end)\{(equation\*?|align\*?|gather\*?|multline\*?|figure|table)\}/g)];
-  if (envMatches.length) {
-    const last = envMatches[envMatches.length - 1];
-    if (last[1] === 'begin') {
-      const env = last[2].replace(/\*$/, '');
-      if (['equation', 'align', 'gather', 'multline'].includes(env)) return 'equation';
-      return env;
-    }
+  if (lastEnvironment?.command === 'begin') {
+    const env = lastEnvironment.environment.replace(/\*$/, '');
+    if (['equation', 'align', 'gather', 'multline'].includes(env)) return 'equation';
+    return env;
   }
 
-  const headings = [...before.matchAll(/\\(chapter|section|subsection|subsubsection|paragraph)\*?\{[^}]*\}/g)];
-  if (headings.length) {
-    const last = headings[headings.length - 1];
-    const end = (last.index ?? 0) + last[0].length;
-    if (/^\s*$/.test(masked.slice(end, start))) return last[1];
-  }
+  if (lastHeading && /^\s*$/.test(masked.slice(lastHeading.end, start))) return lastHeading.command;
   return 'label';
 }
 
@@ -208,8 +216,39 @@ export function buildProjectIndex(
       });
     }
 
+    const environmentContexts: LabelEnvironmentContext[] = [];
+    const environmentContextRe = /\\(begin|end)\{(equation\*?|align\*?|gather\*?|multline\*?|figure|table)\}/g;
+    while ((match = environmentContextRe.exec(masked))) {
+      environmentContexts.push({
+        index: match.index,
+        command: match[1] as 'begin' | 'end',
+        environment: match[2]
+      });
+    }
+
+    const headingContexts: LabelHeadingContext[] = [];
+    const headingContextRe = /\\(chapter|section|subsection|subsubsection|paragraph)\*?\{[^}]*\}/g;
+    while ((match = headingContextRe.exec(masked))) {
+      headingContexts.push({
+        index: match.index,
+        end: headingContextRe.lastIndex,
+        command: match[1]
+      });
+    }
+
+    let environmentContextIndex = 0;
+    let headingContextIndex = 0;
+    let lastEnvironmentContext: LabelEnvironmentContext | undefined;
+    let lastHeadingContext: LabelHeadingContext | undefined;
     const labelRe = /\\label\{([^}]+)\}/g;
     while ((match = labelRe.exec(masked))) {
+      while (environmentContextIndex < environmentContexts.length && environmentContexts[environmentContextIndex].index < match.index) {
+        lastEnvironmentContext = environmentContexts[environmentContextIndex++];
+      }
+      while (headingContextIndex < headingContexts.length && headingContexts[headingContextIndex].index < match.index) {
+        lastHeadingContext = headingContexts[headingContextIndex++];
+      }
+
       const key = String(match[1] || '').trim();
       if (!key) continue;
       index.labels.push({
@@ -219,7 +258,7 @@ export function buildProjectIndex(
         end: labelRe.lastIndex,
         context: contextAround(source, match.index, labelRe.lastIndex),
         key,
-        targetKind: labelTargetKind(masked, key, match.index)
+        targetKind: labelTargetKind(masked, key, match.index, lastEnvironmentContext, lastHeadingContext)
       });
     }
 

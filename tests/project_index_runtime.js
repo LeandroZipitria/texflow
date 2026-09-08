@@ -50,6 +50,25 @@ ok(index.figures.some(x => x.path === 'figures/result' && x.uri.endsWith('/resul
 ok(index.includes.length === 1 && index.includes[0].targetUri.endsWith('/results.tex'), 'include relationship indexed');
 ok(index.bibliographyEntries.length === 2 && index.bibliographyEntries[0].uri.endsWith('/refs.bib'), 'bibliography locations preserved');
 
+const contextualIndex = buildProjectIndex([{
+  uri: 'file:///project/context.tex',
+  label: 'context.tex',
+  text: String.raw`\section{Unprefixed section}\label{plainSection}
+\begin{align*}
+  a &= b \label{plainEquation}
+\end{align*}
+\begin{figure}
+  \includegraphics{figure.pdf}
+  \label{plainFigure}
+\end{figure}
+Text before \label{plainGeneric}`
+}]);
+const contextualKinds = Object.fromEntries(contextualIndex.labels.map(label => [label.key, label.targetKind]));
+ok(contextualKinds.plainSection === 'section', 'unprefixed heading label keeps section context');
+ok(contextualKinds.plainEquation === 'equation', 'unprefixed align label keeps equation context');
+ok(contextualKinds.plainFigure === 'figure', 'unprefixed figure label keeps figure context');
+ok(contextualKinds.plainGeneric === 'label', 'unprefixed prose label remains generic');
+
 const masked = maskLatexComments('a% hidden\n\\label{ok}');
 ok(masked.length === 'a% hidden\n\\label{ok}'.length, 'comment masking preserves offsets');
 ok(masked.includes('\\label{ok}'), 'non-comment text preserved');
