@@ -12,17 +12,32 @@ Thanks for helping improve TeXFlow.
 
 ```bash
 npm ci
-npm run compile
-bash tests/run_fixtures.sh
+npm run check:fast
+```
+
+Run the full regression gate, including LaTeX fixtures, with:
+
+```bash
+npm run check
 ```
 
 ## Tests
 
-- Add a reproducible fixture for every bug that can be modeled with a `.tex` file.
+- Add a reproducible fixture or behavioral regression test for every bug that can be modeled reliably.
 - Keep private or manual documents out of `tests/`.
 - Prefer small regression fixtures with clear expected behavior.
+- Preserve the distinction between `masterDocument` and `activeDocument` in multi-file tests.
+- Do not weaken stale-source guards to make a test pass.
 
 ## Packaging
+
+Use the release gate when preparing a package:
+
+```bash
+npm run check:release
+```
+
+For packaging only:
 
 ```bash
 npm run package
@@ -30,6 +45,7 @@ npm run package
 
 ## Notes
 
-- Do not commit temporary build outputs.
 - Keep changes focused and reproducible.
-
+- Do not commit temporary build outputs or TikZ preview files.
+- Preserve unsupported LaTeX rather than broadening parsing without a safe serialization model.
+- Measure performance before adding caches, bundlers, or broad architectural changes.

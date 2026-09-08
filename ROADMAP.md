@@ -2,46 +2,40 @@
 
 TeXFlow is a visual editor for LaTeX inside VS Code.
 
-The `.tex` file remains the source of truth. TeXFlow provides a visual layer for writing and editing documents, presentations, mathematics, citations, figures, tables, and structure without hiding or replacing the underlying LaTeX.
+The `.tex` file remains the source of truth. TeXFlow provides a visual layer for writing and editing documents, presentations, mathematics, citations, figures, tables, comments, and structure without hiding or replacing the underlying LaTeX.
 
-This document collects possible directions for future development. It is intentionally broader than a release plan: features are grouped by area and are not yet assigned to specific versions.
+This document collects possible directions for future development. It is intentionally broader than a release plan: features are grouped by area and are not assigned automatically to specific versions.
 
 ---
 
 ## Current baseline
 
-Stable release: **v0.19.0**
+Stable release: **v0.20.0**
 
 The current release includes, among other features:
 
 - visual editing of LaTeX documents inside VS Code;
-- Beamer support;
-- blocks and columns;
-- display math inside blocks;
-- frame-level text sizes;
-- citations;
-- labels and references;
-- figures;
-- tables;
-- mathematics editing;
-- source preservation and round-trip editing;
+- article/report/book and Beamer workflows;
+- project-aware Visual editing across `\input` and `\include` files;
+- explicit `masterDocument` / `activeDocument` semantics;
+- a project navigator that lists real project files separately from document structure;
+- project-relative file labels and a resizable persistent project/document sidebar;
+- project-wide labels, references, bibliography indexes, and diagnostics;
+- Project Issues for missing, duplicate, and unused references/bibliography items;
+- cross-file navigation between Visual targets and project sources;
+- structured Equation / Matrix / System editing;
+- semantic numbered/unnumbered math and heading transformations;
+- figures, subfigures, and tables including CSV/TSV paste;
+- TikZ insertion, Figure properties, inline source editing, PDF preview, Source navigation, and bare-picture → Figure promotion;
+- Beamer frame duplication, movement, disable/restore, blocks, columns, and frame options;
+- comments, TODO, FIXME, Author note, commented-out blocks, and comment navigation;
+- Visual ↔ Source location-aware switching;
 - local spell checking in English and Spanish;
-- automatic/manual language selection for spell checking;
-- Beamer frame thumbnails and section/subsection navigation;
-- visual document outline for standard documents;
-- click-to-navigate document structure;
-- figures, tables, and equations in the standard-document outline;
-- TeXFlow entry point in the VS Code Activity Bar;
-- start screen for creating or opening documents;
-- creation of standalone `.tex` files;
-- creation of LaTeX project folders with `main.tex`, `preamble.tex`, and `figures/`;
-- project navigator for `.tex`, `.bib`, and supported figure files;
-- Explorer context actions for creating and opening TeXFlow documents;
-- multi-file project awareness for `\input` and `\include`, including nested files, missing includes, cycles, and main-document identification;
-- document search in Visual mode with highlighted matches and next/previous navigation, including across Beamer frames;
-- source comments, author notes, and commented-out blocks represented by compact visual markers;
-- a bottom comments inspector that stays outside the document/page/slide layout;
-- insertion of comments and notes plus conversion of selected text into commented-out content.
+- Focus mode and simplified menus/presentation;
+- conservative custom-environment support;
+- source preservation and round-trip editing;
+- session-scoped TikZ preview temporaries with conservative cleanup;
+- optimized project-index construction without adding cache complexity.
 
 Validated functionality from the current baseline should not be reopened unless a new feature requires it or a reproducible bug is found.
 
@@ -79,6 +73,8 @@ Grammar and style correction should remain a separate problem.
 
 ## AI-assisted writing
 
+**Status: future**
+
 AI features should be optional and explicitly invoked by the user.
 
 Possible actions on selected text:
@@ -102,31 +98,30 @@ Any external AI integration should be explicit, configurable, and opt-in.
 
 ## Comments and notes
 
-**Status: partially implemented**
+**Status: implemented core workflow**
 
 Current support includes:
 
-- detection of ordinary LaTeX `%` source comments;
-- TeXFlow author notes using `% TeXFlow note: ...`;
-- detection and preservation of `comment` environments;
-- insertion of source comments, author notes, and commented-out blocks;
+- ordinary LaTeX `%` source comments;
+- Comment, TODO, FIXME, and Author note objects;
+- preserved `comment` environments;
+- insertion of notes and commented-out blocks;
 - conversion of selected Visual text into commented-out content;
-- compact `C` markers anchored to the relevant document location without consuming document or slide height;
-- a bottom comments inspector outside the page/slide layout;
+- compact source-backed markers outside the document/slide flow;
+- a bottom comments inspector;
+- previous/next navigation through comments in document order;
 - visual previews for commented-out LaTeX;
-- explicit visual-only hiding of comment markers;
+- visual-only hiding of comment markers;
 - explicit source deletion with confirmation;
-- visibility controls under **View**;
-- Beamer-safe handling when TeXFlow creates a `comment` environment inside a frame.
+- Beamer-safe comment handling;
+- TODO/FIXME tag preservation during editing.
 
 Possible future improvements:
 
-- navigation through all comments/notes in document order;
 - richer aggregation when multiple comments share the same location;
-- TODO and FIXME navigation;
-- support for `todonotes`, including `\todo{}`, `\todo[inline]{}`, and `\missingfigure{}`;
 - optional comment filtering;
-- improved comment editing workflows.
+- support for `todonotes`, including `\todo{}`, `\todo[inline]{}`, and `\missingfigure{}`;
+- richer review metadata if a clear use case appears.
 
 Comments should remain outside the main visual document flow so they do not crowd pages or change Beamer slide layout.
 
@@ -138,9 +133,9 @@ TeXFlow should not attempt to reproduce a full Word-style track-changes system u
 
 ## Document outline
 
-**Status: partially implemented**
+**Status: implemented for navigation; structural editing remains partial**
 
-Current support for standard documents includes:
+Current standard-document support includes:
 
 - chapters where applicable;
 - sections;
@@ -152,7 +147,7 @@ Current support for standard documents includes:
 - equations;
 - associated labels where available.
 
-Current support for Beamer includes:
+Current Beamer support includes:
 
 - source files;
 - sections;
@@ -161,6 +156,8 @@ Current support for Beamer includes:
 - frame thumbnails;
 - collapsible navigation groups;
 - click-to-navigate.
+
+The sidebar also distinguishes real **Project Files** from the structure of the active document. Project paths are displayed relative to the master-project folder and the sidebar width is resizable and persistent.
 
 Possible future improvements:
 
@@ -172,42 +169,17 @@ Possible future improvements:
 - duplicate;
 - drag and drop.
 
-Example:
-
-```text
-Introduction
-  Motivation
-  Literature
-Model
-  Assumptions
-  Equilibrium
-  Equation: eq:model
-Results
-  Figure: Price dispersion
-  Table: Main estimates
-Conclusion
-```
-
-For Beamer:
-
-```text
-Introduction
-  Frame 1
-  Frame 2
-Model
-  Frame 3
-  Frame 4
-Results
-  Frame 5
-```
-
 Structural editing actions should be introduced incrementally because they modify source ranges and therefore carry more source-preservation risk than read-only navigation.
+
+### Minor UI polish
+
+- align the sidebar resize hit area exactly with the visible vertical divider so resize is immediately discoverable.
 
 ---
 
 ## Search and navigation
 
-**Status: partially implemented**
+**Status: implemented for document search and core source/project navigation**
 
 Current support includes:
 
@@ -217,35 +189,45 @@ Current support includes:
 - a distinct active match;
 - next/previous navigation;
 - Enter / Shift+Enter navigation;
-- search across Beamer frames.
+- search across Beamer frames;
+- Visual → Source location mapping;
+- Source → Visual via **Visual here**;
+- explicit **Open in VS Code** source action;
+- cross-file Visual navigation within a project;
+- reference and citation target navigation.
 
 Possible future improvements:
 
-- project-wide search;
-- search headings;
-- search labels;
-- search citations;
-- search equations;
-- navigate between figures and tables;
-- jump directly from a visual element to its LaTeX source;
-- optional replace workflow after source-preservation behavior is defined.
+- project-wide free-text search;
+- search headings as a dedicated mode;
+- search equations/figures/tables by semantic type;
+- optional replace workflow beyond the current conservative literal operation;
+- stronger cursor/selection preservation for complex transitions.
 
 ---
 
 # Visual ↔ Source ↔ PDF workflow
 
-A central long-term objective should be strong synchronization between the three representations of the document:
+**Status: Visual ↔ Source implemented; PDF synchronization remains future**
+
+A central long-term objective remains strong synchronization between the three representations of the document:
 
 **Visual ↔ LaTeX source ↔ PDF**
 
-Possible improvements:
+Current support includes:
 
 - visual element → corresponding source;
-- source → corresponding visual element;
+- source → corresponding visual element where the structure can be mapped safely;
+- cross-file source/Visual navigation;
+- master-document PDF compilation while editing included files;
+- TikZ visual/source/preview workflow.
+
+Possible future improvements:
+
 - visual element → corresponding PDF position;
 - PDF → corresponding source;
 - improved SyncTeX integration;
-- preserve cursor and selection when switching views;
+- stronger cursor and selection preservation when switching views;
 - preserve scroll position where possible.
 
 This could become one of TeXFlow's defining capabilities.
@@ -256,21 +238,25 @@ This could become one of TeXFlow's defining capabilities.
 
 ## Labels and cross-references
 
-Improve handling of labels and references.
+**Status: implemented core project-wide workflow**
 
-Possible features:
+Current support includes:
 
-- autocomplete existing labels;
-- preview the target associated with a label;
-- detect missing references;
-- detect duplicate labels;
-- navigate from `\ref` to target;
-- navigate from target to references;
-- support different reference commands:
-  - `\ref`;
-  - `\eqref`;
-  - `\autoref`;
-  - `\cref`.
+- project-wide label index;
+- searchable label picker;
+- missing-reference detection;
+- duplicate-label detection;
+- unused-label detection;
+- navigation from reference to target;
+- navigation to source locations;
+- common commands including `\ref`, `\eqref`, `\autoref`, `\cref`, and related preserved variants.
+
+Possible future improvements:
+
+- richer preview of the target associated with a label;
+- dedicated target → all references inspector;
+- semantic filtering by equation/figure/table/section;
+- better display names for unlabeled structural targets.
 
 The interface should simplify references without hiding their underlying LaTeX representation.
 
@@ -278,34 +264,50 @@ The interface should simplify references without hiding their underlying LaTeX r
 
 ## Bibliography and citations
 
-Expand bibliography support while avoiding the creation of a separate reference manager.
+**Status: implemented core project-wide workflow**
 
-Possible features:
+Current support includes:
 
-- search bibliography entries;
-- preview author, year, title, and journal;
-- insert multiple citations;
-- support common citation commands;
-- detect missing citation keys;
-- identify bibliography entries not currently cited;
-- navigate citation → BibTeX entry;
-- navigate BibTeX entry → citations;
+- project bibliography indexing;
+- search by key, author/editor, title, year/date;
+- missing citation-key detection;
+- duplicate bibliography-key detection;
+- unused-entry detection;
+- citation → bibliography navigation;
+- bibliography entry → citation usage navigation;
+- inline `\bibitem` indexing;
+- support for common BibTeX/natbib and BibLaTeX/biber setups.
+
+Possible future improvements:
+
+- richer formatted previews;
+- more advanced multiple-citation editing;
+- bibliography-entry editing with explicit source-preservation rules;
 - optional future Zotero integration.
+
+TeXFlow should avoid becoming a separate reference manager.
 
 ---
 
 ## Compilation diagnostics
 
-Improve how LaTeX errors and warnings are presented.
+**Status: partially implemented**
 
-Possible features:
+Current support includes:
 
-- errors associated with the relevant visual element;
-- warnings associated with a frame, paragraph, equation, table, or figure;
-- simplified explanation of common LaTeX errors;
-- "Open source" action;
-- navigate directly to the problematic source location;
-- distinguish errors from warnings.
+- earlier detection of fatal compilation failures;
+- direct handling of common missing-file failures;
+- Project Issues for project/index problems;
+- technical project diagnostics;
+- source navigation for many detected issues.
+
+Possible future improvements:
+
+- associate LaTeX errors/warnings with the relevant visual element;
+- simplified explanations of common LaTeX errors;
+- stronger warning/error distinction in Visual;
+- direct source navigation from compiler diagnostics;
+- optional grouping by file/frame/object.
 
 TeXFlow should avoid silently rewriting the source to fix errors automatically.
 
@@ -313,42 +315,32 @@ TeXFlow should avoid silently rewriting the source to fix errors automatically.
 
 # Mathematics
 
-## Advanced equation editor
+## Structured equation editor
 
-Extend the current mathematics editor.
+**Status: implemented core workflow**
 
-Possible additions:
+Current support includes:
 
-- fractions;
-- superscripts and subscripts;
-- integrals;
-- sums;
-- products;
-- limits;
-- delimiters;
-- cases;
-- matrices;
+- Equation / Matrix / System entry points;
+- inline/display placement;
+- numbered/unnumbered forms;
+- single equations;
 - aligned equations;
-- numbered and unnumbered equations;
-- common mathematical symbols.
+- gathered/multiline structures;
+- cases;
+- common matrices and delimiters;
+- labels;
+- row-level numbering behavior where applicable;
+- common symbols and accents;
+- safe `align` ↔ `align*` round trips.
 
-Matrices could eventually have a small grid-based visual editor.
+Possible future improvements:
 
----
-
-## Equation structure
-
-Current support already includes several structured mathematics workflows.
-
-Possible further improvements around:
-
-- `equation`;
-- `equation*`;
-- `align`;
-- `align*`;
-- `gather`;
-- `cases`;
-- matrix environments.
+- more direct visual editing of nested fractions/superscripts/subscripts;
+- richer matrix grid operations;
+- additional symbol groups;
+- more structured editing of deeply nested math;
+- optional math-to-LaTeX assistance.
 
 The source representation should always remain inspectable and editable.
 
@@ -356,55 +348,60 @@ The source representation should always remain inspectable and editable.
 
 # Tables
 
-## More powerful table editing
+## Table editing
 
-Possible improvements:
+**Status: implemented core workflow**
+
+Current support includes:
 
 - add/remove rows;
 - add/remove columns;
+- cell editing and keyboard navigation;
 - column alignment;
-- column width;
-- `booktabs`;
-- `tabularx`;
 - captions;
 - labels;
-- table positioning;
-- more robust preview.
+- placement;
+- caption position;
+- Booktabs;
+- CSV/TSV paste/import.
 
----
+Possible future improvements:
 
-## Paste tables from spreadsheets
+- column width controls;
+- `tabularx`;
+- `longtable`;
+- multirow/multicolumn structures;
+- richer preview and formatting controls.
 
-A particularly useful workflow:
-
-**Excel / Google Sheets / CSV → copy → paste → LaTeX table**
-
-Possible behavior:
-
-- detect tabular clipboard data;
-- preview the resulting table;
-- allow basic formatting choices;
-- generate the corresponding LaTeX;
-- preserve source transparency.
+Complex package-specific tables should remain preserved until they have a safe serialization model.
 
 ---
 
 # Figures
 
-## Improved figure editing
+## Figure editing
 
-Possible improvements:
+**Status: implemented core workflow**
+
+Current support includes:
+
+- unified image selection;
+- multiple-image routing to subfigures;
+- width;
+- rotation;
+- placement;
+- captions and short captions;
+- labels;
+- caption position;
+- relative project paths;
+- visual Figure properties.
+
+Possible future improvements:
 
 - drag and drop images;
-- visual width selector;
-- placement options;
-- captions;
-- labels;
-- preview;
-- relative paths;
-- subfigures;
-- `subcaption`;
-- multiple-panel figures.
+- richer subfigure editing after insertion;
+- simple multi-panel layout controls;
+- stronger figure/PDF synchronization.
 
 ---
 
@@ -412,22 +409,27 @@ Possible improvements:
 
 ## TikZ integration
 
-TikZ should initially be treated as source-driven graphics rather than as a full graphical editor.
+**Status: first source-driven stage implemented**
 
-First possible stage:
+Current support includes:
 
-- detect `tikzpicture`;
-- display a rendered preview;
-- open/edit TikZ source easily;
-- refresh preview after source changes.
+- detection of `tikzpicture`;
+- **Insert → TikZ figure...**;
+- Figure-style properties for wrapped TikZ;
+- inline TikZ source editing inside TeXFlow;
+- PDF preview beside the editor;
+- Source navigation;
+- **Make figure** for a bare `tikzpicture`;
+- session-scoped temporary preview lifecycle and conservative crash cleanup.
 
-Later possibilities:
+Possible future improvements:
 
 - TikZ snippets;
 - templates for common diagrams;
 - generated TikZ from structured prompts;
-- AI-assisted TikZ generation;
-- simple parameter controls for known diagram types.
+- optional AI-assisted TikZ generation;
+- simple parameter controls for known diagram types;
+- preview invalidation/caching only if profiling shows a real need and preamble dependencies are modeled correctly.
 
 A complete visual TikZ drawing application should not be an early objective because it would effectively become a separate product.
 
@@ -437,36 +439,22 @@ A complete visual TikZ drawing application should not be an early objective beca
 
 ## Insertable LaTeX components
 
-Possible menu:
+**Status: partially implemented**
 
-```text
-Insert
-  Theorem
-  Definition
-  Example
-  Proof
-  Equation
-  Figure
-  Table
-  Algorithm
-  Code block
-```
+Current Structure/Insert/Beamer menus already cover theorem/proof-style environments, equations, figures, tables, frames, blocks, and columns.
 
-For Beamer:
+Possible future additions:
 
-```text
-Frame
-  Title + text
-  Two columns
-  Figure + text
-  Block
-  Alert block
-  Equation
-```
+- code block;
+- algorithm;
+- reusable institutional structures;
+- richer Beamer frame templates such as figure + text or title + columns.
 
 ---
 
 ## User-defined snippets
+
+**Status: future**
 
 Allow users to define reusable LaTeX snippets or structures.
 
@@ -484,30 +472,19 @@ Possible uses:
 
 ## Custom LaTeX environments
 
-Allow TeXFlow to understand selected user-defined environments without hard-coding all of them into the core application.
+**Status: conservative first stage implemented**
 
-Example:
+TeXFlow supports configured simple custom environments through `texflow.customEnvironments` while preserving unsupported/complex instances as raw LaTeX.
 
-```latex
-\begin{theorem}
-...
-\end{theorem}
-```
+Possible future improvements:
 
-or a custom environment defined by a document class or package.
+- richer environment schemas;
+- configurable inline vs block behavior;
+- parameter/title mapping;
+- project-local environment configuration;
+- safer support for environments defined by document classes/packages.
 
-Possible future configuration:
-
-```json
-{
-  "mytheorem": {
-    "type": "block",
-    "title": "Theorem"
-  }
-}
-```
-
-This would make TeXFlow useful across a much wider range of LaTeX workflows.
+The core should not hard-code every possible LaTeX environment.
 
 ---
 
@@ -515,19 +492,23 @@ This would make TeXFlow useful across a much wider range of LaTeX workflows.
 
 ## Visual document settings
 
-Expose common document options in a controlled interface.
+**Status: implemented for common settings**
 
-Possible settings:
+**File → Document settings...** exposes controlled settings such as:
 
-```text
-Document class   article
-Language         Spanish
-Paper size       A4
-Font size        11pt
-Bibliography     biblatex
-```
+- common paper, font, spacing, and preamble options;
+- language;
+- paper size/orientation;
+- font size;
+- line/paragraph spacing;
+- margins;
+- alignment;
+- columns;
+- hyperlinks;
+- Beamer aspect/theme;
+- raw preamble access.
 
-Advanced or unusual settings should remain accessible through the source.
+Advanced or unusual settings remain accessible through Source.
 
 The visual settings panel should never attempt to replace the full LaTeX preamble.
 
@@ -537,44 +518,33 @@ The visual settings panel should never attempt to replace the full LaTeX preambl
 
 ## Multi-file LaTeX projects
 
-**Status: partially implemented**
-
-Support larger projects using:
-
-- `\input`;
-- `\include`;
-- master documents;
-- multiple `.tex` files;
-- shared bibliography files;
-- cross-file labels and references.
+**Status: core project-aware editing implemented**
 
 Current support includes:
 
-- detection of `\input` and `\include`;
-- nested project relationships;
-- main-document awareness;
-- included-file relationships in the Project Navigator;
-- visual include/missing-include indicators;
-- safe handling of circular and missing includes;
-- faster reporting of fatal compilation failures involving missing project files.
-
-Included `.tex` files remain separate source files. Project-wide visual editing, project-wide outline, labels, references, and structural editing across files remain future work.
-
-Possible features:
-
-- project-wide outline;
-- navigate between files in Visual mode;
-- explicit active-document vs master-document model;
+- `\input` and `\include` discovery;
+- nested include graph;
+- explicit master document;
+- explicit active document;
+- missing includes and include cycles;
+- real project files kept separate;
+- Visual editing of included `.tex` files;
+- project-relative file navigation;
 - project-wide labels and references;
-- visual editing while preserving the original project structure.
+- project-wide bibliography indexing;
+- project-wide diagnostics and Project Issues;
+- cross-file navigation;
+- master-document compilation while editing an include.
 
-This would be important for:
+Possible future improvements:
 
-- theses;
-- books;
-- large papers;
-- course notes;
-- long Beamer projects.
+- project-wide outline combining multiple files;
+- reorder/move structures across files with explicit source-preservation rules;
+- stronger project-wide free-text search;
+- richer master-document selection/override controls where automatic identification is ambiguous;
+- larger-project performance profiling on real books/theses.
+
+This remains important for theses, books, large papers, course notes, and long Beamer projects.
 
 ---
 
@@ -582,19 +552,36 @@ This would be important for:
 
 ## Advanced presentation workflow
 
-Current support already includes frame thumbnails, section/subsection navigation, search across frames, and comments that do not consume slide layout.
+**Status: implemented core frame operations**
 
-Possible improvements:
+Current support includes:
 
-- reorder frames by drag and drop;
+- frame thumbnails;
+- section/subsection navigation;
+- search across frames;
 - duplicate frame;
-- comment/uncomment frame;
-- frame preview refinements;
-- presenter notes.
+- move frame up/down;
+- disable/restore frame while preserving recoverable source;
+- blocks/alert/example blocks;
+- columns;
+- frame options;
+- frame-local text sizes;
+- comments that remain outside slide layout;
+- source-aware navigation;
+- a cleaner slide-like Visual presentation.
+
+Possible future improvements:
+
+- drag-and-drop frame reordering;
+- richer frame thumbnail previews;
+- presenter notes if a clear source representation is chosen;
+- direct slide/PDF synchronization.
 
 ---
 
 ## Overlays
+
+**Status: future**
 
 Possible later support for:
 
@@ -611,6 +598,8 @@ Overlay editing should be approached carefully because of the complexity of pres
 
 # AI for LaTeX
 
+**Status: future**
+
 Beyond writing assistance, AI could eventually help with LaTeX-specific tasks.
 
 Possible actions:
@@ -625,42 +614,68 @@ Possible actions:
 - transform selected content into a Beamer frame;
 - simplify complex LaTeX while preserving output.
 
-AI should not silently rewrite the document.
+AI should not silently rewrite the document. All modifications should remain reviewable before being applied.
 
-All modifications should remain reviewable before being applied.
+---
+
+# Performance and architecture
+
+## Current position
+
+`0.20.0` includes a targeted project-index optimization after measurement. Parser, spellcheck, TikZ caching, activation behavior, and packaging were deliberately not reworked where measurements did not justify the additional complexity.
+
+Possible future work:
+
+- profile real very-large projects;
+- revisit the project watcher only if workspace-scale measurements show a problem;
+- consider bundling only if install/activation/runtime measurements show material benefit;
+- continue extracting host/webview domains from `extension.ts` only when extraction has a clear safety or maintainability benefit;
+- avoid parallel parsers, speculative caches, and universal-AST rewrites.
+
+---
+
+# Packaging
+
+## Current position
+
+The `0.20.0` pre-release package remains small (about 2.4 MB before final documentation deltas) and includes only the English and Spanish cspell dictionaries.
+
+Possible future work:
+
+- evaluate bundling if measured benefits become material;
+- continue checking VSIX size/file count at release time;
+- avoid adding language dictionaries or runtime dependencies implicitly.
 
 ---
 
 # Possible product pillars
 
-The roadmap can be summarized into several broad areas:
-
 | Area | Examples |
 |---|---|
-| Writing | spellcheck, AI, comments and notes |
+| Writing | spellcheck, comments/notes, optional AI |
 | Structure | outline, navigation, structural editing |
 | LaTeX intelligence | references, bibliography, diagnostics |
 | Content | math, tables, figures, TikZ |
 | Workflow | Visual ↔ Source ↔ PDF |
 | Extensibility | custom environments, snippets |
-| Projects | multi-file documents |
-| Beamer | thumbnails, reordering, overlays |
+| Projects | multi-file editing and project-wide intelligence |
+| Beamer | frame operations, navigation, overlays |
 | AI | writing, LaTeX, math, TikZ |
 
 ---
 
 # Potential differentiators
 
-Several features could become particularly distinctive for TeXFlow:
+Several capabilities are becoming particularly distinctive for TeXFlow:
 
-1. **Visual ↔ Source ↔ PDF synchronization**
-2. **Document outline and structural editing**
-3. **Intelligent labels and cross-references**
-4. **TikZ preview and source integration**
-5. **Contextual AI operating on selected LaTeX content**
-6. **Visual editing while preserving `.tex` as the canonical source**
+1. **Visual editing across real multi-file LaTeX projects without flattening them**
+2. **Visual ↔ Source synchronization with explicit source preservation**
+3. **Project-wide labels, references, bibliography, and diagnostics**
+4. **TikZ preview/source integration inside a visual LaTeX workflow**
+5. **Document and Beamer structure presented without replacing the underlying source**
+6. **Optional future contextual AI operating on selected LaTeX content**
 
-The central principle should remain:
+The central principle remains:
 
 > TeXFlow does not replace LaTeX. It makes working directly with LaTeX easier.
 
@@ -673,13 +688,17 @@ Future features should preserve the following principles:
 - the `.tex` file remains canonical;
 - avoid source corruption;
 - preserve round-trip editing;
+- distinguish master-document and active-document scope explicitly;
 - prefer local/native capabilities before introducing new dependencies;
+- measure before optimizing;
 - avoid external services unless explicitly requested and configured;
 - do not silently modify source;
 - do not build functionality already provided well by VS Code or the operating system;
 - prefer incremental features over large architectural rewrites;
 - keep advanced LaTeX accessible;
-- avoid turning TeXFlow into a replacement for VS Code, LaTeX, Zotero, or a general-purpose graphics editor.
+- avoid turning TeXFlow into a replacement for VS Code, LaTeX, Zotero, or a general-purpose graphics editor;
+- keep the interface simple, comfortable, clear, and clean;
+- keep the document itself as the primary visual surface.
 
 ---
 
@@ -693,5 +712,7 @@ Features should be promoted into release plans only after:
 2. architecture review;
 3. source-preservation risk analysis;
 4. minimal prototype;
-5. manual or automated validation;
+5. automated/manual validation;
 6. decision on scope and version.
+
+`1.0.0` remains a separate product decision. Completing `0.20.0` does not automatically trigger a 1.0 release.

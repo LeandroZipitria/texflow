@@ -8,32 +8,36 @@
 
 TeXFlow is a visual editor for real LaTeX files inside VS Code. It lets you focus on writing while keeping your `.tex` files intact, editable, and fully accessible.
 
-**Current stable release: 0.19.0.**
+**Current stable release: 0.20.0.**
 
-TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` file remains the source of truth. When TeXFlow cannot safely edit a complex construct visually, it preserves the underlying LaTeX rather than silently rewriting it.
+TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files remain the source of truth. When TeXFlow cannot safely edit a complex construct visually, it preserves the underlying LaTeX rather than silently rewriting it.
 
 ## Highlights
 
 - Visual editing for `article`, `report`, `book`, and Beamer documents.
+- Project-aware Visual editing across `\input` and `\include` files while preserving every source file separately.
+- Explicit master-document and active-document handling for multi-file projects.
+- Project navigator with real `.tex`, `.bib`, and supported figure files; project-relative paths; and a resizable persistent sidebar.
+- Project-wide labels and cross-references, including navigation, missing references, duplicate labels, and unused labels.
+- Project-wide bibliography intelligence with search by citation key, author, title, and year; missing keys; unused entries; and citation/BibTeX navigation.
+- **Project Issues** for project-wide reference, bibliography, and include diagnostics.
 - Semantic paragraphs, headings, lists, and document structure.
 - Bold, italic, underline, color, and paragraph alignment.
-- Inline and display mathematics, equations, `align`, `gather`, `multline`, cases, and matrices.
-- Citations, bibliography workflows, labels, and cross-references.
-- Figures with captions, labels, resize, rotation, and subfigures.
-- Tables with row/column editing, alignment, captions, labels, Booktabs, and CSV/TSV import.
-- Document spacing, local columns, document settings, and raw preamble access.
-- Beamer frames, blocks, columns, frame options, and improved paragraph persistence.
-- Copy, cut, paste, duplicate, and move selected semantic objects.
+- Unified Equation, Matrix, and System workflows with inline/display placement, semantic numbering, aligned equations, cases, matrices, delimiters, and common accents/symbols.
+- Numbered/unnumbered structural editing, including safe `align` ↔ `align*` and `section` ↔ `section*` round trips.
+- Figures with captions, labels, resize, rotation, subfigures, and unified figure insertion.
+- Tables with row/column editing, alignment, captions, labels, Booktabs, and CSV/TSV paste/import.
+- TikZ figures with insertion, Figure properties, inline source editing, PDF preview, Source navigation, and promotion of a bare `tikzpicture` to a Figure.
+- Beamer frame operations including duplicate, move, disable/restore, blocks, columns, frame options, and frame-local text sizes.
+- Comments and notes with Comment, TODO, FIXME, Author note, commented-out blocks, and document-order navigation.
+- Visual ↔ Source navigation that preserves the relevant document location, including cross-file navigation.
 - Visual, Source, Split, and PDF workflows.
-- Local spell checking with English and Spanish dictionaries.
-- Automatic, English, and Español language modes for spell checking.
+- Local spell checking with English and Spanish dictionaries and automatic/manual language selection.
+- Focus mode, a cleaner document/slide presentation, and a simplified top-level menu structure.
+- Conservative support for configured custom environments.
 - Conservative preservation of unsupported LaTeX.
 - Start from TeXFlow — create a standalone `.tex` file or a LaTeX project directly from the TeXFlow sidebar.
-- Project navigator — browse relevant `.tex`, `.bib`, and figure files without leaving TeXFlow.
-- Multi-file project awareness — TeXFlow recognizes `\input` and `\include` relationships, nested source files, missing includes, and the main document while keeping every `.tex` file separate.
 - Document search in Visual mode with `Cmd/Ctrl+F`, highlighted matches, and next/previous navigation, including across Beamer frames.
-- Comments and notes that stay out of the document layout: compact `C` markers open a bottom inspector without crowding pages or slides.
-- Insert source comments and author notes, comment out selected text, and preserve commented-out LaTeX with visual previews and explicit source controls.
 
 ## Installation
 
@@ -67,6 +71,10 @@ https://marketplace.visualstudio.com/items?itemName=leandrozipitria.texflow
 5. Edit in Visual mode, or switch between Visual, Source, Split, and PDF.
 6. Compile with your local LaTeX toolchain.
 
+In multi-file projects, opening an included `.tex` file in TeXFlow keeps the master document for project-wide metadata and compilation while making the included file the active Visual editing target.
+
+TeXFlow saves accepted visual edits back to the active `.tex` source immediately, so ordinary Visual editing does not require a separate save step. Standard **Save** and **Save as...** actions remain available when needed.
+
 You can also right-click a folder in the VS Code Explorer to create a TeXFlow document there, or right-click a `.tex` file to open it with TeXFlow.
 
 ## Documentation
@@ -87,13 +95,19 @@ LyX is used only as a technical reference for structural-editing problems that m
 
 ```bash
 npm ci
-npm run compile
+npm run check:fast
 ```
 
-Run the regression fixtures with:
+Run the full regression gate, including LaTeX fixtures, with:
 
 ```bash
-bash tests/run_fixtures.sh
+npm run check
+```
+
+Create a release package with:
+
+```bash
+npm run check:release
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
