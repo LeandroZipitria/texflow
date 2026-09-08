@@ -173,4 +173,115 @@ z &= w`;
   assert(!src.includes('await updateDocumentRange(project.masterDocument,'), 'host update route must not target masterDocument');
 }
 
+
+// 6. Article comments/notes are visual overlays, not ordinary atomic document
+// objects. Their marker must not consume vertical space and is aligned to the
+// last visual line of the preceding paragraph/heading. A separate insertion
+// affordance may appear after a trailing note so writing can continue below it.
+{
+  const atomicFn = runFunction(
+    extractFunction('isAtomicDocumentBlockNode', 'documentAfterBlockSlotHtml'),
+    'isAtomicDocumentBlockNode'
+  );
+  assert.strictEqual(atomicFn({ kind: 'block', block: { kind: 'comment' } }), false, 'source comments must not become ordinary atomic visual blocks');
+  assert.strictEqual(atomicFn({ kind: 'block', block: { kind: 'commentblock' } }), false, 'comment environments must not become ordinary atomic visual blocks');
+  assert.strictEqual(atomicFn({ kind: 'block', block: { kind: 'figure' } }), true, 'real atomic visual objects must keep their insertion slot');
+  assert(src.includes('function alignDocumentCommentMarkers(host)'), 'article comments must have visual-line alignment logic');
+  assert(src.includes("target.matches('.doc-paragraph,.doc-heading')"), 'comment alignment must measure the preceding paragraph/heading text line');
+  assert(src.includes("targetCenter-anchorRect.top-markerHeight/2"), 'comment marker must be vertically centered on the measured visual line');
+}
+
+
+// 7. Notes/comments keep an explicit source-node anchor. Creating a new
+// paragraph must neither retarget the marker to that paragraph nor insert the
+// visual paragraph before the trailing review node.
+{
+  const helperSource = src.slice(
+    src.indexOf('function isDocumentReviewNode'),
+    src.indexOf('function documentAfterBlockSlotHtml')
+  );
+  const sandbox = { documentFlowOrder: [] };
+  vm.runInNewContext(
+    helperSource + '\nthis.isDocumentReviewNode=isDocumentReviewNode;this.documentReviewAnchorNode=documentReviewAnchorNode;this.documentNodeNeedsParagraphSlot=documentNodeNeedsParagraphSlot;',
+    sandbox
+  );
+  const p = { kind: 'block', id: 'p', start: 0, end: 4, block: { kind: 'paragraph' } };
+  const note = { kind: 'block', id: 'n', start: 6, end: 18, block: { kind: 'comment', commentTag: 'FIXME' } };
+  const heading = { kind: 'heading', id: 'h', start: 20, end: 34 };
+  const nextParagraph = { kind: 'block', id: 'p2', start: 20, end: 24, block: { kind: 'paragraph' } };
+  sandbox.documentFlowOrder = [p, note, heading];
+  assert.strictEqual(sandbox.isDocumentReviewNode(note), true);
+  assert.strictEqual(sandbox.documentReviewAnchorNode(note).id, 'p', 'note must retain the preceding source node as its visual anchor');
+  assert.strictEqual(sandbox.documentNodeNeedsParagraphSlot([p, note, heading], 1), true, 'trailing note before a heading needs a writing slot');
+  assert.strictEqual(sandbox.documentNodeNeedsParagraphSlot([p, note], 1), true, 'trailing note at document end needs a writing slot');
+  assert.strictEqual(sandbox.documentNodeNeedsParagraphSlot([p, note, nextParagraph], 1), false, 'existing paragraph after a note already provides the writing target');
+  assert(src.includes("const anchorAttr=anchorNodeId?' data-anchor-node-id=\"'+esc(anchorNodeId)+'\"':'';"), 'rendered article review markers must carry their explicit anchor node id');
+
+  // Regression for the observed UI failure: even if a newly-created synthetic
+  // paragraph becomes the marker's immediate previous DOM sibling, the marker
+  // must still resolve to the original paragraph by node id.
+  const paragraphEl = { id: 'paragraph' };
+  const syntheticEl = {
+    classList: { contains(name) { return name === 'doc-paragraph'; } },
+    previousElementSibling: null
+  };
+  const root = {
+    querySelector(selector) {
+      return selector === '[data-node-id="p"]' ? paragraphEl : null;
+    }
+  };
+  const anchorEl = {
+    dataset: { anchorNodeId: 'p' },
+    previousElementSibling: syntheticEl,
+    closest(selector) { return selector === '#content' ? root : null; }
+  };
+  const targetSandbox = {
+    document: root,
+    CSS: { escape(value) { return String(value); } }
+  };
+  const targetFn = runFunction(extractFunction('documentCommentAnchorTarget', 'documentCommentTargetRect'), 'documentCommentAnchorTarget', targetSandbox);
+  assert.strictEqual(targetFn(anchorEl), paragraphEl, 'marker must not jump to a new synthetic paragraph');
+
+  // Source order is authoritative for DOM insertion too. The trailing review
+  // element is found by its node id rather than by fragile sibling adjacency.
+  const source = 'Text\n\n% FIXME note\n\n\\section{Next}';
+  const pEnd = source.indexOf('\n');
+  const noteStart = source.indexOf('% FIXME');
+  const noteEnd = noteStart + '% FIXME note'.length;
+  const hStart = source.indexOf('\\section');
+  const pNode = { kind: 'block', id: 'p', start: 0, end: pEnd, block: { kind: 'paragraph' } };
+  const nNode = { kind: 'block', id: 'n', start: noteStart, end: noteEnd, block: { kind: 'comment' } };
+  const hNode = { kind: 'heading', id: 'h', start: hStart, end: source.length };
+  const commentEl = { id: 'comment' };
+  const domRoot = {
+    querySelector(selector) {
+      return selector === '.comment-anchor[data-node-id="n"]' ? commentEl : null;
+    }
+  };
+  const referenceEl = {
+    nextElementSibling: syntheticEl,
+    closest(selector) { return selector === '#content' ? domRoot : null; }
+  };
+  const tailSandbox = {
+    documentSource: source,
+    documentFlowOrder: [pNode, nNode, hNode],
+    isDocumentReviewNode: sandbox.isDocumentReviewNode,
+    document: domRoot,
+    CSS: { escape(value) { return String(value); } },
+    documentBodyInfo() { return { source, start: 0, end: source.length }; }
+  };
+  const tailHelpers =
+    src.slice(src.indexOf('function paragraphInsertionPoint'), src.indexOf('function focusParagraphStart')) + '\n' +
+    src.slice(src.indexOf('function documentReviewTailNode'), src.indexOf('function createSyntheticParagraphAfter'));
+  vm.runInNewContext(tailHelpers + '\nthis.documentReviewTailNode=documentReviewTailNode;this.documentReviewTailElement=documentReviewTailElement;this.paragraphInsertionPoint=paragraphInsertionPoint;', tailSandbox);
+  const tail = tailSandbox.documentReviewTailNode(pNode);
+  assert.strictEqual(tail.id, 'n', 'paragraph insertion must advance past its trailing note in source order');
+  assert.strictEqual(tailSandbox.documentReviewTailElement(referenceEl, pNode), commentEl, 'visual insertion must target the actual trailing note node, not the immediate sibling');
+  const point = tailSandbox.paragraphInsertionPoint(tail);
+  assert(point.anchor >= noteEnd, 'new paragraph source anchor must be after the note');
+  assert.strictEqual(point.anchor, hStart, 'existing blank separator after the note should be reused before the next heading');
+  assert(src.includes('documentReviewTailElement(referenceEl,node)'), 'synthetic paragraph creation must use review-aware DOM placement');
+  assert(src.includes('scheduleDocumentCommentMarkerAlignment(content)'), 'marker alignment must be refreshed after a synthetic paragraph is created');
+}
+
 console.log('PASS build_d_behavior_runtime');
