@@ -114,7 +114,7 @@ ok(!source.includes('pendingBeamerEnterFocus'), 'obsolete post-render Beamer car
 // ---------------------------------------------------------------------------
 ok(source.includes('.comment-anchor{position:relative;height:0!important'), 'comment anchors can still consume document height');
 ok(source.includes('.comment-marker{position:absolute'), 'compact C marker is missing');
-ok(source.includes('>C</button>') || source.includes(">C</button>'"), 'C marker rendering is missing');
+ok(source.includes("const glyph=kind==='todo'?'T':kind==='fixme'?'F':'C'"), 'C/T/F marker rendering is missing');
 
 ok(source.includes('.comment-inspector{position:fixed'), 'comment inspector is not outside document flow');
 ok(source.includes('bottom:0'), 'comment inspector is not anchored at the bottom');

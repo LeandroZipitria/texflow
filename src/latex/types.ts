@@ -17,6 +17,7 @@ export interface ParsedBlock {
     | 'theorem'
     | 'comment'
     | 'commentblock'
+    | 'tikz'
     | 'raw';
   start: number;
   end: number;
@@ -56,4 +57,5 @@ export interface ParsedBlock {
   theoremEnv?: string;
   commentText?: string;
   commentNote?: boolean;
+  commentTag?: 'TODO' | 'FIXME';
 }

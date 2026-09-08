@@ -40,4 +40,13 @@ const sourceComments = parser.parseBlocks('% divider\n% TeXFlow note: note text\
 ok(sourceComments.some(x => x.kind === 'comment'), 'source comment parsing missing');
 ok(sourceComments.some(x => x.kind === 'paragraph'), 'prose after source comments missing');
 
+const taggedComments = parser.parseBlocks('% TODO verify estimate\n\n% FIXME rewrite paragraph');
+ok(taggedComments.some(x => x.kind === 'comment' && x.commentTag === 'TODO'), 'TODO comment classification missing');
+ok(taggedComments.some(x => x.kind === 'comment' && x.commentTag === 'FIXME'), 'FIXME comment classification missing');
+
+const tikzSource = '\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}';
+const tikzBlocks = parser.parseBlocks(tikzSource);
+ok(tikzBlocks.length === 1 && tikzBlocks[0].kind === 'tikz', 'tikzpicture must remain one semantic TikZ block');
+ok(tikzBlocks[0].raw === tikzSource, 'TikZ source must round-trip exactly through the parser');
+
 console.log('PASS parser_single_source_runtime');

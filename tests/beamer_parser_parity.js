@@ -60,6 +60,7 @@ function projection(block) {
   if (block.kind === 'comment') {
     out.commentText = block.commentText;
     out.commentNote = !!block.commentNote;
+    if (block.commentTag) out.commentTag = block.commentTag;
   }
   return out;
 }
@@ -81,9 +82,11 @@ const cases = [
   ['beamer columns', '\\begin{columns}[T]\n\\column{0.48\\textwidth}\nLeft\n\\column{0.48\\textwidth}\nRight\n\\end{columns}'],
   ['equation', '\\begin{equation}\nx=1\n\\end{equation}'],
   ['comment + prose', '% TeXFlow note: check result\n\nNormal paragraph.'],
+  ['TODO comment', '% TODO verify result\n\nNormal paragraph.'],
   ['comment environment', '\\begin{comment}\nOld paragraph.\n\\begin{equation}\nx=y\n\\end{equation}\n\\end{comment}\n\nVisible paragraph.'],
   ['simple table', '\\begin{table}\n\\begin{tabular}{lc}\nA & B \\\\\n1 & 2\n\\end{tabular}\n\\end{table}'],
-  ['figure', '\\begin{figure}\n\\centering\n\\includegraphics[width=0.5\\textwidth]{figure.png}\n\\caption{Caption}\n\\label{fig:test}\n\\end{figure}']
+  ['figure', '\\begin{figure}\n\\centering\n\\includegraphics[width=0.5\\textwidth]{figure.png}\n\\caption{Caption}\n\\label{fig:test}\n\\end{figure}'],
+  ['tikz picture', '\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}']
 ];
 
 let failures = 0;

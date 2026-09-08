@@ -160,7 +160,7 @@ export function findMatchingEnvEnd(source: string, env: string, from: number): {
 
 export function parseBlocks(body: string): ParsedBlock[] {
   const out: ParsedBlock[] = [];
-  const re = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|comment)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
+  const re = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|comment|tikzpicture)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
   let cur = 0;
   let m: RegExpExecArray | null;
   let n = 0;
@@ -218,9 +218,11 @@ export function parseBlocks(body: string): ParsedBlock[] {
       const clean = raw.slice(commentStart, commentEnd);
       const commentNote = /^\s*%\s*TeXFlow note:/i.test(clean);
       const commentText = clean.replace(/^\s*%\s?/gm, '').replace(/^TeXFlow note:\s*/i, '');
+      const tagMatch = /^(TODO|FIXME)\b/i.exec(commentText.trim());
+      const commentTag = tagMatch ? tagMatch[1].toUpperCase() as 'TODO' | 'FIXME' : undefined;
       out.push({
         id: 'b' + n++, kind: 'comment', start: s + commentStart, end: s + commentEnd,
-        raw: clean, text: commentText, commentText, commentNote, align: currentAlign
+        raw: clean, text: commentText, commentText, commentNote, commentTag, align: currentAlign
       });
       if (commentEnd < raw.length) text(s + commentEnd, e);
       return;
@@ -235,7 +237,9 @@ export function parseBlocks(body: string): ParsedBlock[] {
       const clean = body.slice(start, end);
       const commentNote = /^\s*%\s*TeXFlow note:/i.test(clean);
       const commentText = clean.replace(/^\s*%\s?/gm, '').replace(/^TeXFlow note:\s*/i, '');
-      out.push({ id: 'b' + n++, kind: 'comment', start, end, raw: clean, text: commentText, commentText, commentNote, align: currentAlign });
+      const tagMatch = /^(TODO|FIXME)\b/i.exec(commentText.trim());
+      const commentTag = tagMatch ? tagMatch[1].toUpperCase() as 'TODO' | 'FIXME' : undefined;
+      out.push({ id: 'b' + n++, kind: 'comment', start, end, raw: clean, text: commentText, commentText, commentNote, commentTag, align: currentAlign });
       return;
     }
 
@@ -372,6 +376,7 @@ export function parseBlocks(body: string): ParsedBlock[] {
     else if (env === 'minipage') kind = 'container';
     else if (['theorem', 'lemma', 'proposition', 'corollary', 'definition', 'proof'].includes(env)) kind = 'theorem';
     else if (env === 'comment') kind = 'commentblock';
+    else if (env === 'tikzpicture') kind = 'tikz';
     else if (['flushleft', 'center', 'flushright'].includes(env)) kind = 'paragraph';
 
     const effectiveAlign: BlockAlignment = ['flushleft', 'center', 'flushright'].includes(env)
