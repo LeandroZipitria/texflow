@@ -1,0 +1,77 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,booktabs}
+
+\newenvironment{policybox}{\begin{quote}\itshape}{\end{quote}}
+
+\begin{document}
+
+\section{Build B objects}
+
+Inline mathematics with accents and delimiters:
+$\hat{x}+\bar{y}+\tilde{z}+\vec{q}+\dot{x}+\ddot{x}$ and
+$\left\langle x,y\right\rangle \subseteq \mathbb{R}^{2}$.
+
+\[
+  \left(\frac{a+b}{c+d}\right)
+  + \left\lfloor x \right\rfloor
+  + \left\lceil y \right\rceil
+\]
+
+\begin{equation}
+  y = \alpha + \beta x
+  \label{eq:build-b}
+\end{equation}
+
+\begin{align}
+  y &= x + 1 \\
+  z &= 2x
+\end{align}
+
+\begin{gather*}
+  a=b \\
+  c=d
+\end{gather*}
+
+\begin{multline*}
+  a+b+c+d+e+f \\
+  = g+h+i+j+k+l
+\end{multline*}
+
+\[
+\begin{Bmatrix}
+  a & b \\
+  c & d
+\end{Bmatrix}
+\]
+
+\[
+f(x)=
+\begin{cases}
+  x^2 & \text{if } x\ge 0 \\
+  -x  & \text{otherwise}
+\end{cases}
+\]
+
+\begin{table}[htbp]
+\centering
+\caption{Build B table}
+\label{tab:build-b}
+\begin{tabular}{lr}
+\toprule
+Item & Value \\
+\midrule
+A & 1 \\
+B & 2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{policybox}
+This is a simple custom environment. TeXFlow must preserve it as raw LaTeX
+unless the environment is explicitly configured for visual editing.
+\end{policybox}
+
+Equation~\eqref{eq:build-b} and Table~\ref{tab:build-b} test labels after the
+new object editors are present.
+
+\end{document}
