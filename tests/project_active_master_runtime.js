@@ -20,8 +20,10 @@ ok(source.includes('root = masterDocument'), 'temporary root compatibility alias
 ok(source.includes('masterUri: project.masterDocument.uri.toString()'), 'webview payload lacks masterUri');
 ok(source.includes('activeUri: project.activeDocument.uri.toString()'), 'webview payload lacks activeUri');
 
-// Foundation deliberately keeps legacy root reads/writes in place until Build A.
-// This makes the migration explicit rather than silently changing edit targets.
-ok(source.includes('documentSource: project.root.getText()'), 'Foundation unexpectedly changed document-mode source semantics');
+// Build A promotes activeDocument to the Visual document source while keeping
+// masterDocument as the durable project/compile identity.
+ok(source.includes('documentSource: project.activeDocument.getText()'), 'Build A Visual source is not activeDocument');
+ok(source.includes('const requestedActive = refreshed.documents.get(activeUri.toString())'), 'refreshProject does not preserve activeDocument');
+ok(source.includes('const pdfUri = await getPdfWebviewUri(project.masterDocument, panel.webview);'), 'PDF target is not masterDocument');
 
 console.log('PASS project_active_master_runtime');

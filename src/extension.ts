@@ -3,6 +3,8 @@ import * as path from 'path';
 import { spellcheckBlocks, type SpellcheckLanguage, type SpellcheckResultBlock } from './spellcheck';
 import { parseBlocks, webviewParserRuntimeSource } from './latex/blocks';
 import type { ParsedBlock } from './latex/types';
+import { buildProjectIndex, maskLatexComments, type ProjectIndex } from './project/index';
+import { buildProjectIssues, type ProjectIssue, type ProjectStructuralIssueInput } from './diagnostics/projectDiagnostics';
 
 interface FrameInfo {
   index: number;
@@ -100,6 +102,9 @@ interface BibliographyEntry {
   type: string;
   fields: Record<string, string>;
   source: string;
+  uri?: string;
+  start?: number;
+  end?: number;
 }
 
 interface BibliographyResource {
@@ -453,13 +458,11 @@ export function activate(context: vscode.ExtensionContext) {
     const ext = path.extname(uri.fsPath).toLowerCase();
     if (ext === '.tex') {
       try {
-        const doc = await vscode.workspace.openTextDocument(uri);
-        if (/\\documentclass(?:\[[^\]]*\])?\{[^}]+\}/.test(doc.getText())) {
-          await vscode.commands.executeCommand('texflow.openVisualEditor', uri);
-          return;
-        }
+        await vscode.workspace.openTextDocument(uri);
+        await vscode.commands.executeCommand('texflow.openVisualEditor', uri);
+        return;
       } catch {
-        // Fall through to the native editor.
+        // Fall through to the native editor when the file cannot be opened.
       }
     }
     await vscode.commands.executeCommand('vscode.open', uri);
@@ -664,11 +667,14 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     let project = await loadProject(initialDocument, output);
-    await projectNavigator.setRootDocument(project.root.uri);
-    let rootUri = project.root.uri;
+    await projectNavigator.setRootDocument(project.masterDocument.uri);
+    let rootUri = project.masterDocument.uri;
+    let activeUri = project.activeDocument.uri;
     const panel = vscode.window.createWebviewPanel(
       'texflowVisualEditor',
-      `TeXFlow: ${project.root.fileName.split(/[\\/]/).pop()}`,
+      project.activeDocument.uri.toString() === project.masterDocument.uri.toString()
+        ? `TeXFlow: ${path.basename(project.masterDocument.fileName)}`
+        : `TeXFlow: ${path.basename(project.activeDocument.fileName)} · ${path.basename(project.masterDocument.fileName)}`,
       vscode.ViewColumn.Beside,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media'), vscode.Uri.joinPath(project.root.uri, '..'), ...(vscode.workspace.workspaceFolders ?? []).map(f => f.uri)] }
     );
@@ -704,22 +710,33 @@ export function activate(context: vscode.ExtensionContext) {
     };
     const postStatus = (state: 'saving' | 'saved' | 'error', message = '') => panel.webview.postMessage({ type: 'saveStatus', state, message });
     const refreshProject = async () => {
-      // TextDocument instances become unusable after their editor is closed.
-      // Keep the root URI as the durable project identity and reopen a fresh
-      // document on every refresh. This lets TeXFlow remain fully functional
-      // even when no .tex tab is open.
-      const rootDocument = await vscode.workspace.openTextDocument(rootUri);
-      project = await loadProject(rootDocument, output);
+      // Keep master and active URIs as durable session identities. Rebuild the
+      // project from the master, then restore the active document if it is
+      // still part of the include graph. This prevents refreshes from silently
+      // sending multi-file Visual editing back to the master document.
+      const masterDocument = await vscode.workspace.openTextDocument(rootUri);
+      const refreshed = await loadProject(masterDocument, output);
+      const requestedActive = refreshed.documents.get(activeUri.toString());
+      if (requestedActive) refreshed.activeDocument = requestedActive;
+      else activeUri = refreshed.masterDocument.uri;
+      project = refreshed;
+      rootUri = project.masterDocument.uri;
+      activeUri = project.activeDocument.uri;
+      panel.title = project.activeDocument.uri.toString() === project.masterDocument.uri.toString()
+        ? `TeXFlow: ${path.basename(project.masterDocument.fileName)}`
+        : `TeXFlow: ${path.basename(project.activeDocument.fileName)} · ${path.basename(project.masterDocument.fileName)}`;
       return project;
     };
-    const sendDocument = async (selectedFrame?: number, focusFrameTitle = false, focusNewMath = false, focusDocumentHeadingStart?: number) => {
+    const sendDocument = async (selectedFrame?: number, focusFrameTitle = false, focusNewMath = false, focusDocumentHeadingStart?: number, focusSourceOffset?: number) => {
       await refreshProject();
-      const pdfUri = await getPdfWebviewUri(project.root, panel.webview);
+      const pdfUri = await getPdfWebviewUri(project.masterDocument, panel.webview);
       const spellCheckSettings = getSpellCheckSettings(project);
+      const intelligence = await projectIntelligence(project, panel.webview);
       panel.webview.postMessage({
         type: 'document',
         frames: project.frames,
-        fileName: project.root.fileName,
+        fileName: project.activeDocument.fileName,
+        masterFileName: project.masterDocument.fileName,
         isBeamer: project.isBeamer,
         documentClass: project.documentClass,
         metadata: project.metadata,
@@ -740,20 +757,23 @@ export function activate(context: vscode.ExtensionContext) {
           )
         })),
         sources: [...project.documents.values()].map(d => ({ uri: d.uri.toString(), label: vscode.workspace.asRelativePath(d.uri, false), text: d.getText() })),
-        rootUri: project.root.uri.toString(),
+        rootUri: project.masterDocument.uri.toString(),
         masterUri: project.masterDocument.uri.toString(),
         activeUri: project.activeDocument.uri.toString(),
         pdfUri,
         preambles: getPreambleInfos(project),
-        figureResources: await getFigureResources(project, panel.webview),
-        bibliographyEntries: await getBibliographyEntries(project),
+        figureResources: intelligence.figureResources,
+        bibliographyEntries: intelligence.bibliographyEntries,
         bibliographyResources: await getBibliographyResources(project),
-        documentSource: project.root.getText(),
+        projectIndex: intelligence.index,
+        projectIssues: intelligence.issues,
+        documentSource: project.activeDocument.getText(),
         spellCheckSettings,
         selectedFrame,
         focusFrameTitle,
         focusNewMath,
-        focusDocumentHeadingStart
+        focusDocumentHeadingStart,
+        focusSourceOffset
       });
     };
     const getFrameContext = async (frameIndex: number) => {
@@ -774,6 +794,27 @@ export function activate(context: vscode.ExtensionContext) {
       ctx = await getFrameContext(frameIndex);
       return ctx;
     };
+    const revealProjectLocation = async (uriValue: string, startValue = 0, endValue?: number, preferVisual = true) => {
+      if (!uriValue) return;
+      await refreshProject();
+      const uri = vscode.Uri.parse(uriValue);
+      const start = Math.max(0, Number.isFinite(startValue) ? Math.trunc(startValue) : 0);
+      const targetDocument = project.documents.get(uri.toString());
+      if (preferVisual && targetDocument && path.extname(uri.fsPath).toLowerCase() === '.tex') {
+        activeUri = targetDocument.uri;
+        const frame = project.frames.find(item => item.sourceUri === targetDocument.uri.toString() && start >= item.start && start <= item.end);
+        await sendDocument(frame?.index, false, false, undefined, start);
+        return;
+      }
+      const document = targetDocument ?? await vscode.workspace.openTextDocument(uri);
+      const editor = await vscode.window.showTextDocument(document, vscode.ViewColumn.Beside, false);
+      const safeStart = Math.min(start, document.getText().length);
+      const safeEnd = Math.min(Math.max(safeStart, Number.isFinite(endValue) ? Math.trunc(Number(endValue)) : safeStart), document.getText().length);
+      const from = document.positionAt(safeStart);
+      const to = document.positionAt(safeEnd);
+      editor.selection = new vscode.Selection(from, to);
+      editor.revealRange(new vscode.Range(from, to), vscode.TextEditorRevealType.InCenter);
+    };
 
     panel.webview.onDidReceiveMessage(async msg => {
       try {
@@ -789,7 +830,10 @@ export function activate(context: vscode.ExtensionContext) {
           if (msg.key === 'language') await cfg.update('spellCheck.language', ['auto', 'en', 'es'].includes(String(msg.value)) ? String(msg.value) : 'auto', vscode.ConfigurationTarget.Workspace);
           await sendDocument();
         }
-        if (msg.type === 'ready') await sendDocument();
+        if (msg.type === 'ready') {
+          const activeFrame = project.isBeamer ? project.frames.find(frame => frame.sourceUri === activeUri.toString()) : undefined;
+          await sendDocument(activeFrame?.index);
+        }
         if (msg.type === 'reveal') {
           const ctx = await getFrameContext(msg.frameIndex);
           if (!ctx) return;
@@ -924,7 +968,7 @@ export function activate(context: vscode.ExtensionContext) {
           const start = Number(msg.start);
           const end = Number(msg.end);
           const expected = String(msg.expected ?? '');
-          const source = project.root.getText();
+          const source = project.activeDocument.getText();
           if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end > source.length || source.slice(start, end) !== expected) {
             throw new Error('TeXFlow could not safely locate the review item in the LaTeX source.');
           }
@@ -944,7 +988,7 @@ export function activate(context: vscode.ExtensionContext) {
           await beginHistoryStep();
           updatingFromWebview = true;
           try {
-            await applyReplacement(project.root, start, end, '');
+            await applyReplacement(project.activeDocument, start, end, '');
           } finally {
             updatingFromWebview = false;
           }
@@ -993,7 +1037,7 @@ export function activate(context: vscode.ExtensionContext) {
             await refreshProject();
             updatingFromWebview = true;
             try {
-              await updateDocumentRange(project.root, Number(msg.start), Number(msg.end), String(msg.expected ?? ''), String(msg.replacement ?? ''));
+              await updateDocumentRange(project.activeDocument, Number(msg.start), Number(msg.end), String(msg.expected ?? ''), String(msg.replacement ?? ''));
               if (String(msg.feature || '') === 'multicol') {
                 await refreshProject();
                 await ensurePackage(project, 'multicol');
@@ -1039,7 +1083,7 @@ export function activate(context: vscode.ExtensionContext) {
           // into edit mode. No command-palette-style confirmation is needed.
           const ctx = await getFrameContext(msg.frameIndex);
           await beginHistoryStep();
-          await insertFrame(ctx?.document ?? project.root, ctx?.frame, 'New frame');
+          await insertFrame(ctx?.document ?? project.activeDocument, ctx?.frame, 'New frame');
           await sendDocument(Math.max(0, Number(msg.frameIndex ?? -1) + 1), true);
         }
         if (msg.type === 'insertChapter' || msg.type === 'insertSection' || msg.type === 'insertSubsection' || msg.type === 'insertSubsubsection' || msg.type === 'insertParagraphHeading') {
@@ -1055,7 +1099,7 @@ export function activate(context: vscode.ExtensionContext) {
           // moves to the normal paragraph below, matching the semantic model used by LyX.
           const ctx = await getFrameContext(msg.frameIndex);
           const placeholder = level === 'paragraph' ? 'New paragraph heading' : `New ${level}`;
-          const headingStart = await insertHeading(ctx?.document ?? project.root, ctx?.frame, level, placeholder);
+          const headingStart = await insertHeading(ctx?.document ?? project.activeDocument, ctx?.frame, level, placeholder);
           await sendDocument(undefined, false, false, headingStart);
         }
         if (msg.type === 'addBibliography') {
@@ -1128,7 +1172,7 @@ export function activate(context: vscode.ExtensionContext) {
             }
           }
           await refreshProject();
-          panel.webview.postMessage({type:'bibliographyUpdated', bibliographyEntries:await getBibliographyEntries(project), bibliographyResources:await getBibliographyResources(project), documentSource:project.root.getText()});
+          panel.webview.postMessage({type:'bibliographyUpdated', bibliographyEntries:await getBibliographyEntries(project), bibliographyResources:await getBibliographyResources(project), documentSource:project.activeDocument.getText()});
           if (msg.resumeCitation) panel.webview.postMessage({type:'bibliographyReady',openPicker:true});
           else await sendDocument();
           vscode.window.showInformationMessage(`Bibliography connected: ${vscode.workspace.asRelativePath(bibUri,false)}`);
@@ -1160,17 +1204,75 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'showProjectDiagnostics') {
           await refreshProject();
-          const frameBlocks=project.frames.flatMap(f=>parseBlocks(f.body));
-          const rawBlocks=frameBlocks.filter(b=>b.kind==='raw').length;
-          const bibs=(await getBibliographyResources(project)).length;
-          const figures=[...project.documents.values()].reduce((n,d)=>n+(d.getText().match(/\\includegraphics\b/g)||[]).length,0);
-          output.clear();output.appendLine('TeXFlow project diagnostics');output.appendLine('===========================');output.appendLine(`Root: ${project.root.uri.fsPath}`);output.appendLine(`Loaded .tex files: ${project.documents.size}`);output.appendLine(`Include links: ${project.includeReferences.length}`);output.appendLine(`Missing includes: ${project.missingIncludes.length}`);output.appendLine(`Include cycles: ${project.includeCycles.length}`);output.appendLine(`Frames: ${project.frames.length}`);output.appendLine(`Bibliography resources: ${bibs}`);output.appendLine(`Figure commands: ${figures}`);output.appendLine(`Preserved raw blocks in Beamer frames: ${rawBlocks}`);output.appendLine('');for(const doc of project.documents.values())output.appendLine(`- ${doc.uri.fsPath}`);if(project.missingIncludes.length){output.appendLine('');output.appendLine('Missing include targets:');for(const ref of project.missingIncludes)output.appendLine(`- ${path.basename(ref.sourceUri.fsPath)} -> ${ref.rawTarget}`);}if(project.includeCycles.length){output.appendLine('');output.appendLine('Include cycles:');for(const cycle of project.includeCycles)output.appendLine(`- ${cycle.map(x=>path.basename(x)).join(' -> ')}`);}output.show(true);
+          const intelligence = await projectIntelligence(project, panel.webview);
+          const frameBlocks = project.frames.flatMap(frame => parseBlocks(frame.body));
+          const rawBlocks = frameBlocks.filter(block => block.kind === 'raw').length;
+          const resources = await getBibliographyResources(project);
+          const counts = intelligence.issues.reduce((acc, issue) => {
+            acc[issue.severity] += 1;
+            return acc;
+          }, { error: 0, warning: 0, info: 0 });
+          output.clear();
+          output.appendLine('TeXFlow project diagnostics');
+          output.appendLine('===========================');
+          output.appendLine(`Master: ${project.masterDocument.uri.fsPath}`);
+          output.appendLine(`Active: ${project.activeDocument.uri.fsPath}`);
+          output.appendLine(`Loaded .tex files: ${project.documents.size}`);
+          output.appendLine(`Include links: ${project.includeReferences.length}`);
+          output.appendLine(`Frames: ${project.frames.length}`);
+          output.appendLine(`Labels: ${intelligence.index.labels.length}`);
+          output.appendLine(`References: ${intelligence.index.references.length}`);
+          output.appendLine(`Citations: ${intelligence.index.citations.length}`);
+          output.appendLine(`Bibliography resources: ${resources.length}`);
+          output.appendLine(`Bibliography entries: ${intelligence.index.bibliographyEntries.length}`);
+          output.appendLine(`Figure commands: ${intelligence.index.figures.length}`);
+          output.appendLine(`Preserved raw blocks in Beamer frames: ${rawBlocks}`);
+          output.appendLine(`Issues: ${counts.error} error(s), ${counts.warning} warning(s), ${counts.info} info`);
+          output.appendLine('');
+          for (const document of project.documents.values()) output.appendLine(`- ${document.uri.fsPath}`);
+          if (intelligence.issues.length) {
+            output.appendLine('');
+            output.appendLine('Project issues');
+            output.appendLine('--------------');
+            for (const issue of intelligence.issues) {
+              const where = issue.file ? ` [${issue.file}]` : '';
+              output.appendLine(`${issue.severity.toUpperCase()}: ${issue.message}${where}`);
+            }
+          }
+          output.show(true);
+        }
+        if (msg.type === 'navigateProjectLocation') {
+          await revealProjectLocation(String(msg.uri || ''), Number(msg.start || 0), Number(msg.end), msg.preferVisual !== false);
+        }
+        if (msg.type === 'navigateReference') {
+          await refreshProject();
+          const intelligence = await projectIntelligence(project, panel.webview);
+          const referenceKey = String(msg.key || '').split(',').map((value: string) => value.trim()).find(Boolean) || '';
+          const label = intelligence.index.labels.find(item => item.key === referenceKey);
+          if (!label) { vscode.window.showWarningMessage(`TeXFlow: Reference target not found: ${referenceKey}`); return; }
+          await revealProjectLocation(label.uri, label.start, label.end, true);
+        }
+        if (msg.type === 'navigateCitation') {
+          await refreshProject();
+          const intelligence = await projectIntelligence(project, panel.webview);
+          const citationKey = String(msg.key || '').split(',').map((value: string) => value.trim()).find(Boolean) || '';
+          const entry = intelligence.index.bibliographyEntries.find(item => item.key === citationKey);
+          if (!entry?.uri) { vscode.window.showWarningMessage(`TeXFlow: Bibliography entry not found: ${citationKey}`); return; }
+          await revealProjectLocation(entry.uri, entry.start, entry.end, false);
+        }
+        if (msg.type === 'navigateBibliographyUsage') {
+          await refreshProject();
+          const intelligence = await projectIntelligence(project, panel.webview);
+          const citationKey = String(msg.key || '').trim();
+          const usage = intelligence.index.citations.find(item => item.key === citationKey);
+          if (!usage) { vscode.window.showInformationMessage(`TeXFlow: No citation usage found for ${citationKey}.`); return; }
+          await revealProjectLocation(usage.uri, usage.start, usage.end, true);
         }
         if (msg.type === 'chooseSubfigures') {
           postStatus('saving');
           await refreshProject();
           const ctx = project.isBeamer ? await getFrameContext(msg.frameIndex) : undefined;
-          const targetDocument = ctx?.document ?? project.root;
+          const targetDocument = ctx?.document ?? project.activeDocument;
           const chosen = await chooseMultipleFigureFiles(targetDocument);
           if (!chosen.length) { postStatus('saved'); return; }
           panel.webview.postMessage({ type:'subfiguresChosen', paths:chosen.map(x=>x.latexPath), frameIndex:Number(msg.frameIndex), cursorPos:Number(msg.cursorPos) });
@@ -1180,7 +1282,7 @@ export function activate(context: vscode.ExtensionContext) {
           postStatus('saving');
           await refreshProject();
           const ctx = project.isBeamer ? await getFrameContext(msg.frameIndex) : undefined;
-          const targetDocument = ctx?.document ?? project.root;
+          const targetDocument = ctx?.document ?? project.activeDocument;
           const chosen = await chooseFigureFile(targetDocument);
           if (!chosen) { postStatus('saved'); return; }
           const stem = path.parse(chosen.latexPath).name.replace(/[^A-Za-z0-9:_-]+/g, '-');
@@ -1209,11 +1311,12 @@ export function activate(context: vscode.ExtensionContext) {
           if (label && !/^[^{}\\\s]+$/.test(label)) { vscode.window.showWarningMessage('TeXFlow: Labels cannot contain spaces, braces, or backslashes.'); postStatus('saved'); return; }
           if (label && [...project.documents.values()].some(d => d.getText().includes(`\\label{${label}}`))) { vscode.window.showWarningMessage(`TeXFlow: label ${label} already exists.`); postStatus('saved'); return; }
           await beginHistoryStep();
-          const rootLengthBeforePackage = project.root.getText().length;
+          const activeWasMaster = project.activeDocument.uri.toString() === project.masterDocument.uri.toString();
+          const activeLengthBeforePackage = project.activeDocument.getText().length;
           const hasGraphicx = [...project.documents.values()].some(d => /\\usepackage(?:\[[^\]]*\])?\{[^}]*\bgraphicx\b[^}]*\}/.test(d.getText()));
           if (!hasGraphicx) await ensureGraphicx(project.root);
           await refreshProject();
-          const packageDelta = project.root.getText().length - rootLengthBeforePackage;
+          const packageDelta = activeWasMaster ? project.activeDocument.getText().length - activeLengthBeforePackage : 0;
           const block = figureBlockLatex(latexPath, caption, label, placement, project.isBeamer, captionPosition, align, widthPercent, shortCaption, angle);
           if (project.isBeamer) {
             const insertCtx = await getFrameContext(Number(msg.frameIndex));
@@ -1222,13 +1325,13 @@ export function activate(context: vscode.ExtensionContext) {
             await applyReplacement(insertCtx.document, pos, pos, `\n\n${block}\n`);
             await sendDocument(Number(msg.frameIndex), false, false);
           } else {
-            const source = project.root.getText();
+            const source = project.activeDocument.getText();
             const end = source.lastIndexOf('\\end{document}');
             let requested = Number(msg.cursorPos);
             if (Number.isFinite(requested) && packageDelta > 0) requested += packageDelta;
             const pos = Number.isFinite(requested) && requested >= 0 && requested <= (end >= 0 ? end : source.length)
               ? Math.trunc(requested) : (end >= 0 ? end : source.length);
-            await applyReplacement(project.root, pos, pos, `\n\n${block}\n\n`);
+            await applyReplacement(project.activeDocument, pos, pos, `\n\n${block}\n\n`);
             await sendDocument();
           }
           postStatus('saved');
@@ -1256,8 +1359,11 @@ export function activate(context: vscode.ExtensionContext) {
             vscode.window.showWarningMessage('TeXFlow: unsupported table placement.'); postStatus('saved'); return;
           }
           await beginHistoryStep();
+          const activeWasMaster = project.activeDocument.uri.toString() === project.masterDocument.uri.toString();
+          const activeLengthBeforePackage = project.activeDocument.getText().length;
           if (tableStyle === 'booktabs') await ensurePackage(project, 'booktabs');
           await refreshProject();
+          const packageDelta = activeWasMaster ? project.activeDocument.getText().length - activeLengthBeforePackage : 0;
           const block = tableBlockLatex(rows, cols, caption, label, placement, project.isBeamer, alignments, tableStyle);
           if (project.isBeamer) {
             const insertCtx = await getFrameContext(msg.frameIndex);
@@ -1266,11 +1372,12 @@ export function activate(context: vscode.ExtensionContext) {
             await applyReplacement(insertCtx.document, pos, pos, `\n\n${block}\n`);
             await sendDocument(msg.frameIndex, false, false);
           } else {
-            const source = project.root.getText();
+            const source = project.activeDocument.getText();
             const docEnd = source.lastIndexOf('\\end{document}');
-            const requested = Number(msg.cursorPos);
+            let requested = Number(msg.cursorPos);
+            if (Number.isFinite(requested) && packageDelta > 0) requested += packageDelta;
             const pos = Number.isFinite(requested) && requested >= 0 && requested <= (docEnd >= 0 ? docEnd : source.length) ? Math.trunc(requested) : (docEnd >= 0 ? docEnd : source.length);
-            await applyReplacement(project.root, pos, pos, `\n\n${block}\n\n`);
+            await applyReplacement(project.activeDocument, pos, pos, `\n\n${block}\n\n`);
             await sendDocument();
           }
           postStatus('saved');
@@ -1292,11 +1399,11 @@ export function activate(context: vscode.ExtensionContext) {
             await applyReplacement(insertCtx.document, pos, pos, `\n\n${code}\n`);
             await sendDocument(msg.frameIndex, false, false);
           } else {
-            const source = project.root.getText();
+            const source = project.activeDocument.getText();
             const docEnd = source.lastIndexOf('\\end{document}');
             const requested = Number(msg.cursorPos);
             const pos = Number.isFinite(requested) && requested >= 0 && requested <= (docEnd >= 0 ? docEnd : source.length) ? Math.trunc(requested) : (docEnd >= 0 ? docEnd : source.length);
-            await applyReplacement(project.root, pos, pos, `\n\n${code}\n\n`);
+            await applyReplacement(project.activeDocument, pos, pos, `\n\n${code}\n\n`);
             await sendDocument();
           }
           postStatus('saved');
@@ -1327,7 +1434,7 @@ export function activate(context: vscode.ExtensionContext) {
             await sendDocument(msg.frameIndex, false, false);
           } else if (!project.isBeamer) {
             await refreshProject();
-            await insertBlockInDocument(project.root, String(msg.kind || 'displaymath'), String(msg.text || ''));
+            await insertBlockInDocument(project.activeDocument, String(msg.kind || 'displaymath'), String(msg.text || ''));
             await sendDocument();
           }
           postStatus('saved');
@@ -1341,7 +1448,7 @@ export function activate(context: vscode.ExtensionContext) {
             await sendDocument(msg.frameIndex, false, false);
           } else if (!project.isBeamer) {
             await refreshProject();
-            await insertBlockInDocument(project.root, String(msg.kind || 'paragraph'));
+            await insertBlockInDocument(project.activeDocument, String(msg.kind || 'paragraph'));
             await sendDocument();
           }
           postStatus('saved');
@@ -1370,7 +1477,8 @@ export function activate(context: vscode.ExtensionContext) {
           let code = String(msg.latex || '').trim();
           if (!code) { postStatus('saved'); return; }
           const feature = String(msg.feature || '');
-          const rootLengthBeforeFeature = project.root.getText().length;
+          const activeWasMaster = project.activeDocument.uri.toString() === project.masterDocument.uri.toString();
+          const activeLengthBeforeFeature = project.activeDocument.getText().length;
           await beginHistoryStep();
           if (feature === 'link') await ensurePackage(project, 'hyperref');
           if (feature === 'box') await ensurePackage(project, 'graphicx');
@@ -1402,10 +1510,10 @@ export function activate(context: vscode.ExtensionContext) {
             await applyReplacement(ctx.document, pos, pos, `\n\n${code}\n`);
             await sendDocument(ctx.frame.index);
           } else {
-            const doc = await vscode.workspace.openTextDocument(rootUri);
+            const doc = project.activeDocument;
             const source = doc.getText(); const docEnd = source.lastIndexOf('\\end{document}');
             let requested = Number(msg.cursorPos);
-            if (feature === 'commentenv' && Number.isFinite(requested)) requested += Math.max(0, source.length - rootLengthBeforeFeature);
+            if (activeWasMaster && Number.isFinite(requested)) requested += Math.max(0, source.length - activeLengthBeforeFeature);
             const max = docEnd >= 0 ? docEnd : source.length;
             const pos = Number.isFinite(requested) && requested >= 0 && requested <= max ? Math.trunc(requested) : max;
             await applyReplacement(doc, pos, pos, `\n\n${code}\n\n`);
@@ -1417,26 +1525,28 @@ export function activate(context: vscode.ExtensionContext) {
           if (project.isBeamer) return;
           postStatus('saving'); await beginHistoryStep(); await refreshProject();
           const expected = String(msg.expected ?? ''), replacement = String(msg.replacement ?? '');
-          if (project.root.getText() !== expected) throw new Error('TeXFlow document changed before the structural operation could be saved. Refresh and try again.');
+          if (project.activeDocument.getText() !== expected) throw new Error('TeXFlow document changed before the structural operation could be saved. Refresh and try again.');
           updatingFromWebview = true;
-          try { await applyReplacement(project.root, 0, expected.length, replacement); } finally { updatingFromWebview = false; }
+          try { await applyReplacement(project.activeDocument, 0, expected.length, replacement); } finally { updatingFromWebview = false; }
           await sendDocument(); postStatus('saved');
         }
         if (msg.type === 'findReplaceText') {
           if (project.isBeamer) { vscode.window.showWarningMessage('TeXFlow Labs: Find/Replace currently operates on document-mode files only.'); return; }
           const find = String(msg.find ?? ''); if (!find) return;
           const replace = String(msg.replace ?? '');
-          await refreshProject(); const src = project.root.getText();
-          const begin = src.indexOf('\\begin{document}'), end = src.lastIndexOf('\\end{document}');
-          if (begin < 0 || end < begin) return;
-          const bodyStart = begin + '\\begin{document}'.length, body = src.slice(bodyStart, end);
+          await refreshProject(); const src = project.activeDocument.getText();
+          const begin = src.indexOf('\\begin{document}'), explicitEnd = src.lastIndexOf('\\end{document}');
+          const hasDocumentEnvironment = begin >= 0 && explicitEnd >= begin;
+          const bodyStart = hasDocumentEnvironment ? begin + '\\begin{document}'.length : 0;
+          const end = hasDocumentEnvironment ? explicitEnd : src.length;
+          const body = src.slice(bodyStart, end);
           // Labs implementation: literal replacements only outside command names. It deliberately
           // refuses replacements containing a backslash so it cannot mutate LaTeX commands.
           if (find.includes('\\')) { vscode.window.showWarningMessage('TeXFlow Labs: Find/Replace does not modify LaTeX commands.'); return; }
           const replacementBody = body.split(find).join(replace);
           if (replacementBody === body) { vscode.window.showInformationMessage('TeXFlow: no matches found.'); return; }
           await beginHistoryStep(); updatingFromWebview = true;
-          try { await applyReplacement(project.root, bodyStart, end, replacementBody); } finally { updatingFromWebview = false; }
+          try { await applyReplacement(project.activeDocument, bodyStart, end, replacementBody); } finally { updatingFromWebview = false; }
           await sendDocument(); postStatus('saved');
         }
         if (msg.type === 'saveDocumentSettings') {
@@ -1463,11 +1573,13 @@ export function activate(context: vscode.ExtensionContext) {
               await sendDocument(ctx.frame.index);
             }
           } else {
-            const rootLengthBeforePackage = project.root.getText().length;
+            const activeWasMaster = project.activeDocument.uri.toString() === project.masterDocument.uri.toString();
+            const activeLengthBeforePackage = project.activeDocument.getText().length;
             await ensurePackage(project, 'multicol');
-            const doc = await vscode.workspace.openTextDocument(rootUri);
+            await refreshProject();
+            const doc = project.activeDocument;
             const src = doc.getText();
-            const packageDelta = src.length - rootLengthBeforePackage;
+            const packageDelta = activeWasMaster ? src.length - activeLengthBeforePackage : 0;
             const docEnd = src.lastIndexOf('\\end{document}');
             let requested = Number(msg.cursorPos);
             if (Number.isFinite(requested) && packageDelta > 0) requested += packageDelta;
@@ -1558,12 +1670,16 @@ export function activate(context: vscode.ExtensionContext) {
           editor.selection = new vscode.Selection(pos, pos);
           editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
         }
+        if (msg.type === 'openProjectDocument') {
+          const value = String(msg.uri || '');
+          if (!value) return;
+          await revealProjectLocation(value, 0, 0, true);
+        }
         if (msg.type === 'openIncludedSource') {
           const value = String(msg.uri || '');
           if (!value) return;
           try {
-            const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(value));
-            await vscode.window.showTextDocument(document, vscode.ViewColumn.Beside, false);
+            await revealProjectLocation(value, 0, 0, true);
           } catch {
             vscode.window.showWarningMessage(`TeXFlow: Included file not found: ${String(msg.target || value)}`);
           }
@@ -1608,10 +1724,10 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'saveAs') {
           await refreshProject();
-          const target = await vscode.window.showSaveDialog({ defaultUri: project.root.uri, filters: { LaTeX: ['tex'] }, saveLabel: 'Save TeX file as' });
+          const target = await vscode.window.showSaveDialog({ defaultUri: project.activeDocument.uri, filters: { LaTeX: ['tex'] }, saveLabel: 'Save TeX file as' });
           if (!target) return;
           postStatus('saving');
-          await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(project.root.getText()));
+          await vscode.workspace.fs.writeFile(target, new TextEncoder().encode(project.activeDocument.getText()));
           postStatus('saved');
           panel.dispose();
           await vscode.commands.executeCommand('texflow.openVisualEditor', target);
@@ -2130,7 +2246,7 @@ function splitTopLevelBibFields(source: string): string[] {
   return out.map(x => x.trim()).filter(Boolean);
 }
 
-function parseBibText(source: string, sourceLabel: string): BibliographyEntry[] {
+function parseBibText(source: string, sourceLabel: string, sourceUri = ''): BibliographyEntry[] {
   const entries: BibliographyEntry[] = [];
   const text = String(source ?? '');
   const head = /@([A-Za-z]+)\s*([\{(])\s*([^,\s]+)\s*,/g;
@@ -2159,7 +2275,7 @@ function parseBibText(source: string, sourceLabel: string): BibliographyEntry[] 
       if (!/^[a-z][a-z0-9_-]*$/i.test(name)) continue;
       fields[name] = cleanBibValue(part.slice(eq + 1));
     }
-    entries.push({ key: m[3].trim(), type, fields, source: sourceLabel });
+    entries.push({ key: m[3].trim(), type, fields, source: sourceLabel, uri: sourceUri, start: m.index, end: i + 1 });
     head.lastIndex = i + 1;
   }
   return entries;
@@ -2168,6 +2284,7 @@ function parseBibText(source: string, sourceLabel: string): BibliographyEntry[] 
 function bibliographySystem(project: ProjectModel): BibliographySystem {
   const source = [...project.documents.values()].map(d => d.getText()).join('\n');
   if (/\\addbibresource(?:\[[^\]]*\])?\{[^}]+\}/i.test(source) || /\\usepackage(?:\[[^\]]*\])?\{[^}]*\bbiblatex\b[^}]*\}/i.test(source)) return 'biblatex';
+  if (/\\begin\{thebibliography\}/i.test(source)) return 'bibtex';
   if (/\\bibliography\{[^}]+\}/i.test(source)) {
     if (/\\usepackage(?:\[[^\]]*\])?\{[^}]*\bnatbib\b[^}]*\}/i.test(source) || /\\(?:citep|citet)\b/.test(source)) return 'natbib';
     return 'bibtex';
@@ -2232,8 +2349,33 @@ async function getBibliographyEntries(project: ProjectModel): Promise<Bibliograp
   for (const resource of await getBibliographyResources(project)) {
     try {
       const bytes = await vscode.workspace.fs.readFile(vscode.Uri.parse(resource.uri));
-      entries.push(...parseBibText(new TextDecoder('utf-8').decode(bytes), resource.label));
+      entries.push(...parseBibText(new TextDecoder('utf-8').decode(bytes), resource.label, resource.uri));
     } catch { /* keep editor usable when a .bib file is unreadable */ }
+  }
+  // Inline thebibliography entries are project bibliography entries too. Keep
+  // exact source locations so citation navigation works without inventing a
+  // second bibliography model or flattening the project.
+  for (const document of project.documents.values()) {
+    const source = document.getText();
+    const masked = maskLatexComments(source);
+    const itemRe = /\\bibitem(?:\[([^\]]*)\])?\{([^}]+)\}/g;
+    let match: RegExpExecArray | null;
+    while ((match = itemRe.exec(masked))) {
+      const key = String(match[2] || '').trim();
+      if (!key) continue;
+      const next = masked.slice(itemRe.lastIndex).search(/\\bibitem(?:\[[^\]]*\])?\{|\\end\{thebibliography\}/);
+      const end = next >= 0 ? itemRe.lastIndex + next : Math.min(source.length, itemRe.lastIndex + 240);
+      const preview = source.slice(itemRe.lastIndex, end).replace(/\\[A-Za-z@]+\*?(?:\[[^\]]*\])?/g, ' ').replace(/[{}]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+      entries.push({
+        key,
+        type: 'bibitem',
+        fields: { title: preview || String(match[1] || '').trim() },
+        source: vscode.workspace.asRelativePath(document.uri, false),
+        uri: document.uri.toString(),
+        start: match.index,
+        end: itemRe.lastIndex
+      });
+    }
   }
   return entries;
 }
@@ -2284,6 +2426,87 @@ async function getFigureResources(project: ProjectModel, webview: vscode.Webview
     }
   }
   return resources;
+}
+
+
+function projectIndexFor(project: ProjectModel, bibliographyEntries: BibliographyEntry[]): ProjectIndex {
+  const missingKeys = new Set(project.missingIncludes.map(reference => `${reference.sourceUri.toString()}|${reference.start}|${reference.targetUri.toString()}`));
+  return buildProjectIndex(
+    [...project.documents.values()].map(document => ({
+      uri: document.uri.toString(),
+      label: vscode.workspace.asRelativePath(document.uri, false),
+      text: document.getText()
+    })),
+    bibliographyEntries,
+    project.includeReferences.map(reference => ({
+      sourceUri: reference.sourceUri.toString(),
+      targetUri: reference.targetUri.toString(),
+      rawTarget: reference.rawTarget,
+      command: reference.command,
+      start: reference.start,
+      end: reference.end,
+      missing: missingKeys.has(`${reference.sourceUri.toString()}|${reference.start}|${reference.targetUri.toString()}`)
+    }))
+  );
+}
+
+function structuralProjectIssues(
+  project: ProjectModel,
+  index: ProjectIndex,
+  figureResources: Record<string, { uri: string; isPdf: boolean; extension: string }>
+): ProjectStructuralIssueInput[] {
+  const issues: ProjectStructuralIssueInput[] = [];
+  for (const reference of project.missingIncludes) {
+    issues.push({
+      kind: 'missing-include',
+      severity: 'error',
+      message: `Included file not found: ${reference.rawTarget}`,
+      target: reference.rawTarget,
+      documentUri: reference.sourceUri.toString(),
+      start: reference.start,
+      end: reference.end,
+      file: vscode.workspace.asRelativePath(reference.sourceUri, false)
+    });
+  }
+  for (const cycle of project.includeCycles) {
+    issues.push({
+      kind: 'include-cycle',
+      severity: 'error',
+      message: `Circular include: ${cycle.map(value => path.basename(value)).join(' -> ')}`,
+      target: cycle.join(' -> ')
+    });
+  }
+  for (const figure of index.figures) {
+    if (/[\\#$]/.test(figure.path)) continue;
+    if (figureResources[`${figure.uri}|${figure.path}`] || figureResources[`*|${figure.path}`]) continue;
+    issues.push({
+      kind: 'missing-figure',
+      severity: 'warning',
+      message: `Figure file not found: ${figure.path}`,
+      target: figure.path,
+      documentUri: figure.uri,
+      start: figure.start,
+      end: figure.end,
+      file: figure.file
+    });
+  }
+  return issues;
+}
+
+async function projectIntelligence(
+  project: ProjectModel,
+  webview: vscode.Webview
+): Promise<{
+  bibliographyEntries: BibliographyEntry[];
+  figureResources: Record<string, { uri: string; isPdf: boolean; extension: string }>;
+  index: ProjectIndex;
+  issues: ProjectIssue[];
+}> {
+  const bibliographyEntries = await getBibliographyEntries(project);
+  const figureResources = await getFigureResources(project, webview);
+  const index = projectIndexFor(project, bibliographyEntries);
+  const issues = buildProjectIssues(index, structuralProjectIssues(project, index, figureResources));
+  return { bibliographyEntries, figureResources, index, issues };
 }
 
 async function getPdfWebviewUri(document: vscode.TextDocument, webview: vscode.Webview): Promise<string> {
@@ -3037,7 +3260,7 @@ body{display:flex;flex-direction:column}
 
 .document-continuous-wrap{display:flex;justify-content:center;padding:18px 0 82px}.document-continuous{box-sizing:border-box;width:min(900px,calc(100% - 24px));min-height:520px;margin:0 auto;background:var(--paper);border:1px solid color-mix(in srgb,var(--line-strong) 62%,transparent);border-radius:5px;box-shadow:0 14px 42px rgba(0,0,0,.14);padding:58px 72px 72px;font-size:16px;line-height:1.58;color:var(--fg);position:relative}.document-continuous .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-continuous .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-continuous .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}
 .document-pages{--doc-page-ratio:.7071;--doc-page-pad-x:72px;--doc-page-pad-top:64px;--doc-page-pad-bottom:70px;display:flex;flex-direction:column;align-items:center;gap:34px;padding:10px 0 82px}.document-sheet{box-sizing:border-box;width:min(794px,calc(100% - 24px));aspect-ratio:var(--doc-page-ratio);margin:0 auto;background:var(--paper);border:1px solid color-mix(in srgb,var(--line-strong) 76%,transparent);border-radius:5px;box-shadow:0 18px 52px rgba(0,0,0,.18);padding:var(--doc-page-pad-top) var(--doc-page-pad-x) var(--doc-page-pad-bottom);font-size:16px;line-height:1.58;color:var(--fg);overflow:hidden;position:relative}.document-page-content{height:100%;overflow:hidden}.document-page-number{position:absolute;bottom:18px;left:0;right:0;text-align:center;color:var(--muted);font-size:11px;opacity:.68;pointer-events:none}.document-sheet.page-overflow{box-shadow:0 0 0 1px color-mix(in srgb,var(--vscode-errorForeground) 55%,transparent),0 18px 52px rgba(0,0,0,.18)}.document-sheet.page-overflow:after{content:'Approx. page overflow';position:absolute;right:14px;bottom:15px;padding:3px 6px;border-radius:5px;background:var(--vscode-inputValidation-errorBackground,color-mix(in srgb,var(--vscode-errorForeground) 16%,var(--paper)));color:var(--vscode-inputValidation-errorForeground,var(--vscode-errorForeground));font-size:10px;font-weight:650}.doc-page-break-note{position:absolute;left:14px;bottom:16px;color:var(--muted);font-size:10px;opacity:.55;pointer-events:none}
-.doc-title{text-align:center;margin:18px 0 58px}.doc-title h1{font-size:2.05em;margin:0 0 12px;font-weight:650}.doc-title>div{color:var(--muted);margin-top:5px}.doc-heading{scroll-margin-top:72px;color:var(--fg);font-weight:650}.doc-heading.level-1{font-size:1.85em;margin:46px 0 22px}.doc-heading.level-2{font-size:1.55em;margin:38px 0 18px}.doc-heading.level-3{font-size:1.27em;margin:30px 0 14px}.doc-heading.level-4{font-size:1.1em;margin:24px 0 12px}.doc-paragraph{margin:0 0 18px;white-space:pre-wrap}.doc-list{margin:10px 0 22px;padding-left:2.1em}.doc-list li{margin:6px 0}.doc-math{position:relative;margin:24px 0;text-align:center;overflow-x:auto;padding:0 2.2em}.doc-equation-number{position:absolute;right:.2em;top:50%;transform:translateY(-50%);font-size:.9em;color:var(--muted)}.doc-code{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;background:color-mix(in srgb,var(--paper) 88%,var(--fg) 12%);padding:.08em .28em;border-radius:4px}.doc-latex-block{margin:22px 0;padding:14px 18px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 92%,var(--accent) 8%)}.doc-block-title{font-weight:650;margin-bottom:8px}.doc-figure-placeholder{margin:24px auto;padding:32px;border:1px dashed var(--line-strong);text-align:center;color:var(--muted);border-radius:8px}.doc-raw{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.doc-raw pre{white-space:pre-wrap;margin:8px 0 0}.doc-include{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--paper) 97%,var(--vscode-editorWidget-background));display:flex;align-items:center;gap:12px}.doc-include-main{min-width:0;flex:1}.doc-include-kind{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}.doc-include-path{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.doc-include-meta{font-size:10px;color:var(--muted);margin-top:3px}.doc-include button{border:1px solid var(--line-strong);border-radius:5px;padding:5px 9px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.doc-include button:hover{background:var(--vscode-button-secondaryHoverBackground)}.doc-include.missing{border-color:var(--vscode-inputValidation-warningBorder,var(--vscode-errorForeground));background:var(--vscode-inputValidation-warningBackground,color-mix(in srgb,var(--paper) 94%,var(--vscode-errorForeground) 6%))}.doc-include.missing .doc-include-kind{color:var(--vscode-inputValidation-warningForeground,var(--vscode-errorForeground))}.doc-mode-note{text-align:right;color:var(--muted);font-size:11px;margin-top:54px}.doc-outline{padding:7px 10px;border-radius:6px;cursor:pointer;color:var(--muted);line-height:1.25}.doc-outline:hover{background:var(--hover);color:var(--fg)}.doc-outline.level-1{font-weight:700;color:var(--fg);margin-top:9px}.doc-outline.level-2{font-weight:600;color:var(--fg);margin-top:7px}.doc-outline.level-3{padding-left:20px;font-size:.94em}.doc-outline.level-4{padding-left:30px;font-size:.9em}.doc-outline-object{font-size:.86em;color:var(--muted);padding-top:5px;padding-bottom:5px}.doc-outline-object.depth-1{padding-left:18px}.doc-outline-object.depth-2{padding-left:26px}.doc-outline-object.depth-3{padding-left:34px}.doc-outline-object.depth-4,.doc-outline-object.depth-5{padding-left:42px}.doc-outline-object .outline-kind{font-size:.82em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:5px}.doc-outline-object .outline-label{color:var(--fg)}.doc-outline-empty{padding:12px 10px;color:var(--muted);font-size:.9em}.doc-outline-matter{margin:14px 8px 5px;padding-top:8px;border-top:1px solid var(--line);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.doc-heading.starred:before{content:'◇ ';color:var(--muted);font-size:.72em;vertical-align:.15em}.doc-toc{margin:28px 0 44px;padding:24px 26px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--paper) 98%,var(--fg) 2%)}.doc-toc h2{font-size:1.45em;margin:0 0 16px}.doc-toc-row{display:grid;grid-template-columns:4.7em 1fr;width:100%;border:0;background:transparent;color:var(--fg);font:inherit;text-align:left;padding:5px 4px;border-radius:4px;cursor:pointer}.doc-toc-row:hover{background:var(--hover)}.doc-toc-row.level-2{padding-left:14px}.doc-toc-row.level-3{padding-left:28px}.doc-toc-row.level-4{padding-left:42px;font-size:.94em}.doc-toc-number{font-variant-numeric:tabular-nums;color:var(--muted)}.doc-toc-note,.doc-toc-empty{margin-top:13px;font-size:.82em;color:var(--muted)}.document-pane{overflow:auto;padding:0 18px}.document-pane .document-pages{padding-top:10px}.document-pane .document-continuous-wrap{padding-top:10px}.document-pane .document-continuous{padding:44px 48px 54px}.document-pane .document-sheet{--doc-page-pad-x:48px;--doc-page-pad-top:44px;--doc-page-pad-bottom:54px}.workspace>.document-pages{padding-top:18px}.document-sheet .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-sheet .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-sheet .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-item-editable{min-height:1.4em;padding:1px 3px}.doc-math{cursor:default}.doc-math:hover{background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%);border-radius:6px}
+.doc-title{text-align:center;margin:18px 0 58px}.doc-title h1{font-size:2.05em;margin:0 0 12px;font-weight:650}.doc-title>div{color:var(--muted);margin-top:5px}.doc-heading{scroll-margin-top:72px;color:var(--fg);font-weight:650}.doc-heading.level-1{font-size:1.85em;margin:46px 0 22px}.doc-heading.level-2{font-size:1.55em;margin:38px 0 18px}.doc-heading.level-3{font-size:1.27em;margin:30px 0 14px}.doc-heading.level-4{font-size:1.1em;margin:24px 0 12px}.doc-paragraph{margin:0 0 18px;white-space:pre-wrap}.doc-list{margin:10px 0 22px;padding-left:2.1em}.doc-list li{margin:6px 0}.doc-math{position:relative;margin:24px 0;text-align:center;overflow-x:auto;padding:0 2.2em}.doc-equation-number{position:absolute;right:.2em;top:50%;transform:translateY(-50%);font-size:.9em;color:var(--muted)}.doc-code{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;background:color-mix(in srgb,var(--paper) 88%,var(--fg) 12%);padding:.08em .28em;border-radius:4px}.doc-latex-block{margin:22px 0;padding:14px 18px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 92%,var(--accent) 8%)}.doc-block-title{font-weight:650;margin-bottom:8px}.doc-figure-placeholder{margin:24px auto;padding:32px;border:1px dashed var(--line-strong);text-align:center;color:var(--muted);border-radius:8px}.doc-raw{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.doc-raw pre{white-space:pre-wrap;margin:8px 0 0}.doc-include{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--paper) 97%,var(--vscode-editorWidget-background));display:flex;align-items:center;gap:12px}.doc-include-main{min-width:0;flex:1}.doc-include-kind{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}.doc-include-path{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.doc-include-meta{font-size:10px;color:var(--muted);margin-top:3px}.doc-include button{border:1px solid var(--line-strong);border-radius:5px;padding:5px 9px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.doc-include button:hover{background:var(--vscode-button-secondaryHoverBackground)}.doc-include.missing{border-color:var(--vscode-inputValidation-warningBorder,var(--vscode-errorForeground));background:var(--vscode-inputValidation-warningBackground,color-mix(in srgb,var(--paper) 94%,var(--vscode-errorForeground) 6%))}.doc-include.missing .doc-include-kind{color:var(--vscode-inputValidation-warningForeground,var(--vscode-errorForeground))}.doc-mode-note{text-align:right;color:var(--muted);font-size:11px;margin-top:54px}.doc-outline{padding:7px 10px;border-radius:6px;cursor:pointer;color:var(--muted);line-height:1.25}.doc-outline:hover{background:var(--hover);color:var(--fg)}.doc-outline.level-1{font-weight:700;color:var(--fg);margin-top:9px}.doc-outline.level-2{font-weight:600;color:var(--fg);margin-top:7px}.doc-outline.level-3{padding-left:20px;font-size:.94em}.doc-outline.level-4{padding-left:30px;font-size:.9em}.doc-outline-object{font-size:.86em;color:var(--muted);padding-top:5px;padding-bottom:5px}.doc-outline-object.depth-1{padding-left:18px}.doc-outline-object.depth-2{padding-left:26px}.doc-outline-object.depth-3{padding-left:34px}.doc-outline-object.depth-4,.doc-outline-object.depth-5{padding-left:42px}.doc-outline-object .outline-kind{font-size:.82em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:5px}.doc-outline-object .outline-label{color:var(--fg)}.doc-outline-empty{padding:12px 10px;color:var(--muted);font-size:.9em}.project-files-title{margin-top:6px}.project-file-link{appearance:none;width:100%;display:flex;align-items:center;gap:7px;border:0;border-radius:6px;background:transparent;color:var(--muted);font:inherit;font-size:11px;text-align:left;padding:6px 9px;cursor:pointer}.project-file-link:hover{background:var(--hover);color:var(--fg)}.project-file-link.active{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--fg);font-weight:650}.project-file-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-file-role{font-size:8px;font-weight:700;letter-spacing:.06em;color:var(--muted)}.doc-outline-matter{margin:14px 8px 5px;padding-top:8px;border-top:1px solid var(--line);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.doc-heading.starred:before{content:'◇ ';color:var(--muted);font-size:.72em;vertical-align:.15em}.doc-toc{margin:28px 0 44px;padding:24px 26px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--paper) 98%,var(--fg) 2%)}.doc-toc h2{font-size:1.45em;margin:0 0 16px}.doc-toc-row{display:grid;grid-template-columns:4.7em 1fr;width:100%;border:0;background:transparent;color:var(--fg);font:inherit;text-align:left;padding:5px 4px;border-radius:4px;cursor:pointer}.doc-toc-row:hover{background:var(--hover)}.doc-toc-row.level-2{padding-left:14px}.doc-toc-row.level-3{padding-left:28px}.doc-toc-row.level-4{padding-left:42px;font-size:.94em}.doc-toc-number{font-variant-numeric:tabular-nums;color:var(--muted)}.doc-toc-note,.doc-toc-empty{margin-top:13px;font-size:.82em;color:var(--muted)}.document-pane{overflow:auto;padding:0 18px}.document-pane .document-pages{padding-top:10px}.document-pane .document-continuous-wrap{padding-top:10px}.document-pane .document-continuous{padding:44px 48px 54px}.document-pane .document-sheet{--doc-page-pad-x:48px;--doc-page-pad-top:44px;--doc-page-pad-bottom:54px}.workspace>.document-pages{padding-top:18px}.document-sheet .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-sheet .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-sheet .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-item-editable{min-height:1.4em;padding:1px 3px}.doc-math{cursor:default}.doc-math:hover{background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%);border-radius:6px}
 .texflow-semantic-block{position:relative;outline:none}.texflow-semantic-block.semantic-block-selected{outline:2px solid color-mix(in srgb,var(--accent) 72%,transparent);outline-offset:5px;border-radius:7px}.semantic-delete{position:absolute;z-index:8;right:-9px;top:-11px;width:24px;height:24px;display:none;align-items:center;justify-content:center;border:1px solid var(--line-strong);border-radius:999px;background:var(--vscode-editor-background);color:var(--vscode-foreground);font:600 17px/1 var(--vscode-font-family);cursor:pointer;box-shadow:0 2px 7px rgba(0,0,0,.25)}.texflow-semantic-block.semantic-block-selected>.semantic-delete{display:flex}.semantic-delete:hover{background:var(--vscode-inputValidation-errorBackground,var(--hover));border-color:var(--vscode-inputValidation-errorBorder,var(--line-strong))}.doc-after-block-slot{min-height:18px;margin:-4px 0 8px;border-radius:5px;display:flex;align-items:center;justify-content:flex-start;color:transparent;font-size:11px;cursor:text;outline:none;transition:color .12s,background .12s}.doc-after-block-slot:before{content:'Start typing…';padding:2px 6px}.doc-after-block-slot:hover,.doc-after-block-slot:focus{color:var(--muted);background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%)}
 
 @media(max-width:900px){:root{--sidebar:190px;--toolrail:58px}.main{padding:22px}.slide{padding:30px 34px;min-height:480px}.tool-label{display:none}.menu-trigger,.rail-action{height:45px}.topbar-brand span:last-child{display:none}.mode-tab{padding:6px 8px}}
@@ -3102,7 +3325,7 @@ body{display:flex;flex-direction:column}
 .floating-btn{border-radius:10px;backdrop-filter:blur(10px)}.toolbar{border-radius:12px;backdrop-filter:blur(14px)}
 
 
-.bib-citation{display:inline-flex;align-items:center;gap:.22em;padding:.02em .22em;border-radius:4px;background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--fg);white-space:nowrap}.bib-citation.missing{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent)}.bib-citation-key{font-size:.72em;color:var(--muted);margin-left:.15em}.tex-reference{display:inline-flex;align-items:center;gap:.28em;padding:.02em .26em;border-radius:4px;background:color-mix(in srgb,var(--vscode-symbolIcon-referenceForeground,var(--accent)) 12%,transparent);color:var(--fg);white-space:nowrap}.tex-reference.missing{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent)}.tex-reference-kind{font-size:.72em;font-weight:650;color:var(--muted)}.tex-reference-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.74em}.texflow-label-badge{display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none}.doc-math-wrap{position:relative}.doc-math-wrap .texflow-label-badge{position:absolute;right:0;top:0}.doc-heading-selected,.doc-math-wrap.selected{outline:1px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:4px;border-radius:3px}.doc-heading[data-label]::after{content:attr(data-label);display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none;pointer-events:none}.doc-bibliography{margin:34px 0 10px;padding-top:12px;border-top:1px solid var(--line)}.doc-bibliography h2{font-size:1.45em;margin:0 0 16px}.bib-entry{padding:8px 0;border-bottom:1px solid color-mix(in srgb,var(--line) 65%,transparent);line-height:1.42}.bib-entry:last-child{border-bottom:0}.bib-entry-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.75em;color:var(--muted);margin-left:.45em}.bib-print-placeholder{display:block;margin:14px 0;padding:12px 14px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 95%,var(--accent) 5%);color:var(--muted)}
+.bib-citation{display:inline-flex;align-items:center;gap:.22em;padding:.02em .22em;border-radius:4px;background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--fg);white-space:nowrap}.bib-citation.missing{color:var(--vscode-errorForeground,var(--danger));background:color-mix(in srgb,var(--vscode-errorForeground,var(--danger)) 12%,transparent);box-shadow:inset 0 -2px 0 var(--vscode-errorForeground,var(--danger))}.bib-citation-key{font-size:.72em;color:var(--muted);margin-left:.15em}.tex-reference{display:inline-flex;align-items:center;gap:.28em;padding:.02em .26em;border-radius:4px;background:color-mix(in srgb,var(--vscode-symbolIcon-referenceForeground,var(--accent)) 12%,transparent);color:var(--fg);white-space:nowrap}.tex-reference.missing{color:var(--vscode-errorForeground,var(--danger));background:color-mix(in srgb,var(--vscode-errorForeground,var(--danger)) 12%,transparent);box-shadow:inset 0 -2px 0 var(--vscode-errorForeground,var(--danger))}.tex-reference-kind{font-size:.72em;font-weight:650;color:var(--muted)}.tex-reference-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.74em}.texflow-label-badge{display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none}.doc-math-wrap{position:relative}.doc-math-wrap .texflow-label-badge{position:absolute;right:0;top:0}.doc-heading-selected,.doc-math-wrap.selected{outline:1px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:4px;border-radius:3px}.doc-heading[data-label]::after{content:attr(data-label);display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none;pointer-events:none}.doc-bibliography{margin:34px 0 10px;padding-top:12px;border-top:1px solid var(--line)}.doc-bibliography h2{font-size:1.45em;margin:0 0 16px}.bib-entry{padding:8px 0;border-bottom:1px solid color-mix(in srgb,var(--line) 65%,transparent);line-height:1.42}.bib-entry:last-child{border-bottom:0}.bib-entry-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.75em;color:var(--muted);margin-left:.45em}.bib-print-placeholder{display:block;margin:14px 0;padding:12px 14px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 95%,var(--accent) 5%);color:var(--muted)}
 .table-editor-body{padding:16px;overflow:auto;display:grid;gap:14px}.table-editor-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.table-field{display:grid;gap:5px}.table-field.wide{grid-column:1/-1}.table-field label{font-size:11px;color:var(--muted);font-weight:650}.table-input,.table-select{width:100%;box-sizing:border-box;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:7px;padding:8px 10px;font:inherit;outline:none}.table-input:focus,.table-select:focus{border-color:var(--vscode-focusBorder)}.table-alignments{display:flex;flex-wrap:wrap;gap:8px}.table-align-control{display:flex;align-items:center;gap:5px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--panel) 90%,transparent)}.table-align-control span{font-size:11px;color:var(--muted)}.table-align-control select{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:5px;padding:4px 6px}.table-preview-shell{border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;background:var(--vscode-editor-background)}.table-preview{border-collapse:collapse;margin:auto;min-width:260px}.table-preview td{border:1px solid var(--line-strong);height:28px;min-width:62px;padding:3px 7px;color:var(--muted);font-size:11px}.table-validation{min-height:16px;font-size:11px;color:var(--vscode-inputValidation-errorForeground,var(--danger))}@media(max-width:640px){.table-editor-grid{grid-template-columns:1fr}.table-field.wide{grid-column:auto}}
 .tex-footnote,.tex-link,.tex-index,.tex-field,.tex-nomenclature{display:inline-flex;align-items:center;gap:.28em;padding:.03em .3em;margin:0 .05em;border:1px solid var(--line);border-radius:4px;background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);color:var(--fg);font-size:.9em;white-space:nowrap;vertical-align:baseline}.tex-footnote:before{content:'fn';font-size:.68em;font-weight:700;color:var(--accent)}.tex-link:before{content:'↗';color:var(--accent)}.tex-index:before{content:'idx';font-size:.65em;color:var(--muted)}.tex-field:before{content:'ƒ';color:var(--muted)}.tex-nomenclature:before{content:'sym';font-size:.65em;color:var(--muted)}.doc-rich-block{position:relative;margin:18px 0;padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:color-mix(in srgb,var(--paper) 97%,var(--accent) 3%)}.doc-rich-block.comment{border-left:4px solid var(--line-strong);background:color-mix(in srgb,var(--paper) 98%,var(--vscode-editorWidget-background) 2%)}.doc-rich-block.comment.author-note{border-left-color:var(--accent)}.doc-rich-block.comment-block{border-left:4px solid color-mix(in srgb,var(--muted) 65%,var(--line-strong));background:color-mix(in srgb,var(--paper) 96%,var(--vscode-editorWidget-background) 4%)}.commented-preview{opacity:.9}.commented-preview-paragraph{margin:0 0 12px;line-height:1.55}.commented-preview-paragraph:last-child{margin-bottom:0}.commented-preview-heading{font-weight:650;color:var(--vscode-foreground);margin:14px 0 9px;line-height:1.25}.commented-preview-heading.level-chapter{font-size:1.45em}.commented-preview-heading.level-section{font-size:1.28em}.commented-preview-heading.level-subsection{font-size:1.12em}.commented-preview-heading.level-subsubsection,.commented-preview-heading.level-paragraph{font-size:1em}.commented-preview-list{margin:8px 0 14px;padding-left:1.8em}.commented-preview-list li{margin:4px 0}.commented-preview-quote{margin:10px 0;padding:8px 12px;border-left:3px solid var(--line-strong);color:var(--muted)}.commented-preview-include{display:flex;align-items:center;gap:8px;margin:10px 0;padding:7px 9px;border:1px dashed var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.commented-preview-include .commented-preview-include-kind{font-size:.78em;text-transform:uppercase;letter-spacing:.05em;font-weight:700}.commented-preview-include code{color:var(--vscode-foreground)}.commented-source-editor{display:none!important;font-family:var(--vscode-editor-font-family,monospace);font-size:.9em;white-space:pre-wrap;min-height:90px;margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--vscode-editor-background)}.doc-rich-block.comment-block.review-editing .commented-preview{display:none}.doc-rich-block.comment-block.review-editing .commented-source-editor{display:block!important}.doc-rich-block.comment-block.review-editing .review-card-head{margin-bottom:8px}.doc-rich-block.quote{border-left:4px solid var(--line-strong);font-style:italic}.doc-rich-block.theorem{border-left:4px solid var(--accent)}.doc-rich-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}.review-card-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}.review-card-head .doc-rich-label{flex:1;min-width:0;margin-bottom:0}.review-card-actions{display:flex;align-items:center;gap:5px}.review-card-action{appearance:none;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font:inherit;font-size:10px;line-height:1;padding:5px 7px;cursor:pointer;white-space:nowrap}.review-card-action:hover{background:var(--hover);color:var(--vscode-foreground);border-color:var(--line-strong)}.review-card-action.review-hide{font-size:15px;padding:3px 7px}.review-card-action.review-delete-source:hover{color:var(--vscode-errorForeground);border-color:var(--vscode-errorForeground)}.doc-rich-block.review-collapsed .review-card-body{display:none}.doc-rich-block.review-collapsed .review-card-head{margin-bottom:0}
 .comment-anchor{position:relative;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:visible!important;z-index:15;box-shadow:none!important}
@@ -3132,6 +3355,20 @@ body.comment-inspector-open .main{padding-bottom:calc(100px + clamp(190px,30vh,3
 .comment-inspector-actions button:hover{background:var(--hover);border-color:var(--line-strong)}
 .comment-inspector-actions .danger:hover{color:var(--vscode-errorForeground);border-color:var(--vscode-errorForeground)}
 .comment-inspector-note{color:var(--muted);font-size:11px;margin-top:10px}
+.active-file-indicator{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px;padding:0 6px}
+.project-issues{position:fixed;left:var(--sidebar);right:0;bottom:0;height:clamp(210px,34vh,380px);z-index:116;background:var(--vscode-sideBar-background,var(--panel));border-top:1px solid var(--line-strong);box-shadow:0 -14px 34px rgba(0,0,0,.26);transform:translateY(102%);transition:transform .16s ease,left .16s ease;display:flex;flex-direction:column}
+body.nav-closed .project-issues,body.focus-mode .project-issues{left:0}
+body.project-issues-open .project-issues{transform:translateY(0)}
+body.project-issues-open .main{padding-bottom:calc(100px + clamp(210px,34vh,380px));scroll-padding-bottom:calc(clamp(210px,34vh,380px) + 24px)}
+.project-issues-head{height:42px;flex:0 0 42px;display:flex;align-items:center;gap:10px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--vscode-editorWidget-background)}
+.project-issues-head strong{flex:1;font-size:12px;letter-spacing:.02em}.project-issues-count{font-size:11px;color:var(--muted)}
+.project-issues-close{appearance:none;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font:inherit;font-size:16px;line-height:1;padding:4px 8px;cursor:pointer}
+.project-issues-close:hover{background:var(--hover);color:var(--vscode-foreground)}
+.project-issues-body{flex:1;min-height:0;overflow:auto;padding:12px}.project-issues-empty{padding:18px;color:var(--muted);text-align:center}
+.project-issues-group{margin-bottom:14px}.project-issues-group-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 6px 2px}
+.project-issue-row{appearance:none;width:100%;display:grid;grid-template-columns:76px minmax(0,1fr) auto;gap:8px;align-items:start;text-align:left;border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--vscode-foreground);font:inherit;padding:8px 6px;cursor:pointer}
+.project-issue-row:hover{background:var(--hover)}.project-issue-row.no-location{cursor:default}.project-issue-severity{font-size:10px;font-weight:700;text-transform:uppercase}.project-issue-main{min-width:0}.project-issue-message{font-size:12px}.project-issue-context{margin-top:2px;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.project-issue-file{font-size:10px;color:var(--muted);white-space:nowrap}
+@media(max-width:1050px){.project-issues{left:0}body.project-issues-open .main{padding-bottom:calc(70px + clamp(210px,34vh,380px))}.active-file-indicator{display:none}}
 .doc-break{position:relative;height:28px;margin:18px 0;border-top:1px dashed var(--line-strong);color:var(--muted);font-size:10px;text-align:center;padding-top:5px}.labs-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.labs-form-grid label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:11px}.labs-form-grid label.wide{grid-column:1/-1}.labs-form-grid input,.labs-form-grid textarea,.labs-form-grid select{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:7px 8px;font:inherit}.labs-feature-note{font-size:10px;color:var(--muted);margin-top:8px}
 .tex-hspace{display:inline-flex;align-items:center;justify-content:center;min-width:.45em;height:1em;margin:0 .08em;padding:0 .18em;border:1px dashed color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:3px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:.68em;vertical-align:middle;white-space:nowrap}.doc-vspace,.vspace-block{position:relative;min-height:18px;margin:8px 0;border-left:2px dotted color-mix(in srgb,var(--accent) 55%,transparent);background:linear-gradient(to bottom,transparent 45%,color-mix(in srgb,var(--accent) 10%,transparent) 45%,color-mix(in srgb,var(--accent) 10%,transparent) 55%,transparent 55%);border-radius:3px}.doc-vspace .vspace-label,.vspace-block .vspace-label{position:absolute;left:7px;top:50%;transform:translateY(-50%);padding:1px 5px;background:var(--paper,var(--panel));color:var(--muted);font-size:10px;font-family:var(--vscode-editor-font-family,monospace)}.spacing-modal-body{padding:16px;display:grid;gap:13px}.spacing-type-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.spacing-type-row button{padding:10px;border:1px solid var(--line-strong);border-radius:8px;background:var(--input);color:var(--fg);cursor:pointer}.spacing-type-row button.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--input))}.spacing-presets{display:flex;gap:7px;flex-wrap:wrap}.spacing-presets button{padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--fg);cursor:pointer}.spacing-presets button:hover{background:var(--hover)}
 .cite-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.46);display:none;align-items:center;justify-content:center;z-index:260}.cite-modal-backdrop.open{display:flex}.cite-modal{width:min(760px,calc(100vw - 34px));max-height:min(720px,calc(100vh - 34px));display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line-strong);border-radius:14px;box-shadow:0 28px 70px rgba(0,0,0,.42);overflow:hidden}.cite-modal-head,.cite-modal-foot{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}.cite-modal-foot{border-bottom:0;border-top:1px solid var(--line);justify-content:flex-end}.cite-modal-body{padding:14px;overflow:auto}.cite-search-row{display:grid;grid-template-columns:1fr 150px;gap:10px;margin-bottom:12px}.cite-search,.cite-style{width:100%;box-sizing:border-box;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:7px;padding:8px 10px;font:inherit}.cite-results{display:flex;flex-direction:column;gap:7px}.cite-result{display:grid;grid-template-columns:22px 1fr;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer;background:transparent;color:var(--fg);text-align:left}.cite-result:hover{background:var(--hover)}.cite-result.selected{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}.cite-result-main{min-width:0}.cite-result-title{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cite-result-meta{font-size:.82em;color:var(--muted);margin-top:2px}.cite-empty{padding:20px;color:var(--muted);text-align:center}.cite-check{align-self:center}.cite-close,.cite-cancel,.cite-insert,.cite-secondary{border:1px solid var(--line-strong);background:var(--button);color:var(--button-fg);border-radius:7px;padding:7px 11px;cursor:pointer}.cite-insert{background:var(--accent);color:var(--accent-fg);border-color:transparent}.cite-secondary{background:transparent;color:var(--fg)}.cite-secondary:disabled,.cite-insert:disabled{opacity:.45;cursor:default}.cite-preview{font-size:.78em;color:var(--muted);display:block;margin-top:2px}.cite-menu-subtitle{margin-top:8px;padding-top:9px;border-top:1px solid var(--line)}.doc-outline-bibliography{font-weight:650;color:var(--fg);margin-top:9px}.doc-outline-bibliography.pending{color:var(--muted);font-weight:500;font-style:italic}
@@ -3142,10 +3379,14 @@ body.comment-inspector-open .main{padding-bottom:calc(100px + clamp(190px,30vh,3
 ::highlight(texflow-find-current){background:var(--vscode-editor-findMatchBackground,color-mix(in srgb,var(--vscode-focusBorder) 58%,transparent));color:var(--vscode-editor-findMatchForeground,var(--vscode-editor-foreground))}
 .texflow-find{position:fixed;right:18px;top:54px;z-index:120;display:none;align-items:center;gap:5px;padding:6px;background:var(--vscode-editorWidget-background,var(--panel));border:1px solid var(--vscode-widget-border,var(--line-strong));border-radius:8px;box-shadow:0 10px 28px rgba(0,0,0,.28)}
 .texflow-find.open{display:flex}.texflow-find input{width:260px;max-width:34vw;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--line-strong));border-radius:5px;padding:6px 8px;font:inherit;outline:none}.texflow-find input:focus{border-color:var(--vscode-focusBorder);box-shadow:0 0 0 1px var(--vscode-focusBorder)}.texflow-find-count{min-width:58px;text-align:center;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.texflow-find button{width:28px;height:28px;display:grid;place-items:center;border:0;border-radius:5px;background:transparent;color:var(--vscode-foreground);font:inherit;cursor:pointer}.texflow-find button:hover:not(:disabled){background:var(--hover)}.texflow-find button:disabled{opacity:.4;cursor:default}body.focus-mode .texflow-find{top:12px}@media(max-width:700px){.texflow-find{left:10px;right:10px}.texflow-find input{width:auto;max-width:none;flex:1}}
-</style></head><body class="nav-open"><header class="topbar"><div class="topbar-brand" aria-label="TeXFlow"><span class="brand-full">TeXFlow</span><span class="brand-short">TF</span></div><div class="top-menu" id="file-menu"><button class="top-action menu-label" id="file-menu-button">File ▾</button><div class="top-menu-panel"><button id="new-document">New document…</button><span class="menu-divider"></span><button id="open-file" title="Open (Ctrl/Cmd+O)">Open…</button><button id="save-file" title="Save (Ctrl/Cmd+S)">Save</button><button id="save-as" title="Save as (Ctrl/Cmd+Shift+S)">Save as…</button></div></div><div class="top-menu" id="edit-menu"><button class="top-action menu-label" id="edit-menu-button">Edit ▾</button><div class="top-menu-panel"><button id="undo" title="Undo">↶ Undo</button><button id="redo" title="Redo">↷ Redo</button><span class="menu-divider"></span><button id="find-document" title="Find (Ctrl/Cmd+F)">Find…</button><button id="labs-find-replace">Find / Replace…</button><span class="menu-divider"></span><div class="menu-title">Selected object</div><button id="labs-copy-object">Copy object</button><button id="labs-paste-object">Paste object</button><button id="labs-duplicate-object">Duplicate object</button><button id="labs-move-up">Move up</button><button id="labs-move-down">Move down</button></div></div><div class="top-menu" id="structure-menu"><button class="top-action menu-label" id="structure-menu-button">Structure ▾</button><div class="top-menu-panel wide-menu" id="structure-menu-panel"></div></div><div class="top-menu" id="insert-menu"><button class="top-action menu-label" id="insert-menu-button">Insert ▾</button><div class="top-menu-panel wide-menu" id="insert-menu-panel"></div></div><div class="top-menu" id="format-menu"><button class="top-action menu-label" id="format-menu-button">Format ▾</button><div class="top-menu-panel"><div class="menu-title">Text</div><button class="format" data-format="bold"><b>B</b>&nbsp;&nbsp;Bold</button><button class="format" data-format="italic"><i>I</i>&nbsp;&nbsp;Italic</button><button class="format" data-format="underline"><u>U</u>&nbsp;&nbsp;Underline</button><button class="format" data-format="key">K&nbsp;&nbsp;Key</button><button class="format" data-format="alert">!&nbsp;&nbsp;Alert</button><span class="menu-divider"></span><div class="menu-title">Paragraph alignment</div><button class="insert" data-action="alignleft">Align left</button><button class="insert" data-action="aligncenter">Center</button><button class="insert" data-action="alignright">Align right</button><button class="insert" data-action="alignjustify">Justify / normal</button><span class="menu-divider"></span><div class="menu-title">Text color</div><div class="color-grid top-color-grid"><button class="color-swatch" data-color="black" title="black" style="background:black"></button><button class="color-swatch" data-color="gray" title="gray" style="background:gray"></button><button class="color-swatch" data-color="red" title="red" style="background:red"></button><button class="color-swatch" data-color="orange" title="orange" style="background:orange"></button><button class="color-swatch" data-color="yellow" title="yellow" style="background:yellow"></button><button class="color-swatch" data-color="green" title="green" style="background:green"></button><button class="color-swatch" data-color="blue" title="blue" style="background:blue"></button><button class="color-swatch" data-color="cyan" title="cyan" style="background:cyan"></button><button class="color-swatch" data-color="magenta" title="magenta" style="background:magenta"></button><button class="color-swatch" data-color="purple" title="purple" style="background:purple"></button><button class="color-swatch" data-color="brown" title="brown" style="background:brown"></button></div></div></div><div class="top-menu" id="references-menu"><button class="top-action menu-label" id="references-menu-button">References ▾</button><div class="top-menu-panel wide-menu" id="references-menu-panel"></div></div><div class="top-menu" id="layout-menu-top"><button class="top-action menu-label" id="layout-menu-button">Layout ▾</button><div class="top-menu-panel wide-menu" id="layout-menu-panel"></div></div><div class="top-menu" id="language-menu-top"><button class="top-action menu-label" id="language-menu-button">Language ▾</button><div class="top-menu-panel"><button id="spell-language-automatic">Automatic</button><button id="spell-language-english">English</button><button id="spell-language-spanish">Español</button><span class="menu-divider"></span><button id="spell-check-toggle">Spell checking</button></div></div><div class="top-menu beamer-only" id="beamer-menu-top"><button class="top-action menu-label" id="beamer-menu-button">Beamer ▾</button><div class="top-menu-panel"><button class="insert" data-action="frame">New frame</button><span class="menu-divider"></span><div class="menu-title">Blocks</div><button class="insert" data-action="beamerblock">Block</button><button class="insert" data-action="beameralert">Alert block</button><button class="insert" data-action="beamerexample">Example block</button><span class="menu-divider"></span><div class="menu-title">Frame text size</div><button class="frame-size-option" data-frame-size="normal">✓ Normal</button><button class="frame-size-option" data-frame-size="small">Small</button><button class="frame-size-option" data-frame-size="footnotesize">Footnotesize</button><button class="frame-size-option" data-frame-size="scriptsize">Scriptsize</button><button class="frame-size-option" data-frame-size="tiny">Tiny</button><span class="menu-divider"></span><button class="insert" data-action="frameoptions">Frame options…</button></div></div><div class="top-menu" id="view-menu"><button class="top-action menu-label" id="view-menu-button">View ▾</button><div class="top-menu-panel"><button class="document-only" id="view-continuous">✓ Continuous</button><button class="document-only" id="view-pages">Pages</button><span class="menu-divider document-only"></span><button id="toggle-nav">Index / outline</button><button id="focus-mode">Focus mode</button><span class="menu-divider"></span><div class="menu-title">Comments</div><button id="view-source-comments">Show source comments</button><button id="view-author-notes">Show author notes</button><button id="view-comment-blocks">Show commented-out blocks</button><button id="view-hidden-comments" style="display:none">Show hidden comments</button><span class="menu-divider"></span><button id="project-diagnostics">Project diagnostics</button></div></div><span class="top-separator"></span><nav class="mode-tabs"><button class="mode-tab active" data-view="visual">Visual</button><button class="mode-tab" data-view="source">Source</button><button class="mode-tab" data-view="split">Split</button><button class="mode-tab" data-view="pdf">PDF</button></nav><span class="top-spacer topbar-spacer"></span><button class="top-action primary" id="top-compile">▶ Compile</button><span class="save-status" id="save-status">Saved</span></header><div class="texflow-find" id="texflow-find" role="search"><input id="texflow-find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in document"><span class="texflow-find-count" id="texflow-find-count">0 of 0</span><button id="texflow-find-prev" type="button" title="Previous match (Shift+Enter)">↑</button><button id="texflow-find-next" type="button" title="Next match (Enter)">↓</button><button id="texflow-find-close" type="button" title="Close (Esc)">×</button></div><div class="floating-actions"><button class="floating-btn focus-exit" id="exit-focus" title="Exit focus mode">⛶</button></div><div id="app"><aside class="side"><div class="brand"><span class="brand-mark">T</span><span>Document</span></div><div id="nav"></div></aside><main class="main"><div id="content" class="empty">Loading…</div></main></div>
+</style></head><body class="nav-open"><header class="topbar"><div class="topbar-brand" aria-label="TeXFlow"><span class="brand-full">TeXFlow</span><span class="brand-short">TF</span></div><div class="top-menu" id="file-menu"><button class="top-action menu-label" id="file-menu-button">File ▾</button><div class="top-menu-panel"><button id="new-document">New document…</button><span class="menu-divider"></span><button id="open-file" title="Open (Ctrl/Cmd+O)">Open…</button><button id="save-file" title="Save (Ctrl/Cmd+S)">Save</button><button id="save-as" title="Save as (Ctrl/Cmd+Shift+S)">Save as…</button></div></div><div class="top-menu" id="edit-menu"><button class="top-action menu-label" id="edit-menu-button">Edit ▾</button><div class="top-menu-panel"><button id="undo" title="Undo">↶ Undo</button><button id="redo" title="Redo">↷ Redo</button><span class="menu-divider"></span><button id="find-document" title="Find (Ctrl/Cmd+F)">Find…</button><button id="labs-find-replace">Find / Replace…</button><span class="menu-divider"></span><div class="menu-title">Selected object</div><button id="labs-copy-object">Copy object</button><button id="labs-paste-object">Paste object</button><button id="labs-duplicate-object">Duplicate object</button><button id="labs-move-up">Move up</button><button id="labs-move-down">Move down</button></div></div><div class="top-menu" id="structure-menu"><button class="top-action menu-label" id="structure-menu-button">Structure ▾</button><div class="top-menu-panel wide-menu" id="structure-menu-panel"></div></div><div class="top-menu" id="insert-menu"><button class="top-action menu-label" id="insert-menu-button">Insert ▾</button><div class="top-menu-panel wide-menu" id="insert-menu-panel"></div></div><div class="top-menu" id="format-menu"><button class="top-action menu-label" id="format-menu-button">Format ▾</button><div class="top-menu-panel"><div class="menu-title">Text</div><button class="format" data-format="bold"><b>B</b>&nbsp;&nbsp;Bold</button><button class="format" data-format="italic"><i>I</i>&nbsp;&nbsp;Italic</button><button class="format" data-format="underline"><u>U</u>&nbsp;&nbsp;Underline</button><button class="format" data-format="key">K&nbsp;&nbsp;Key</button><button class="format" data-format="alert">!&nbsp;&nbsp;Alert</button><span class="menu-divider"></span><div class="menu-title">Paragraph alignment</div><button class="insert" data-action="alignleft">Align left</button><button class="insert" data-action="aligncenter">Center</button><button class="insert" data-action="alignright">Align right</button><button class="insert" data-action="alignjustify">Justify / normal</button><span class="menu-divider"></span><div class="menu-title">Text color</div><div class="color-grid top-color-grid"><button class="color-swatch" data-color="black" title="black" style="background:black"></button><button class="color-swatch" data-color="gray" title="gray" style="background:gray"></button><button class="color-swatch" data-color="red" title="red" style="background:red"></button><button class="color-swatch" data-color="orange" title="orange" style="background:orange"></button><button class="color-swatch" data-color="yellow" title="yellow" style="background:yellow"></button><button class="color-swatch" data-color="green" title="green" style="background:green"></button><button class="color-swatch" data-color="blue" title="blue" style="background:blue"></button><button class="color-swatch" data-color="cyan" title="cyan" style="background:cyan"></button><button class="color-swatch" data-color="magenta" title="magenta" style="background:magenta"></button><button class="color-swatch" data-color="purple" title="purple" style="background:purple"></button><button class="color-swatch" data-color="brown" title="brown" style="background:brown"></button></div></div></div><div class="top-menu" id="references-menu"><button class="top-action menu-label" id="references-menu-button">References ▾</button><div class="top-menu-panel wide-menu" id="references-menu-panel"></div></div><div class="top-menu" id="layout-menu-top"><button class="top-action menu-label" id="layout-menu-button">Layout ▾</button><div class="top-menu-panel wide-menu" id="layout-menu-panel"></div></div><div class="top-menu" id="language-menu-top"><button class="top-action menu-label" id="language-menu-button">Language ▾</button><div class="top-menu-panel"><button id="spell-language-automatic">Automatic</button><button id="spell-language-english">English</button><button id="spell-language-spanish">Español</button><span class="menu-divider"></span><button id="spell-check-toggle">Spell checking</button></div></div><div class="top-menu beamer-only" id="beamer-menu-top"><button class="top-action menu-label" id="beamer-menu-button">Beamer ▾</button><div class="top-menu-panel"><button class="insert" data-action="frame">New frame</button><span class="menu-divider"></span><div class="menu-title">Blocks</div><button class="insert" data-action="beamerblock">Block</button><button class="insert" data-action="beameralert">Alert block</button><button class="insert" data-action="beamerexample">Example block</button><span class="menu-divider"></span><div class="menu-title">Frame text size</div><button class="frame-size-option" data-frame-size="normal">✓ Normal</button><button class="frame-size-option" data-frame-size="small">Small</button><button class="frame-size-option" data-frame-size="footnotesize">Footnotesize</button><button class="frame-size-option" data-frame-size="scriptsize">Scriptsize</button><button class="frame-size-option" data-frame-size="tiny">Tiny</button><span class="menu-divider"></span><button class="insert" data-action="frameoptions">Frame options…</button></div></div><div class="top-menu" id="view-menu"><button class="top-action menu-label" id="view-menu-button">View ▾</button><div class="top-menu-panel"><button class="document-only" id="view-continuous">✓ Continuous</button><button class="document-only" id="view-pages">Pages</button><span class="menu-divider document-only"></span><button id="toggle-nav">Index / outline</button><button id="focus-mode">Focus mode</button><span class="menu-divider"></span><div class="menu-title">Comments</div><button id="view-source-comments">Show source comments</button><button id="view-author-notes">Show author notes</button><button id="view-comment-blocks">Show commented-out blocks</button><button id="view-hidden-comments" style="display:none">Show hidden comments</button><span class="menu-divider"></span><button id="project-issues-button">Project Issues</button><button id="project-diagnostics">Project diagnostics</button></div></div><span class="top-separator"></span><nav class="mode-tabs"><button class="mode-tab active" data-view="visual">Visual</button><button class="mode-tab" data-view="source">Source</button><button class="mode-tab" data-view="split">Split</button><button class="mode-tab" data-view="pdf">PDF</button></nav><span class="top-spacer topbar-spacer"></span><span class="active-file-indicator" id="active-file-indicator"></span><button class="top-action primary" id="top-compile">▶ Compile</button><span class="save-status" id="save-status">Saved</span></header><div class="texflow-find" id="texflow-find" role="search"><input id="texflow-find-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find in document"><span class="texflow-find-count" id="texflow-find-count">0 of 0</span><button id="texflow-find-prev" type="button" title="Previous match (Shift+Enter)">↑</button><button id="texflow-find-next" type="button" title="Next match (Enter)">↓</button><button id="texflow-find-close" type="button" title="Close (Esc)">×</button></div><div class="floating-actions"><button class="floating-btn focus-exit" id="exit-focus" title="Exit focus mode">⛶</button></div><div id="app"><aside class="side"><div class="brand"><span class="brand-mark">T</span><span>Document</span></div><div id="nav"></div></aside><main class="main"><div id="content" class="empty">Loading…</div></main></div>
 <aside class="comment-inspector" id="comment-inspector" aria-hidden="true">
   <div class="comment-inspector-head"><strong>Comments</strong><button type="button" class="comment-inspector-close" id="comment-inspector-close" title="Close">×</button></div>
   <div class="comment-inspector-body" id="comment-inspector-body"><div class="comment-inspector-note">Select a C marker to open a comment.</div></div>
+</aside>
+<aside class="project-issues" id="project-issues" aria-hidden="true">
+  <div class="project-issues-head"><strong>Project Issues</strong><span class="project-issues-count" id="project-issues-count"></span><button type="button" class="project-issues-close" id="project-issues-close" title="Close">×</button></div>
+  <div class="project-issues-body" id="project-issues-body"><div class="project-issues-empty">No project issues.</div></div>
 </aside>
 <div class="math-modal-backdrop" id="math-modal" aria-hidden="true">
   <section class="math-modal" role="dialog" aria-modal="true" aria-labelledby="math-modal-title">
@@ -3248,7 +3489,7 @@ body.comment-inspector-open .main{padding-bottom:calc(100px + clamp(190px,30vh,3
   <section class="cite-modal" role="dialog" aria-modal="true" aria-labelledby="reference-modal-title">
     <header class="cite-modal-head"><strong id="reference-modal-title">Insert reference</strong><span class="spacer"></span><button class="cite-close" id="reference-close" type="button">✕</button></header>
     <div class="cite-modal-body">
-      <div class="cite-search-row"><input class="cite-search" id="reference-search" type="search" placeholder="Search labels…"><select class="cite-style" id="reference-style"><option value="ref">Reference — \ref</option><option value="eqref">Equation — \eqref</option></select></div>
+      <div class="cite-search-row"><input class="cite-search" id="reference-search" type="search" placeholder="Search labels…"><select class="cite-style" id="reference-style"><option value="ref">Reference — \ref</option><option value="eqref">Equation — \eqref</option><option value="autoref">Automatic — \autoref</option><option value="cref">Clever reference — \cref</option><option value="Cref">Clever reference — \Cref</option><option value="pageref">Page — \pageref</option><option value="vref">Varioref — \vref</option><option value="Vref">Varioref — \Vref</option></select></div>
       <div class="cite-results" id="reference-results"></div>
     </div>
     <footer class="cite-modal-foot"><span class="spacer"></span><button class="cite-cancel" id="reference-cancel" type="button">Cancel</button><button class="cite-insert" id="reference-insert" type="button" disabled>Insert reference</button></footer>
@@ -3267,7 +3508,12 @@ body.comment-inspector-open .main{padding-bottom:calc(100px + clamp(190px,30vh,3
 </div>
 <script nonce="${nonce}" src="${katexJs}"></script>
 <script nonce="${nonce}">
-const vscode=acquireVsCodeApi();let frames=[],current=0,isBeamer=false,documentClass='',documentSource='',metadata={},documentSettings={},documentLayoutMode='continuous',preambleOriginalText='',preambleDirty=false,presentationStyle={aspectWidth:4,aspectHeight:3,aspectLabel:'4:3',baseFontPt:11,bodyFontPx:16,titleFontPx:24.8,lineHeight:1.28},preambles=[],currentPreamble='root-preamble',mode='frames',viewMode='visual',sources=[],projectIncludes=[],rootUri='',pdfUri='',figureResources={},bibliographyEntries=[],bibliographyResources=[],bibliographyByKey={};
+const vscode=acquireVsCodeApi();let frames=[],current=0,isBeamer=false,documentClass='',documentSource='',metadata={},documentSettings={},documentLayoutMode='continuous',preambleOriginalText='',preambleDirty=false,presentationStyle={aspectWidth:4,aspectHeight:3,aspectLabel:'4:3',baseFontPt:11,bodyFontPx:16,titleFontPx:24.8,lineHeight:1.28},preambles=[],currentPreamble='root-preamble',mode='frames',viewMode='visual',sources=[],projectIncludes=[],rootUri='',masterUri='',activeUri='',activeFileName='',masterFileName='',pdfUri='',figureResources={},bibliographyEntries=[],bibliographyResources=[],bibliographyByKey={},projectIndex={documents:[],headings:[],labels:[],references:[],citations:[],bibliographyEntries:[],figures:[],includes:[]},projectIssues=[];
+function texflowBaseName(value){const parts=String(value||'').replace(/\\/g,'/').split('/').filter(Boolean);return parts[parts.length-1]||String(value||'');}
+function updateActiveFileIndicator(){const el=document.getElementById('active-file-indicator');if(!el)return;const active=texflowBaseName(activeFileName||activeUri),master=texflowBaseName(masterFileName||masterUri);el.textContent=active&&master&&active!==master?active+' · Project: '+master:(active||master||'');el.title=active&&master&&active!==master?'Active: '+active+' · Master: '+master:(active||master||'');}
+function closeProjectIssues(){document.body.classList.remove('project-issues-open');const panel=document.getElementById('project-issues');if(panel)panel.setAttribute('aria-hidden','true');}
+function renderProjectIssues(){const host=document.getElementById('project-issues-body'),count=document.getElementById('project-issues-count');if(!host)return;const rows=Array.isArray(projectIssues)?projectIssues:[];if(count)count.textContent=rows.length?String(rows.length):'0';host.innerHTML='';if(!rows.length){const empty=document.createElement('div');empty.className='project-issues-empty';empty.textContent='No project issues.';host.appendChild(empty);return;}const groups=[['error','Errors'],['warning','Warnings'],['info','Info']];groups.forEach(([severity,title])=>{const indexed=rows.map((issue,index)=>({issue,index})).filter(x=>x.issue&&x.issue.severity===severity);if(!indexed.length)return;const group=document.createElement('section');group.className='project-issues-group';const heading=document.createElement('div');heading.className='project-issues-group-title';heading.textContent=title+' · '+indexed.length;group.appendChild(heading);indexed.forEach(({issue,index})=>{const row=document.createElement('button');row.type='button';row.className='project-issue-row'+(issue.documentUri?'':' no-location');const sev=document.createElement('span');sev.className='project-issue-severity';sev.textContent=String(issue.kind||severity);const main=document.createElement('span');main.className='project-issue-main';const message=document.createElement('div');message.className='project-issue-message';message.textContent=String(issue.message||issue.kind||'Project issue');main.appendChild(message);if(issue.target){const context=document.createElement('div');context.className='project-issue-context';context.textContent=String(issue.target);main.appendChild(context);}const file=document.createElement('span');file.className='project-issue-file';file.textContent=String(issue.file||texflowBaseName(issue.documentUri||''));row.append(sev,main,file);if(issue.documentUri)row.onclick=()=>vscode.postMessage({type:'navigateProjectLocation',uri:issue.documentUri,start:Number(issue.start||0),end:Number(issue.end||issue.start||0),preferVisual:/\.tex$/i.test(String(issue.documentUri||''))});group.appendChild(row);});host.appendChild(group);});}
+function openProjectIssues(){closeCommentInspector();const panel=document.getElementById('project-issues');if(panel)panel.setAttribute('aria-hidden','false');document.body.classList.add('project-issues-open');renderProjectIssues();}
 const reviewVisibility={sourceComments:localStorage.getItem('texflow-review-source-comments')==='1',authorNotes:localStorage.getItem('texflow-review-author-notes')!=='0',commentBlocks:localStorage.getItem('texflow-review-comment-blocks')!=='0'};
 const reviewHiddenItems=new Set(),reviewCollapsedItems=new Set();
 let activeCommentInspectorKey='';
@@ -3357,7 +3603,7 @@ function texflowFindScheduleRefresh(resetIndex=false){if(!texflowFindState.open)
 function texflowFindNavigate(delta){const total=texflowFindState.matches.length;if(!total)return;texflowFindState.index=(Math.max(0,texflowFindState.index)+delta+total)%total;const target=texflowFindState.matches[texflowFindState.index];texflowFindUpdateCounter();if(isBeamer&&target&&target.frameIndex!==current){current=target.frameIndex;renderWorkspace();requestAnimationFrame(()=>texflowFindApplyVisible(true));return;}texflowFindApplyVisible(true);}
 function texflowOpenFind(){closeTopMenus();if(viewMode==='source'||viewMode==='pdf'){viewMode='visual';renderWorkspace();}const bar=document.getElementById('texflow-find'),input=document.getElementById('texflow-find-input');if(!bar||!input)return;texflowFindState.open=true;bar.classList.add('open');requestAnimationFrame(()=>{input.focus();input.select();texflowFindState.query=input.value||'';texflowFindRefresh(true,true);});}
 function texflowCloseFind(){const bar=document.getElementById('texflow-find');texflowFindState.open=false;if(bar)bar.classList.remove('open');texflowFindClearHighlights();}
-window.addEventListener('message',e=>{if(e.data.type==='spellcheckResult'){if(String(e.data.requestId||'')!==String(texflowSpellState.pendingRequestId||''))return;if(!texflowSpellState.supported)return;texflowApplySpellHighlights(e.data.issuesById||{});return;}if(e.data.type==='compileStarted'){pdfBuildState='building';pdfBuildMessage='Compiling…';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFinished'){pdfBuildState='ready';pdfBuildMessage='PDF compiled and opened in the VS Code PDF viewer.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFailed'){pdfBuildState='error';pdfBuildMessage=e.data.message||'Compilation failed.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='saveStatus'){const el=document.getElementById('save-status');el.textContent=e.data.state==='saving'?'Saving…':e.data.state==='error'?'Save error':(e.data.message||'Saved');el.classList.toggle('error',e.data.state==='error');if(e.data.state==='saved'){clearTimeout(window.__texflowStatusTimer);window.__texflowStatusTimer=setTimeout(()=>{el.textContent='Saved';},1600);}return;}if(e.data.type==='document'){frames=e.data.frames;isBeamer=!!e.data.isBeamer;documentClass=e.data.documentClass||'';documentSource=e.data.documentSource||'';metadata=e.data.metadata||{};documentSettings=e.data.documentSettings||documentSettings||{};presentationStyle=e.data.presentationStyle||presentationStyle;applyPresentationStyle();preambles=e.data.preambles||[];sources=e.data.sources||[];projectIncludes=e.data.projectIncludes||[];rootUri=e.data.rootUri||'';pdfUri=e.data.pdfUri||'';figureResources=e.data.figureResources||{};bibliographyEntries=e.data.bibliographyEntries||[];bibliographyResources=e.data.bibliographyResources||[];bibliographyByKey={};bibliographyEntries.forEach(x=>bibliographyByKey[x.key]=x);if(e.data.spellCheckSettings){texflowSpellState.enabled=!!e.data.spellCheckSettings.enabled;texflowSpellState.language=e.data.spellCheckSettings.language||'auto';}if(Number.isInteger(e.data.selectedFrame))current=Math.max(0,Math.min(e.data.selectedFrame,frames.length-1));if(!preambles.some(x=>x.id===currentPreamble)&&preambles[0])currentPreamble=preambles[0].id;document.querySelectorAll('.beamer-only').forEach(x=>x.classList.toggle('hidden',!isBeamer));document.querySelectorAll('.document-only').forEach(x=>x.classList.toggle('hidden',isBeamer));updateDocumentViewMenu();renderTopMenus();texflowUpdateLanguageMenu();renderNav();if(mode==='preamble')renderPreamble(currentPreamble);else renderWorkspace();if(e.data.focusFrameTitle){requestAnimationFrame(()=>{const t=document.querySelector('.workspace .slide .title[contenteditable=true]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}if(e.data.focusNewMath){requestAnimationFrame(()=>{const f=frames[current];if(!f)return;const maths=parseBlocks(f.body).filter(b=>b.kind==='equation');const b=maths[maths.length-1];if(b)openMathEditor(b,current);});}if(Number.isFinite(e.data.focusDocumentHeadingStart)){requestAnimationFrame(()=>{const t=document.querySelector('.doc-heading[data-node-start="'+String(e.data.focusDocumentHeadingStart)+'"]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}texflowScheduleSpellcheck();}});
+window.addEventListener('message',e=>{if(e.data.type==='spellcheckResult'){if(String(e.data.requestId||'')!==String(texflowSpellState.pendingRequestId||''))return;if(!texflowSpellState.supported)return;texflowApplySpellHighlights(e.data.issuesById||{});return;}if(e.data.type==='compileStarted'){pdfBuildState='building';pdfBuildMessage='Compiling…';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFinished'){pdfBuildState='ready';pdfBuildMessage='PDF compiled and opened in the VS Code PDF viewer.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='compileFailed'){pdfBuildState='error';pdfBuildMessage=e.data.message||'Compilation failed.';viewMode='pdf';renderWorkspace();return;}if(e.data.type==='saveStatus'){const el=document.getElementById('save-status');el.textContent=e.data.state==='saving'?'Saving…':e.data.state==='error'?'Save error':(e.data.message||'Saved');el.classList.toggle('error',e.data.state==='error');if(e.data.state==='saved'){clearTimeout(window.__texflowStatusTimer);window.__texflowStatusTimer=setTimeout(()=>{el.textContent='Saved';},1600);}return;}if(e.data.type==='document'){frames=e.data.frames||[];isBeamer=!!e.data.isBeamer;documentClass=e.data.documentClass||'';documentSource=e.data.documentSource||'';metadata=e.data.metadata||{};documentSettings=e.data.documentSettings||documentSettings||{};presentationStyle=e.data.presentationStyle||presentationStyle;applyPresentationStyle();preambles=e.data.preambles||[];sources=e.data.sources||[];projectIncludes=e.data.projectIncludes||[];masterUri=e.data.masterUri||e.data.rootUri||'';activeUri=e.data.activeUri||masterUri;rootUri=masterUri;activeFileName=e.data.fileName||'';masterFileName=e.data.masterFileName||activeFileName;pdfUri=e.data.pdfUri||'';figureResources=e.data.figureResources||{};bibliographyEntries=e.data.bibliographyEntries||[];bibliographyResources=e.data.bibliographyResources||[];projectIndex=e.data.projectIndex||{documents:[],headings:[],labels:[],references:[],citations:[],bibliographyEntries:[],figures:[],includes:[]};projectIssues=e.data.projectIssues||[];bibliographyByKey={};bibliographyEntries.forEach(x=>bibliographyByKey[x.key]=x);updateActiveFileIndicator();if(document.body.classList.contains('project-issues-open'))renderProjectIssues();if(e.data.spellCheckSettings){texflowSpellState.enabled=!!e.data.spellCheckSettings.enabled;texflowSpellState.language=e.data.spellCheckSettings.language||'auto';}if(Number.isInteger(e.data.selectedFrame))current=Math.max(0,Math.min(e.data.selectedFrame,Math.max(0,frames.length-1)));if(!preambles.some(x=>x.id===currentPreamble)&&preambles[0])currentPreamble=preambles[0].id;document.querySelectorAll('.beamer-only').forEach(x=>x.classList.toggle('hidden',!isBeamer));document.querySelectorAll('.document-only').forEach(x=>x.classList.toggle('hidden',isBeamer));updateDocumentViewMenu();renderTopMenus();texflowUpdateLanguageMenu();renderNav();if(mode==='preamble')renderPreamble(currentPreamble);else renderWorkspace();if(e.data.focusFrameTitle){requestAnimationFrame(()=>{const t=document.querySelector('.workspace .slide .title[contenteditable=true]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}if(e.data.focusNewMath){requestAnimationFrame(()=>{const f=frames[current];if(!f)return;const maths=parseBlocks(f.body).filter(b=>b.kind==='equation');const b=maths[maths.length-1];if(b)openMathEditor(b,current);});}if(Number.isFinite(e.data.focusDocumentHeadingStart)){requestAnimationFrame(()=>{const t=document.querySelector('.doc-heading[data-node-start="'+String(e.data.focusDocumentHeadingStart)+'"]');if(t){t.focus();const r=document.createRange();r.selectNodeContents(t);const sel=window.getSelection();sel.removeAllRanges();sel.addRange(r);}});}if(Number.isFinite(e.data.focusSourceOffset)){requestAnimationFrame(()=>focusDocumentSourceOffset(Number(e.data.focusSourceOffset)));}texflowScheduleSpellcheck();}});
 function esc(s){return String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));}
 let activeEditable=null;const saveTimers=new WeakMap();function scheduleSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);document.getElementById('save-status').textContent='Editing…';saveTimers.set(el,setTimeout(()=>send(false),500));}
 /* Blur/focus movement must persist source WITHOUT rebuilding the webview.
@@ -3391,7 +3637,7 @@ function latexToHtml(text){
  source=source.replace(/\\nomenclature\{([^{}]*)\}\{([^{}]*)\}/g,(_,symbol,description)=>{const i=nomenclatures.push({symbol,description})-1;return '@@TEXFLOW_NOMENCLATURE_'+i+'@@';});
  source=source.replace(/\\(?:today|jobname)\b/g,m=>{const i=fields.push(m.slice(1))-1;return '@@TEXFLOW_FIELD_'+i+'@@';});
  source=source.replace(/\\hspace(\*)?\{([^}]+)\}/g,(_,star,amount)=>{const i=hspaces.push({star:!!star,amount})-1;return '@@TEXFLOW_HSPACE_'+i+'@@';});
- source=source.replace(/\\(eqref|ref|autoref|pageref)\{([^}]+)\}/g,(_,cmd,key)=>{const i=references.push({cmd,key})-1;return '@@TEXFLOW_REFERENCE_'+i+'@@';});
+ source=source.replace(/\\(eqref|ref|autoref|cref|Cref|pageref|vref|Vref)\{([^}]+)\}/g,(_,cmd,key)=>{const i=references.push({cmd,key})-1;return '@@TEXFLOW_REFERENCE_'+i+'@@';});
  source=source.replace(/\\(parencite|textcite|autocite|citep|citet|cite)\{([^}]+)\}/g,(_,cmd,keys)=>{const i=citations.push({cmd,keys})-1;return '@@TEXFLOW_CITATION_'+i+'@@';});
  source=source.replace(/\\printbibliography(?:\[[^\]]*\])?/g,'@@TEXFLOW_PRINT_BIB@@');
  source=source.replace(/\\\[([\s\S]*?)\\\]/g,(_,expr)=>{const i=displayMath.push(expr)-1;return '@@TEXFLOW_DISPLAY_MATH_'+i+'@@';});
@@ -3419,8 +3665,8 @@ function latexToHtml(text){
  x=x.replace(/@@TEXFLOW_HSPACE_(\d+)@@/g,(_,idx)=>{const h=hspaces[Number(idx)]||{amount:'',star:false};return '<span class="tex-hspace" contenteditable="false" data-space-amount="'+esc(h.amount)+'" data-space-starred="'+(h.star?'true':'false')+'">↔ '+esc(h.amount)+'</span><span class="math-caret-anchor">&#8203;</span>';});
  x=x.replace(/@@TEXFLOW_DISPLAY_MATH_(\d+)@@/g,(_,idx)=>'<span class="display-math" contenteditable="false" data-math="'+encodeURIComponent(displayMath[Number(idx)]||'')+'"></span><span class="math-caret-anchor">&#8203;</span>');
  x=x.replace(/@@TEXFLOW_INLINE_MATH_(\d+)@@/g,(_,idx)=>'<span class="inline-math" contenteditable="false" data-math="'+encodeURIComponent(inlineMath[Number(idx)]||'')+'"></span><span class="math-caret-anchor">&#8203;</span>');
- x=x.replace(/@@TEXFLOW_REFERENCE_(\d+)@@/g,(_,idx)=>{const r=references[Number(idx)]||{cmd:'ref',key:''},known=documentLabels.some(x=>x.key===r.key)||String(documentSource||'').includes('\\label{'+r.key+'}'),num=documentRefs[r.key],display=r.cmd==='eqref'&&num?'('+num+')':r.key;return '<span class="tex-reference'+(known?'':' missing')+'" contenteditable="false" data-ref-command="'+esc(r.cmd)+'" data-ref-key="'+esc(r.key)+'"><span class="tex-reference-kind">'+esc(r.cmd)+'</span><span class="tex-reference-key">'+esc(display)+'</span></span><span class="math-caret-anchor">&#8203;</span>';});
- x=x.replace(/@@TEXFLOW_CITATION_(\d+)@@/g,(_,idx)=>{const c=citations[Number(idx)]||{cmd:'cite',keys:''},v=citationLabel(c.keys,c.cmd);return '<span class="bib-citation'+(v.missing?' missing':'')+'" contenteditable="false" data-cite-command="'+esc(c.cmd)+'" data-cite-keys="'+esc(c.keys)+'">'+v.html+'<span class="bib-citation-key">'+esc(c.keys)+'</span></span><span class="math-caret-anchor">&#8203;</span>';});
+ x=x.replace(/@@TEXFLOW_REFERENCE_(\d+)@@/g,(_,idx)=>{const r=references[Number(idx)]||{cmd:'ref',key:''},keys=String(r.key||'').split(',').map(x=>x.trim()).filter(Boolean),knownLabels=new Set(availableLabels().map(x=>x.key)),known=keys.length>0&&keys.every(k=>knownLabels.has(k)),num=keys.length===1?documentRefs[keys[0]]:null,display=r.cmd==='eqref'&&num?'('+num+')':r.key;return '<span class="tex-reference'+(known?'':' missing')+'" contenteditable="false" data-ref-command="'+esc(r.cmd)+'" data-ref-key="'+esc(r.key)+'" title="'+esc(known?'Double-click to open reference target':'Missing reference target: '+r.key)+'"><span class="tex-reference-kind">'+esc(r.cmd)+'</span><span class="tex-reference-key">'+esc(display)+'</span></span><span class="math-caret-anchor">&#8203;</span>';});
+ x=x.replace(/@@TEXFLOW_CITATION_(\d+)@@/g,(_,idx)=>{const c=citations[Number(idx)]||{cmd:'cite',keys:''},v=citationLabel(c.keys,c.cmd);return '<span class="bib-citation'+(v.missing?' missing':'')+'" contenteditable="false" data-cite-command="'+esc(c.cmd)+'" data-cite-keys="'+esc(c.keys)+'" title="'+esc(v.missing?'Missing bibliography entry: '+c.keys:'Double-click to open bibliography entry')+'">'+v.html+'<span class="bib-citation-key">'+esc(c.keys)+'</span></span><span class="math-caret-anchor">&#8203;</span>';});
  x=x.replace(/@@TEXFLOW_PRINT_BIB@@/g,'<span class="bib-print-placeholder" contenteditable="false">References — rendered from the loaded .bib file. See PDF for final bibliography formatting.</span>');
  return x;
 }
@@ -3772,8 +4018,22 @@ function makeThumb(f,i){
 function collapsibleGroup(label,cls,key){
  const group=document.createElement('div');group.className=cls;const title=document.createElement('div');title.className=cls==='nav-group'?'nav-group-title':'nav-subgroup-title';const store='texflow-collapse-'+key;const collapsed=localStorage.getItem(store)==='1';if(collapsed)group.classList.add('collapsed');title.innerHTML='<span class="chev">'+(collapsed?'+':'−')+'</span><span>'+esc(label)+'</span>';title.onclick=()=>{group.classList.toggle('collapsed');const c=group.classList.contains('collapsed');title.querySelector('.chev').textContent=c?'▸':'▾';localStorage.setItem(store,c?'1':'0')};const body=document.createElement('div');body.className=cls==='nav-group'?'nav-group-body':'nav-subgroup-body';group.append(title,body);return{group,body};
 }
+function renderProjectFileLinks(nav){
+ const indexed=projectIndex&&Array.isArray(projectIndex.documents)?projectIndex.documents:[];
+ const docs=indexed.length?indexed:sources.map(x=>({uri:String(x.uri||''),label:String(x.label||texflowBaseName(x.uri||''))}));
+ if(docs.length<=1)return;
+ const title=document.createElement('div');title.className='section project-files-title';title.textContent='PROJECT FILES';nav.appendChild(title);
+ docs.forEach(item=>{
+  const uri=String(item.uri||''),label=String(item.label||texflowBaseName(uri));if(!uri)return;
+  const row=document.createElement('button');row.type='button';row.className='project-file-link'+(uri===activeUri?' active':'');row.dataset.uri=uri;row.title=uri===masterUri?'Master document · '+label:'Open '+label+' in Visual';
+  const name=document.createElement('span');name.className='project-file-name';name.textContent=label;row.appendChild(name);
+  if(uri===masterUri){const role=document.createElement('span');role.className='project-file-role';role.textContent='MASTER';row.appendChild(role);}
+  row.onclick=()=>{if(uri!==activeUri)vscode.postMessage({type:'openProjectDocument',uri});};nav.appendChild(row);
+ });
+}
 function renderNav(){
  const nav=document.getElementById('nav');nav.innerHTML='';
+ renderProjectFileLinks(nav);
  const p=document.createElement('div');p.className='preamble-link'+(mode==='preamble'?' active':'');p.textContent='⌘  Preamble';p.title='Edit the preamble as plain LaTeX';p.onclick=()=>renderPreamble(currentPreamble);nav.appendChild(p);
  if(!isBeamer){renderDocumentOutline(nav);return;}
  let fileBody=nav,sectionBody=null,subBody=null,lastFile='__',lastSection='__',lastSub='__';
@@ -3879,7 +4139,7 @@ function parseDocumentFlow(){
    /* style command is metadata; preserve in Source, do not render */
   }else if(m[7]){
    const absStart=info.start+m.index,absEnd=info.start+tokenRe.lastIndex;
-   const ref=projectIncludes.find(r=>r.sourceUri===rootUri&&Number(r.start)===absStart);
+   const ref=projectIncludes.find(r=>r.sourceUri===activeUri&&Number(r.start)===absStart);
    out.push({
     kind:'include',id:'doc-include'+nextId(),start:absStart,end:absEnd,raw:m[0],
     includeCommand:m[7],includeTarget:String(m[8]||'').trim(),
@@ -3904,6 +4164,20 @@ function parseDocumentFlow(){
   if(target){target.label=key;if(target.block)target.block.label=key;if(target.block&&target.block.eqNumber)documentRefs[key]=target.block.eqNumber;}
  }
  return out;
+}
+function focusDocumentSourceOffset(offset){
+ if(isBeamer||!Number.isFinite(offset))return;
+ const targetOffset=Number(offset),flow=parseDocumentFlow();
+ const localLabel=documentLabels.find(x=>Math.abs(Number(x.pos)-targetOffset)<=2&&x.targetId);
+ let node=localLabel?documentFlowById[localLabel.targetId]:null;
+ if(!node)node=flow.find(x=>Number(x.start)<=targetOffset&&targetOffset<=Number(x.end));
+ if(!node){for(let i=flow.length-1;i>=0;i--){if(Number(flow[i].start)<=targetOffset){node=flow[i];break;}}}
+ if(!node)return;
+ const el=document.getElementById(node.id)||document.querySelector('[data-node-id="'+CSS.escape(String(node.id||''))+'"]');
+ if(!el)return;
+ document.querySelectorAll('.semantic-selected').forEach(x=>x.classList.remove('semantic-selected'));
+ el.classList.add('semantic-selected');
+ el.scrollIntoView({behavior:'smooth',block:'center'});
 }
 function renderDocumentOutline(nav){
  const title=document.createElement('div');title.className='section';title.textContent=(documentClass||'document').toUpperCase();nav.appendChild(title);
@@ -4025,27 +4299,34 @@ function bindDocumentTable(el,node){
 function documentIncludeHtml(node){
  const target=String(node.includeTarget||''),missing=!!node.missing,command=String(node.includeCommand||'input');
  const displayTarget=target+(target&&!/\.[A-Za-z0-9]+$/.test(target)?'.tex':'');
- const action=!missing&&node.targetUri?'<button class="doc-include-open" data-uri="'+esc(node.targetUri)+'" data-target="'+esc(displayTarget)+'">Open source</button>':'';
+ const action=!missing&&node.targetUri?'<button class="doc-include-open" data-uri="'+esc(node.targetUri)+'" data-target="'+esc(displayTarget)+'">Open in Visual</button>':'';
  return '<div class="doc-include'+(missing?' missing':'')+'" data-node-id="'+node.id+'"><div class="doc-include-main"><div class="doc-include-kind">'+(missing?'Missing included file':'Included file')+'</div><div class="doc-include-path">'+esc(displayTarget||target)+'</div><div class="doc-include-meta">\\'+esc(command)+' · source preserved</div></div>'+action+'</div>';
 }
 function commentedBlockPreviewHtml(text){
  const source=String(text||'').replace(/\r\n?/g,'\n');
+ function inertLatexHtml(raw){
+  const tokens=[];
+  const protectedSource=String(raw||'').replace(/\\(?:label|eqref|ref|autoref|cref|Cref|pageref|vref|Vref)\*?\s*\{[^}]*\}|\\(?:parencite|textcite|autocite|footcite|smartcite|supercite|citep|citet|cite|nocite)\*?\s*(?:\[[^\]]*\]\s*){0,2}\{[^}]*\}/g,m=>{const id=tokens.push(m)-1;return '@@TEXFLOW_COMMENT_SOURCE_'+id+'@@';});
+  let html=latexToHtml(protectedSource);
+  html=html.replace(/@@TEXFLOW_COMMENT_SOURCE_(\d+)@@/g,(_,idx)=>'<code class="commented-source-token">'+esc(tokens[Number(idx)]||'')+'</code>');
+  return html;
+ }
  function paragraphHtml(raw){
   return String(raw||'').split(/\n\s*\n+/).map(part=>part.trim()).filter(Boolean).map(part=>{
    if(part.split('\n').every(line=>/^\s*%/.test(line)))return '<div class="commented-preview-paragraph" style="color:var(--muted)">'+esc(part.replace(/^\s*%\s?/gm,''))+'</div>';
-   return '<div class="commented-preview-paragraph">'+latexToHtml(part.replace(/\n+/g,' '))+'</div>';
+   return '<div class="commented-preview-paragraph">'+inertLatexHtml(part.replace(/\n+/g,' '))+'</div>';
   }).join('');
  }
  function plainHtml(raw){
   const chunk=String(raw||'');let html='',cur=0,m;
   const token=/\\(chapter|section|subsection|subsubsection|paragraph)\*?\{([^}]*)\}|\\(input|include)\s*\{([^}]+)\}/g;
-  while((m=token.exec(chunk))){html+=paragraphHtml(chunk.slice(cur,m.index));if(m[1])html+='<div class="commented-preview-heading level-'+esc(m[1])+'">'+latexToHtml(m[2]||'')+'</div>';else{const target=String(m[4]||'').trim(),display=target+(target&&!/\.[A-Za-z0-9]+$/.test(target)?'.tex':'');html+='<div class="commented-preview-include"><span class="commented-preview-include-kind">'+esc(String(m[3]||'input'))+' · commented out</span><code>'+esc(display||target)+'</code></div>';}cur=token.lastIndex;}
+  while((m=token.exec(chunk))){html+=paragraphHtml(chunk.slice(cur,m.index));if(m[1])html+='<div class="commented-preview-heading level-'+esc(m[1])+'">'+inertLatexHtml(m[2]||'')+'</div>';else{const target=String(m[4]||'').trim(),display=target+(target&&!/\.[A-Za-z0-9]+$/.test(target)?'.tex':'');html+='<div class="commented-preview-include"><span class="commented-preview-include-kind">'+esc(String(m[3]||'input'))+' · commented out</span><code>'+esc(display||target)+'</code></div>';}cur=token.lastIndex;}
   html+=paragraphHtml(chunk.slice(cur));return html;
  }
  function listHtml(inner,ordered){
   const parts=String(inner||'').split(/\\item(?:<[^>]*>)?(?:\[[^\]]*\])?/).slice(1).map(x=>x.trim()).filter(Boolean);
   if(!parts.length)return plainHtml(inner);
-  const tag=ordered?'ol':'ul';return '<'+tag+' class="commented-preview-list">'+parts.map(item=>'<li>'+latexToHtml(item.replace(/\n+/g,' '))+'</li>').join('')+'</'+tag+'>';
+  const tag=ordered?'ol':'ul';return '<'+tag+' class="commented-preview-list">'+parts.map(item=>'<li>'+inertLatexHtml(item.replace(/\n+/g,' '))+'</li>').join('')+'</'+tag+'>';
  }
  let html='',cur=0,m;const env=/\\begin\{(equation\*?|align\*?|gather\*?|multline\*?|itemize|enumerate|quote|quotation)\}/g;
  while((m=env.exec(source))){const match=findMatchingEnvEnd(source,m[1],env.lastIndex);if(!match)break;html+=plainHtml(source.slice(cur,m.index));const inner=source.slice(env.lastIndex,match.start).trim(),name=String(m[1]||'');if(/^(?:equation|align|gather|multline)/.test(name)){let math=inner.replace(/\\label\{[^}]+\}/g,'').replace(/\\(?:notag|nonumber)\b/g,'').trim();if(/^align/.test(name))math='\\begin{aligned}'+math+'\\end{aligned}';html+='<div class="display-math commented-preview-math" contenteditable="false" data-math="'+encodeURIComponent(math)+'"></div>';}else if(name==='itemize'||name==='enumerate')html+=listHtml(inner,name==='enumerate');else html+='<div class="commented-preview-quote">'+plainHtml(inner)+'</div>';cur=match.end;env.lastIndex=match.end;}
@@ -4145,7 +4426,7 @@ function isAtomicDocumentBlockNode(x){if(!(x&&x.kind==='block'&&x.block))return 
 function documentAfterBlockSlotHtml(node){return '<div class="doc-after-block-slot" data-after-node-id="'+node.id+'" tabindex="0" aria-label="Start a paragraph after this object"></div>'; }
 function documentFlowInnerHtml(){
  const flow=parseDocumentFlow();let html='';
- if(metadata.title||metadata.author){html+='<header class="doc-title"><h1>'+latexToHtml(metadata.title||'Untitled document')+'</h1>'+(metadata.author?'<div>'+latexToHtml(metadata.author)+'</div>':'')+(metadata.date?'<div class="doc-date">'+latexToHtml(metadata.date)+'</div>':'')+'</header>';}
+ if(activeUri===masterUri&&(metadata.title||metadata.author)){html+='<header class="doc-title"><h1>'+latexToHtml(metadata.title||'Untitled document')+'</h1>'+(metadata.author?'<div>'+latexToHtml(metadata.author)+'</div>':'')+(metadata.date?'<div class="doc-date">'+latexToHtml(metadata.date)+'</div>':'')+'</header>';}
  flow.forEach((x,i)=>{
   if(x.kind==='matter')return;
   if(x.kind==='toc'){html+=documentTocHtml(flow);return;}
@@ -4193,7 +4474,7 @@ function updateDocumentNode(node,replacement,refresh=true,feature=''){
  if(Number.isFinite(start)&&Number.isFinite(end)&&start>=0&&end>=start&&documentSource.slice(start,end)===expected){
   const delta=finalReplacement.length-(end-start);
   documentSource=documentSource.slice(0,start)+finalReplacement+documentSource.slice(end);
-  const rootSource=sources.find(x=>x.uri===rootUri);if(rootSource)rootSource.text=documentSource;
+  const rootSource=sources.find(x=>x.uri===activeUri)||sources.find(x=>x.uri===rootUri);if(rootSource)rootSource.text=documentSource;
   if(wasSynthetic){
    node.start=start+syntheticPrefix.length;node.end=node.start+syntheticContent.length;node.raw=syntheticContent;node.synthetic=false;delete node.insertPrefix;
    if(node.block){node.block.raw=syntheticContent;node.block.text=syntheticContent;node.block.synthetic=false;}
@@ -4453,9 +4734,9 @@ function renderPreamble(id){
  c.innerHTML='<div class="settings-shell">'+settings+'<section class="settings-card"><div class="preamble-head"><select id="preamble-select">'+options+'</select><button class="secondary" id="preamble-cancel">Close</button><button class="secondary" id="preamble-source">Open source</button><button id="preamble-save">Save raw preamble</button></div><textarea id="preamble-code" class="preamble-code" spellcheck="false"></textarea><div class="settings-note">Use Raw LaTeX for custom commands and settings TeXFlow does not manage.</div></section></div>';
  const ta=document.getElementById('preamble-code'),cancel=document.getElementById('preamble-cancel'),save=document.getElementById('preamble-save');ta.value=info.text;preambleOriginalText=info.text;preambleDirty=false;const updateDirty=()=>{preambleDirty=ta.value!==preambleOriginalText;cancel.textContent=preambleDirty?'Cancel':'Close';save.disabled=!preambleDirty;};updateDirty();ta.addEventListener('input',updateDirty);document.getElementById('preamble-select').onchange=e=>{if(preambleDirty&&!confirm('Discard unsaved preamble changes?')){e.target.value=currentPreamble;return;}renderPreamble(e.target.value);};save.onclick=()=>{preambleOriginalText=ta.value;preambleDirty=false;updateDirty();vscode.postMessage({type:'savePreamble',preambleId:currentPreamble,text:ta.value});};cancel.onclick=()=>closePreambleEditor();document.getElementById('preamble-source').onclick=()=>{if(preambleDirty&&!confirm('Open source and discard unsaved preamble changes?'))return;preambleDirty=false;vscode.postMessage({type:'revealPreamble',preambleId:currentPreamble});};document.getElementById('ds-save').onclick=()=>{const settings={fontSize:document.getElementById('ds-font').value,paper:document.getElementById('ds-paper').value,orientation:document.getElementById('ds-orientation').value,globalColumns:document.getElementById('ds-columns').value,language:document.getElementById('ds-language').value,lineSpacing:document.getElementById('ds-lines').value,defaultAlignment:document.getElementById('ds-align').value,margin:document.getElementById('ds-margin').value,paragraphIndent:document.getElementById('ds-parindent').value,paragraphSkip:document.getElementById('ds-parskip').value,hyperlinks:document.getElementById('ds-hyperlinks').value==='on',extraPackages:document.getElementById('ds-packages').value};if(isBeamer){settings.beamerAspect=document.getElementById('ds-aspect').value;settings.beamerTheme=document.getElementById('ds-theme').value;}vscode.postMessage({type:'saveDocumentSettings',settings});};if(window.innerWidth<900&&typeof setNav==='function')setNav(false);
 }
-function currentSource(){const f=frames[current];return sources.find(x=>x.uri===(f&&f.sourceUri))||sources.find(x=>x.uri===rootUri)||sources[0];}
+function currentSource(){const f=frames[current];return sources.find(x=>x.uri===(f&&f.sourceUri))||sources.find(x=>x.uri===activeUri)||sources.find(x=>x.uri===masterUri)||sources[0];}
 function sourceEditorHtml(compact=false){const src=currentSource();if(!src)return'<div class="empty">No LaTeX source loaded.</div>';const options=sources.map(x=>'<option value="'+esc(x.uri)+'"'+(x.uri===src.uri?' selected':'')+'>'+esc(x.label)+'</option>').join('');return'<section class="source-shell"><div class="source-head"><select class="source-select">'+options+'</select><button class="source-save">Save source</button></div><textarea class="source-code" spellcheck="false"></textarea></section>';}
-function bindSourceEditor(host){const src=currentSource();if(!src)return;const ta=host.querySelector('.source-code');if(!ta)return;ta.value=src.text;host.querySelector('.source-select').onchange=e=>{const target=sources.find(x=>x.uri===e.target.value);if(target){const fIndex=frames.findIndex(f=>f.sourceUri===target.uri);if(fIndex>=0)current=fIndex;renderWorkspace();}};host.querySelector('.source-save').onclick=()=>vscode.postMessage({type:'saveSource',uri:src.uri,text:ta.value});}
+function bindSourceEditor(host){const src=currentSource();if(!src)return;const ta=host.querySelector('.source-code');if(!ta)return;ta.value=src.text;host.querySelector('.source-select').onchange=e=>{const target=sources.find(x=>x.uri===e.target.value);if(target)vscode.postMessage({type:'navigateProjectLocation',uri:target.uri,start:0,end:0,preferVisual:true});};host.querySelector('.source-save').onclick=()=>vscode.postMessage({type:'saveSource',uri:src.uri,text:ta.value});}
 function visualFrameHtml(f){if(!f)return'<div class="empty">No Beamer frames found.</div>';const v=frameVerticalClass(f),z=frameTextSizeClass(f);if(/\\(?:titlepage|maketitle)\b/.test(f.body))return'<article class="slide title-page align-center'+v+z+'"><div class="blocks-host"><div class="title align-center">'+latexToHtml(metadata.title||'Untitled presentation')+'</div>'+(metadata.subtitle?'<div style="font-size:1.25em;margin:.5em 0 1.6em">'+latexToHtml(metadata.subtitle)+'</div>':'')+'<div style="font-size:1.08em;margin-top:2.5em">'+latexToHtml(metadata.author||'')+'</div>'+(metadata.institute?'<div style="margin-top:.75em;color:var(--muted)">'+latexToHtml(metadata.institute)+'</div>':'')+(metadata.date?'<div style="margin-top:2em">'+latexToHtml(metadata.date)+'</div>':'')+'</div></article>';return'<article class="slide'+v+z+'"><div class="title" contenteditable="true">'+esc(f.title)+'</div><div class="blocks-host"></div></article>';}
 function bindVisualFrame(host,i){const f=frames[i];if(!f||/\\(?:titlepage|maketitle)\b/.test(f.body))return;bindVisualNavigationSpine(host);const title=host.querySelector('.title');attachEditor(title);const saveTitle=refresh=>vscode.postMessage({type:'updateFrameTitle',frameIndex:i,title:editorToLatex(title),refresh});title.addEventListener('input',()=>scheduleSave(title,saveTitle));title.addEventListener('blur',()=>flushSave(title,saveTitle));const blockHost=host.querySelector('.blocks-host');const parsed=parseBlocks(f.body);parsed.forEach(b=>blockHost.appendChild(renderBlock(b,i)));if(!parsed.length){const empty=document.createElement('div');empty.className='block paragraph empty-frame-body';empty.contentEditable='true';empty.dataset.placeholder='Start typing slide content…';attachEditor(empty);const saveEmpty=refresh=>vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text:editorToLatex(empty),refresh});empty.__texflowCommit=(text,feature='')=>{setEditableLatex(empty,text);vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text,refresh:true,feature});};empty.__texflowCommentOutSupported=true;empty.__texflowSaveNow=()=>saveEmpty(false);bindBeamerProseEnter(empty,i);empty.addEventListener('input',()=>scheduleSave(empty,saveEmpty));empty.addEventListener('blur',()=>flushSave(empty,saveEmpty));blockHost.appendChild(empty);}else{const trailing=document.createElement('div');trailing.className='trailing-paragraph editable';trailing.contentEditable='true';trailing.dataset.placeholder='Continue typing…';attachEditor(trailing);let saved='';const saveTrailing=refresh=>{const text=editableLatex(trailing);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh});saved=text;};trailing.__texflowCommit=(text,feature='')=>{setEditableLatex(trailing,text);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh:true,feature});saved=text;};trailing.__texflowCommentOutSupported=true;trailing.__texflowSaveNow=()=>saveTrailing(false);bindBeamerProseEnter(trailing,i);trailing.addEventListener('input',()=>scheduleSave(trailing,saveTrailing));trailing.addEventListener('blur',()=>flushSave(trailing,saveTrailing));blockHost.appendChild(trailing);}title.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();flushSave(title,saveTitle);moveVisualEditableCaret(title,1);}});;const slide=host.querySelector('.slide');if(slide){scheduleSlideFit(slide);slide.addEventListener('input',()=>scheduleSlideFit(slide));}}
 function renderWorkspace(){mode='frames';current=Math.max(0,Math.min(current,frames.length-1));renderNav();updateFrameTextSizeMenu();document.querySelectorAll('.mode-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===viewMode));const c=document.getElementById('content');c.className='workspace';if(viewMode==='source'){c.innerHTML=sourceEditorHtml();bindSourceEditor(c);return;}if(viewMode==='pdf'){const hasPdf=!!pdfUri;const status=pdfBuildState==='building'?'Compiling…':pdfBuildState==='error'?pdfBuildMessage:(hasPdf?(pdfBuildMessage||'PDF ready.'):'No compiled PDF found.');c.innerHTML='<section class="pdf-shell"><div class="pdf-head"><span>Compiled PDF</span><button class="top-action" id="pdf-refresh">Refresh</button>'+(hasPdf?'<button class="top-action" id="pdf-open">Open PDF</button>':'')+'<button class="top-action primary" id="pdf-compile">Compile</button></div><div class="pdf-empty"><div><div style="font-size:28px;margin-bottom:12px">'+(pdfBuildState==='building'?'⏳':pdfBuildState==='error'?'⚠':'✓')+'</div><div>'+esc(status)+'</div>'+(hasPdf?'<div style="margin-top:8px;font-size:12px">TeXFlow uses the native VS Code PDF viewer to avoid the blank grey embedded-PDF bug.</div>':'')+'</div></div></section>';document.getElementById('pdf-refresh').onclick=()=>vscode.postMessage({type:'refreshPdf'});const open=document.getElementById('pdf-open');if(open)open.onclick=()=>vscode.postMessage({type:'openPdf'});document.getElementById('pdf-compile').onclick=()=>vscode.postMessage({type:'compile'});return;}if(!isBeamer){if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane document-pane">'+visualDocumentHtml()+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualDocument(c.querySelector('.visual-pane'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualDocumentHtml();bindVisualDocument(c);return;}if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane">'+visualFrameHtml(frames[current])+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualFrame(c.querySelector('.visual-pane'),current);scheduleSlideFit(c.querySelector('.visual-pane .slide'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualFrameHtml(frames[current]);bindVisualFrame(c,current);scheduleSlideFit(c.querySelector('.slide'));}
@@ -4618,11 +4899,13 @@ function setStructuralTarget(node,el){
  else{const wrap=el.closest('.doc-math-wrap')||el;wrap.classList.add('selected');}
 }
 function availableLabels(){
+ const indexed=projectIndex&&Array.isArray(projectIndex.labels)?projectIndex.labels:[];
+ if(indexed.length){const seen=new Set();return indexed.filter(x=>{const key=String(x&&x.key||'');if(!key||seen.has(key))return false;seen.add(key);return true;}).map(x=>({key:String(x.key),targetKind:String(x.targetKind||'label'),file:String(x.file||''),uri:String(x.uri||''),start:Number(x.start||0),end:Number(x.end||x.start||0)}));}
  if(!isBeamer)parseDocumentFlow();
  const found=[],seen=new Set();
  const enrich=new Map(documentLabels.map(x=>[x.key,x]));
  const src=String(documentSource||'');let m;const re=/\\label\{([^}]+)\}/g;
- while((m=re.exec(src))){const key=String(m[1]||'').trim();if(!key||seen.has(key))continue;seen.add(key);const meta=enrich.get(key)||{};found.push({key,targetKind:meta.targetKind||'label'});}
+ while((m=re.exec(src))){const key=String(m[1]||'').trim();if(!key||seen.has(key))continue;seen.add(key);const meta=enrich.get(key)||{};found.push({key,targetKind:meta.targetKind||'label',file:texflowBaseName(activeFileName||activeUri),uri:activeUri,start:m.index,end:re.lastIndex});}
  return found;
 }
 function openReferencePicker(){
@@ -4632,9 +4915,9 @@ function openReferencePicker(){
 }
 function closeReferencePicker(){const modal=document.getElementById('reference-modal');modal.classList.remove('open');modal.setAttribute('aria-hidden','true');referenceSelection='';referenceAnchor=null;}
 function renderReferenceResults(){
- const host=document.getElementById('reference-results'),q=(document.getElementById('reference-search').value||'').trim().toLowerCase(),rows=availableLabels().filter(x=>!q||x.key.toLowerCase().includes(q)||String(x.targetKind||'').toLowerCase().includes(q));
- if(!rows.length){host.innerHTML='<div class="cite-empty">'+(availableLabels().length?'No matching labels.':'No \\label{...} commands were found in this document.')+'</div>';document.getElementById('reference-insert').disabled=true;return;}
- host.innerHTML='';rows.forEach(item=>{const row=document.createElement('button');row.type='button';row.className='cite-result'+(referenceSelection===item.key?' selected':'');row.innerHTML='<span></span><span class="cite-result-main"><div class="cite-result-title">'+esc(item.key)+'</div><div class="cite-result-meta">'+esc(item.targetKind||'label')+'</div></span>';row.onclick=()=>{referenceSelection=item.key;document.getElementById('reference-style').value=item.targetKind==='equation'?'eqref':'ref';document.getElementById('reference-insert').disabled=false;renderReferenceResults();};host.appendChild(row);});
+ const host=document.getElementById('reference-results'),q=(document.getElementById('reference-search').value||'').trim().toLowerCase(),rows=availableLabels().filter(x=>!q||x.key.toLowerCase().includes(q)||String(x.targetKind||'').toLowerCase().includes(q)||String(x.file||'').toLowerCase().includes(q));
+ if(!rows.length){host.innerHTML='<div class="cite-empty">'+(availableLabels().length?'No matching labels.':'No \\label{...} commands were found in this project.')+'</div>';document.getElementById('reference-insert').disabled=true;return;}
+ host.innerHTML='';rows.forEach(item=>{const row=document.createElement('button');row.type='button';row.className='cite-result'+(referenceSelection===item.key?' selected':'');row.innerHTML='<span></span><span class="cite-result-main"><div class="cite-result-title">'+esc(item.key)+'</div><div class="cite-result-meta">'+esc(item.targetKind||'label')+(item.file?' · '+esc(item.file):'')+'</div></span>';row.onclick=()=>{referenceSelection=item.key;document.getElementById('reference-style').value=item.targetKind==='equation'?'eqref':'ref';document.getElementById('reference-insert').disabled=false;renderReferenceResults();};host.appendChild(row);});
 }
 function saveReferencePicker(){if(!referenceSelection)return;const cmd=document.getElementById('reference-style').value||'ref',code='\\'+cmd+'{'+referenceSelection+'}';if(!insertLatexAtRememberedCursor(code,referenceAnchor)){vscode.postMessage({type:'showWarning',message:'Place the cursor in editable text before inserting a reference.'});return;}closeReferencePicker();}
 function openLabelPicker(){
@@ -4652,11 +4935,11 @@ function saveLabelPicker(){
  else{const b=node.block||{},raw=String(node.raw||'');if(b.kind==='figure'){const at=raw.lastIndexOf('\\end{figure}');if(at<0)return;replacement=raw.slice(0,at).replace(/\s*$/,'')+'\n\\label{'+key+'}\n'+raw.slice(at);}else if(b.env==='display'){const at=raw.lastIndexOf('\\]');if(at<0)return;replacement=raw.slice(0,at).replace(/\s*$/,'')+'\n\\label{'+key+'}\n'+raw.slice(at);}else if(b.env==='$$'){const at=raw.lastIndexOf('$$');if(at<=0)return;replacement=raw.slice(0,at).replace(/\s*$/,'')+'\n\\label{'+key+'}\n'+raw.slice(at);}else{const endToken='\\end{'+b.env+'}',at=raw.lastIndexOf(endToken);if(at<0)return;replacement=raw.slice(0,at).replace(/\s*$/,'')+'\n\\label{'+key+'}\n'+raw.slice(at);}}
  closeLabelPicker();updateDocumentNode(node,replacement,true);
 }
-function citationSystemFromSource(){const all=String(documentSource||'')+'\n'+sources.map(x=>x.text||'').join('\n');if(/\\addbibresource(?:\[[^\]]*\])?\{[^}]+\}/i.test(all)||/\\usepackage(?:\[[^\]]*\])?\{[^}]*\bbiblatex\b[^}]*\}/i.test(all))return'biblatex';if(/\\bibliography\{[^}]+\}/i.test(all)){if(/\\usepackage(?:\[[^\]]*\])?\{[^}]*\bnatbib\b[^}]*\}/i.test(all)||/\\(?:citep|citet)\b/.test(all))return'natbib';return'bibtex';}return'none';}
+function citationSystemFromSource(){const all=String(documentSource||'')+'\n'+sources.map(x=>x.text||'').join('\n');if(/\\addbibresource(?:\[[^\]]*\])?\{[^}]+\}/i.test(all)||/\\usepackage(?:\[[^\]]*\])?\{[^}]*\bbiblatex\b[^}]*\}/i.test(all))return'biblatex';if(/\\begin\{thebibliography\}/i.test(all))return'bibtex';if(/\\bibliography\{[^}]+\}/i.test(all)){if(/\\usepackage(?:\[[^\]]*\])?\{[^}]*\bnatbib\b[^}]*\}/i.test(all)||/\\(?:citep|citet)\b/.test(all))return'natbib';return'bibtex';}return'none';}
 function citationPreviewText(cmd,entry){const f=(entry||{}).fields||{},author=bibAuthorLabel(entry||{fields:{},key:'ref'}),year=bibPlain(f.year||f.date||'Year');if(cmd==='textcite'||cmd==='citet')return author+' ('+year+')';if(cmd==='cite')return '['+author+' '+year+']';return '('+author+' '+year+')';}
 function configureCitationStyle(){const select=document.getElementById('cite-style'),system=citationSystemFromSource(),entry=bibliographyByKey[[...citationSelection][0]]||bibliographyEntries[0];let opts=[];if(system==='natbib')opts=[['citep','Parenthetical'],['citet','Textual'],['cite','Standard']];else if(system==='bibtex')opts=[['cite','Standard']];else opts=[['parencite','Parenthetical'],['textcite','Textual'],['cite','Standard'],['autocite','Automatic']];select.innerHTML=opts.map(([cmd,label])=>'<option value="'+cmd+'">'+label+' — '+esc(citationPreviewText(cmd,entry))+' — \\'+cmd+'</option>').join('');}
 function citationSearchText(entry){const f=entry.fields||{};return [entry.key,entry.type,f.author,f.editor,f.title,f.year,f.date,f.journal,f.booktitle,f.publisher].filter(Boolean).join(' ').toLowerCase();}
-function renderCitationResults(){const host=document.getElementById('cite-results'),q=(document.getElementById('cite-search').value||'').trim().toLowerCase();const rows=bibliographyEntries.filter(e=>!q||citationSearchText(e).includes(q));if(!rows.length){host.innerHTML='<div class="cite-empty">'+(bibliographyResources.length?(bibliographyEntries.length?'No matching references.':'The connected .bib file has no readable entries yet. Open it in VS Code to add references.'):'No bibliography is connected yet. Add or select a .bib file, then insert citations here.')+'</div>';document.getElementById('cite-insert').disabled=true;return;}host.innerHTML='';rows.forEach(entry=>{const f=entry.fields||{},row=document.createElement('button');row.type='button';row.className='cite-result'+(citationSelection.has(entry.key)?' selected':'');row.innerHTML='<input class="cite-check" type="checkbox" tabindex="-1" '+(citationSelection.has(entry.key)?'checked':'')+'><span class="cite-result-main"><div class="cite-result-title">'+esc(bibPlain(f.title||entry.key))+'</div><div class="cite-result-meta">'+esc(bibPlain(f.author||f.editor||''))+(f.year?' · '+esc(bibPlain(f.year)):'')+' · '+esc(entry.type)+' · '+esc(entry.key)+'</div></span>';row.onclick=()=>{if(citationSelection.has(entry.key))citationSelection.delete(entry.key);else citationSelection.add(entry.key);configureCitationStyle();document.getElementById('cite-insert').disabled=!citationSelection.size;renderCitationResults();};host.appendChild(row);});document.getElementById('cite-insert').disabled=!citationSelection.size;}
+function renderCitationResults(){const host=document.getElementById('cite-results'),q=(document.getElementById('cite-search').value||'').trim().toLowerCase();const rows=bibliographyEntries.filter(e=>!q||citationSearchText(e).includes(q));if(!rows.length){host.innerHTML='<div class="cite-empty">'+(bibliographyResources.length?(bibliographyEntries.length?'No matching references.':'The connected .bib file has no readable entries yet. Open it in VS Code to add references.'):'No bibliography is connected yet. Add or select a .bib file, then insert citations here.')+'</div>';document.getElementById('cite-insert').disabled=true;return;}host.innerHTML='';rows.forEach(entry=>{const f=entry.fields||{},row=document.createElement('button');row.type='button';row.className='cite-result'+(citationSelection.has(entry.key)?' selected':'');row.innerHTML='<input class="cite-check" type="checkbox" tabindex="-1" '+(citationSelection.has(entry.key)?'checked':'')+'><span class="cite-result-main"><div class="cite-result-title">'+esc(bibPlain(f.title||entry.key))+'</div><div class="cite-result-meta">'+esc(bibPlain(f.author||f.editor||''))+(f.year?' · '+esc(bibPlain(f.year)):'')+' · '+esc(entry.type)+' · '+esc(entry.key)+'</div></span>';row.onclick=()=>{if(citationSelection.has(entry.key))citationSelection.delete(entry.key);else citationSelection.add(entry.key);configureCitationStyle();document.getElementById('cite-insert').disabled=!citationSelection.size;renderCitationResults();};row.ondblclick=e=>{e.preventDefault();e.stopPropagation();vscode.postMessage({type:'navigateBibliographyUsage',key:entry.key});};row.title='Double-click to open first citation usage';host.appendChild(row);});document.getElementById('cite-insert').disabled=!citationSelection.size;}
 function snapshotVisualCursor(){
  rememberVisualCursor();
  const ctx=lastVisualCursor;
@@ -4707,7 +4990,7 @@ function normalizeAtomicInsertionRange(editable,range){
  return r;
 }
 function citationCodeParts(code){const m=/^\\(parencite|textcite|autocite|citep|citet|cite)\{([^}]*)\}$/.exec(String(code||''));return m?{cmd:m[1],keys:m[2]}:null;}
-function referenceCodeParts(code){const m=/^\\(eqref|ref|autoref|pageref)\{([^}]*)\}$/.exec(String(code||''));return m?{cmd:m[1],key:m[2]}:null;}
+function referenceCodeParts(code){const m=/^\\(eqref|ref|autoref|cref|Cref|pageref|vref|Vref)\{([^}]*)\}$/.exec(String(code||''));return m?{cmd:m[1],key:m[2]}:null;}
 function restoreCaretAfterInsertedLatex(editable,code,occurrence){
  const parts=citationCodeParts(code),refParts=referenceCodeParts(code),spaceParts=/^\\hspace(\*)?\{([^}]+)\}$/.exec(String(code||''));let boundary=null;
  if(parts){
@@ -4964,9 +5247,9 @@ function updateDocumentViewMenu(){
 }
 const cursorMenuButtons=['structure-menu-button','insert-menu-button','format-menu-button','references-menu-button','layout-menu-button'].map(id=>document.getElementById(id)).filter(Boolean);cursorMenuButtons.forEach(btn=>btn.addEventListener('mousedown',e=>{rememberVisualCursor();e.preventDefault();}));const topMenus=[...document.querySelectorAll('.top-menu')];function moveLanguageMenuToFormat(){const menu=document.getElementById('language-menu-top');const panel=document.querySelector('#format-menu .top-menu-panel');if(!menu||!panel)return;const divider=document.createElement('span');divider.className='menu-divider';const title=document.createElement('div');title.className='menu-title';title.textContent='Language';panel.appendChild(divider);panel.appendChild(title);['spell-language-automatic','spell-language-english','spell-language-spanish'].forEach(id=>{const btn=document.getElementById(id);if(btn)panel.appendChild(btn);});const toggleDivider=document.createElement('span');toggleDivider.className='menu-divider';panel.appendChild(toggleDivider);const toggle=document.getElementById('spell-check-toggle');if(toggle)panel.appendChild(toggle);menu.remove();}moveLanguageMenuToFormat();function closeTopMenus(except){topMenus.forEach(m=>{if(m!==except)m.classList.remove('open')})}topMenus.forEach(menu=>{const trigger=menu.querySelector(':scope > .top-action');trigger.onclick=e=>{e.stopPropagation();const wasOpen=menu.classList.contains('open');closeTopMenus();if(menu.id==='beamer-menu-top')updateFrameTextSizeMenu();menu.classList.toggle('open',!wasOpen);};});document.querySelectorAll('.frame-size-option').forEach(btn=>{btn.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};btn.onclick=()=>{const size=String(btn.dataset.frameSize||'normal');closeTopMenus();vscode.postMessage({type:'updateFrameFontSize',frameIndex:current,size});};});function runTopMenuAction(action){closeTopMenus();if(action==='title'||action==='author')vscode.postMessage({type:'setMetadata',field:action});else if(action==='abstract')vscode.postMessage({type:'insertAbstract'});else if(action==='frame')vscode.postMessage({type:'insertFrame',frameIndex:current});else if(action==='chapter')vscode.postMessage({type:'insertChapter',frameIndex:current});else if(action==='section')vscode.postMessage({type:'insertSection',frameIndex:current});else if(action==='subsection')vscode.postMessage({type:'insertSubsection',frameIndex:current});else if(action==='subsubsection')vscode.postMessage({type:'insertSubsubsection',frameIndex:current});else if(action==='paragraphHeading')vscode.postMessage({type:'insertParagraphHeading',frameIndex:current});else if(action==='paragraph')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'paragraph'});else if(action==='bullets')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'itemize'});else if(action==='numbered')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'enumerate'});else if(action==='inlinemath')openMathInsert('inlinemath',current);else if(action==='displaymath')openMathInsert('displaymath',current);else if(action==='equation')openMathInsert('equation',current);else if(action==='alignmath')openMathInsert('alignmath',current);else if(action==='gathermath')openMathInsert('gathermath',current);else if(action==='multlinemath')openMathInsert('multlinemath',current);else if(action==='casesmath')openMathInsert('casesmath',current);else if(action==='matrixmath')openMathInsert('matrixmath',current);else if(action==='citation')openCitationPicker();else if(action==='addbibliography')vscode.postMessage({type:'addBibliography',resumeCitation:false,cursorPos:rememberedStructuralCursorPos()});else if(action==='referencessection')vscode.postMessage({type:'addReferencesSection',cursorPos:rememberedStructuralCursorPos()});else if(action==='openbibliography')vscode.postMessage({type:'openBibliography'});else if(action==='label')openLabelPicker();else if(action==='reference')openReferencePicker();else if(action==='footnote')openLabsFootnote();else if(action==='link')openLabsLink();else if(action==='special')openLabsSpecial();else if(action==='index')openLabsIndex();else if(action==='nomenclature')openLabsNomenclature();else if(action==='field')openLabsField();else if(action==='newpage')labsInsertBlock('\\newpage','break');else if(action==='clearpage')labsInsertBlock('\\clearpage','break');else if(action==='quote')openLabsQuote('quote');else if(action==='quotation')openLabsQuote('quotation');else if(action==='minipage')openLabsMinipage();else if(action==='theorem')openLabsTheorem();else if(action==='comment')openLabsComment();else if(action==='authornote')openLabsAuthorNote();else if(action==='commentblock')openLabsCommentBlock();else if(action==='commentoutselection')commentOutSelectedText();else if(action==='toggleSourceComments')toggleReviewVisibility('sourceComments');else if(action==='toggleAuthorNotes')toggleReviewVisibility('authorNotes');else if(action==='toggleCommentBlocks')toggleReviewVisibility('commentBlocks');else if(action==='showHiddenReviewItems')restoreHiddenReviewItems();else if(action==='printindex')labsInsertBlock('\\printindex','index');else if(action==='printnomenclature')labsInsertBlock('\\printnomenclature','nomenclature');else if(action==='figure')vscode.postMessage({type:'insertFigure',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='subfigures')vscode.postMessage({type:'chooseSubfigures',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='table')openTableEditor();else if(action==='tabledata')openLabsTableData();else if(action==='spacing')openSpacingEditor();else if(action==='documentsettings')renderPreamble(currentPreamble);else if(action==='columns2')insertLocalColumns(2);else if(action==='columns3')insertLocalColumns(3);}
 function renderTopMenu(panelId,sections){const panel=document.getElementById(panelId);if(!panel)return;panel.innerHTML='';const addTitle=t=>{const d=document.createElement('div');d.className='menu-title';d.textContent=t;panel.appendChild(d);};const addDivider=()=>{const d=document.createElement('span');d.className='menu-divider';panel.appendChild(d);};const add=(label,action)=>{const b=document.createElement('button');b.textContent=label;b.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};b.onclick=()=>runTopMenuAction(action);panel.appendChild(b);};sections.forEach((section,i)=>{if(i)addDivider();if(section.title)addTitle(section.title);section.items.forEach(item=>{if(item.when===false)return;add(item.label,item.action);});});}
-function renderTopMenus(){renderTopMenu('structure-menu-panel',[{title:'Document structure',items:[{label:'Normal text',action:'paragraph'},{label:'Title',action:'title'},{label:'Author',action:'author'},{label:'Abstract',action:'abstract',when:!isBeamer},{label:'Chapter',action:'chapter',when:['book','report'].includes(documentClass)},{label:'Section',action:'section'},{label:'Subsection',action:'subsection'},{label:'Subsubsection',action:'subsubsection',when:!isBeamer},{label:'Paragraph heading',action:'paragraphHeading',when:!isBeamer}]},{title:'Lists',items:[{label:'Bulleted list',action:'bullets'},{label:'Numbered list',action:'numbered'}]},{title:'Blocks & containers',items:[{label:'Quote…',action:'quote'},{label:'Quotation…',action:'quotation'},{label:'Minipage…',action:'minipage'},{label:'Theorem / proof…',action:'theorem'},{label:'Two-column block…',action:'columns2'},{label:'Three-column block…',action:'columns3'}]}]);renderTopMenu('insert-menu-panel',[{title:'Comments & notes',items:[{label:'Source comment…',action:'comment'},{label:'Author note…',action:'authornote'},{label:'Commented-out block…',action:'commentblock'},{label:'Comment out selection',action:'commentoutselection'}]},{title:'Math',items:[{label:'Inline math',action:'inlinemath'},{label:'Display math',action:'displaymath'},{label:'Numbered equation…',action:'equation'},{label:'Aligned equations…',action:'alignmath'},{label:'Gathered equations…',action:'gathermath'},{label:'Multiline equation…',action:'multlinemath'},{label:'Cases / system…',action:'casesmath'},{label:'Matrix…',action:'matrixmath'}]},{title:'Figures',items:[{label:'Figure…',action:'figure'},{label:'Subfigures…',action:'subfigures'}]},{title:'Tables',items:[{label:'Table…',action:'table'},{label:'Table from CSV / TSV…',action:'tabledata'}]},{title:'Inline objects',items:[{label:'Link / URL…',action:'link'},{label:'Special character…',action:'special'},{label:'Field…',action:'field'}]}]);renderTopMenu('references-menu-panel',[{title:'Citations & bibliography',items:[{label:'Insert citation…',action:'citation'},{label:'Add / change bibliography…',action:'addbibliography'},{label:'Insert bibliography…',action:'referencessection'},{label:'Open .bib',action:'openbibliography'}]},{title:'Cross-references',items:[{label:'Add label to selected object…',action:'label'},{label:'Insert cross-reference…',action:'reference'}]},{title:'Notes & indexes',items:[{label:'Footnote…',action:'footnote'},{label:'Index entry…',action:'index'},{label:'Print index',action:'printindex'},{label:'Nomenclature entry…',action:'nomenclature'},{label:'Print nomenclature',action:'printnomenclature'}]}]);renderTopMenu('layout-menu-panel',[{title:'Document',items:[{label:'Document settings / preamble…',action:'documentsettings'}]},{title:'Spacing',items:[{label:'Horizontal / vertical spacing…',action:'spacing'}]},{title:'Breaks',items:[{label:'Page break',action:'newpage'},{label:'Clear page',action:'clearpage'}]}]);} document.getElementById('view-continuous').onclick=()=>{documentLayoutMode='continuous';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-pages').onclick=()=>{documentLayoutMode='pages';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-source-comments').onclick=()=>{toggleReviewVisibility('sourceComments');};document.getElementById('view-author-notes').onclick=()=>{toggleReviewVisibility('authorNotes');};document.getElementById('view-comment-blocks').onclick=()=>{toggleReviewVisibility('commentBlocks');};document.getElementById('view-hidden-comments').onclick=()=>{restoreHiddenReviewItems();};updateCommentViewMenu();const commentInspectorClose=document.getElementById('comment-inspector-close');if(commentInspectorClose)commentInspectorClose.onclick=()=>closeCommentInspector();document.addEventListener('click',e=>{if(!e.target.closest('.top-menu'))closeTopMenus();});document.querySelectorAll('.mode-tab').forEach(btn=>btn.onclick=()=>{viewMode=btn.dataset.view;renderWorkspace();});document.getElementById('new-document').onclick=()=>{closeTopMenus();vscode.postMessage({type:'newDocument'});};document.getElementById('open-file').onclick=()=>{closeTopMenus();vscode.postMessage({type:'open'});};document.getElementById('save-file').onclick=()=>{closeTopMenus();const el=document.getElementById('save-status');el.textContent='Saving…';vscode.postMessage({type:'save'});};document.getElementById('save-as').onclick=()=>{closeTopMenus();vscode.postMessage({type:'saveAs'});};document.getElementById('undo').onclick=()=>vscode.postMessage({type:'undo'});document.getElementById('redo').onclick=()=>vscode.postMessage({type:'redo'});document.getElementById('find-document').onclick=()=>texflowOpenFind();document.getElementById('labs-find-replace').onclick=()=>{closeTopMenus();openLabsFindReplace();};document.getElementById('labs-copy-object').onclick=()=>{closeTopMenus();labsCopyObject();};document.getElementById('labs-paste-object').onclick=()=>{closeTopMenus();labsPasteObject();};document.getElementById('labs-duplicate-object').onclick=()=>{closeTopMenus();labsDuplicateObject();};document.getElementById('labs-move-up').onclick=()=>{closeTopMenus();labsMoveObject(-1);};document.getElementById('labs-move-down').onclick=()=>{closeTopMenus();labsMoveObject(1);};document.getElementById('project-diagnostics').onclick=()=>{closeTopMenus();vscode.postMessage({type:'showProjectDiagnostics'});};document.getElementById('top-compile').onclick=()=>vscode.postMessage({type:'compile'});document.getElementById('spell-language-automatic').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'auto'});document.getElementById('spell-language-english').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'en'});document.getElementById('spell-language-spanish').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'es'});document.getElementById('spell-check-toggle').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'enabled',value:!texflowSpellState.enabled});const body=document.body;const toggleNav=document.getElementById('toggle-nav');const focusBtn=document.getElementById('focus-mode');const exitFocus=document.getElementById('exit-focus');const findInput=document.getElementById('texflow-find-input'),findPrev=document.getElementById('texflow-find-prev'),findNext=document.getElementById('texflow-find-next'),findClose=document.getElementById('texflow-find-close');if(findInput){findInput.addEventListener('input',()=>{texflowFindState.query=findInput.value||'';texflowFindRefresh(true,true);});findInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();texflowFindNavigate(e.shiftKey?-1:1);}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();texflowCloseFind();}});}if(findPrev)findPrev.onclick=()=>texflowFindNavigate(-1);if(findNext)findNext.onclick=()=>texflowFindNavigate(1);if(findClose)findClose.onclick=()=>texflowCloseFind();const texflowFindObserver=new MutationObserver(()=>texflowFindScheduleRefresh(false));const texflowFindContent=document.getElementById('content');if(texflowFindContent)texflowFindObserver.observe(texflowFindContent,{subtree:true,childList:true,characterData:true});function setNav(open){body.classList.toggle('nav-open',open);body.classList.toggle('nav-closed',!open);localStorage.setItem('texflow-nav',open?'open':'closed');}function setFocus(on){body.classList.toggle('focus-mode',on);localStorage.setItem('texflow-focus',on?'on':'off');}// Every TeXFlow document starts with its navigator visible on desktop.
+function renderTopMenus(){renderTopMenu('structure-menu-panel',[{title:'Document structure',items:[{label:'Normal text',action:'paragraph'},{label:'Title',action:'title'},{label:'Author',action:'author'},{label:'Abstract',action:'abstract',when:!isBeamer},{label:'Chapter',action:'chapter',when:['book','report'].includes(documentClass)},{label:'Section',action:'section'},{label:'Subsection',action:'subsection'},{label:'Subsubsection',action:'subsubsection',when:!isBeamer},{label:'Paragraph heading',action:'paragraphHeading',when:!isBeamer}]},{title:'Lists',items:[{label:'Bulleted list',action:'bullets'},{label:'Numbered list',action:'numbered'}]},{title:'Blocks & containers',items:[{label:'Quote…',action:'quote'},{label:'Quotation…',action:'quotation'},{label:'Minipage…',action:'minipage'},{label:'Theorem / proof…',action:'theorem'},{label:'Two-column block…',action:'columns2'},{label:'Three-column block…',action:'columns3'}]}]);renderTopMenu('insert-menu-panel',[{title:'Comments & notes',items:[{label:'Source comment…',action:'comment'},{label:'Author note…',action:'authornote'},{label:'Commented-out block…',action:'commentblock'},{label:'Comment out selection',action:'commentoutselection'}]},{title:'Math',items:[{label:'Inline math',action:'inlinemath'},{label:'Display math',action:'displaymath'},{label:'Numbered equation…',action:'equation'},{label:'Aligned equations…',action:'alignmath'},{label:'Gathered equations…',action:'gathermath'},{label:'Multiline equation…',action:'multlinemath'},{label:'Cases / system…',action:'casesmath'},{label:'Matrix…',action:'matrixmath'}]},{title:'Figures',items:[{label:'Figure…',action:'figure'},{label:'Subfigures…',action:'subfigures'}]},{title:'Tables',items:[{label:'Table…',action:'table'},{label:'Table from CSV / TSV…',action:'tabledata'}]},{title:'Inline objects',items:[{label:'Link / URL…',action:'link'},{label:'Special character…',action:'special'},{label:'Field…',action:'field'}]}]);renderTopMenu('references-menu-panel',[{title:'Citations & bibliography',items:[{label:'Insert citation…',action:'citation'},{label:'Add / change bibliography…',action:'addbibliography'},{label:'Insert bibliography…',action:'referencessection'},{label:'Open .bib',action:'openbibliography'}]},{title:'Cross-references',items:[{label:'Add label to selected object…',action:'label'},{label:'Insert cross-reference…',action:'reference'}]},{title:'Notes & indexes',items:[{label:'Footnote…',action:'footnote'},{label:'Index entry…',action:'index'},{label:'Print index',action:'printindex'},{label:'Nomenclature entry…',action:'nomenclature'},{label:'Print nomenclature',action:'printnomenclature'}]}]);renderTopMenu('layout-menu-panel',[{title:'Document',items:[{label:'Document settings / preamble…',action:'documentsettings'}]},{title:'Spacing',items:[{label:'Horizontal / vertical spacing…',action:'spacing'}]},{title:'Breaks',items:[{label:'Page break',action:'newpage'},{label:'Clear page',action:'clearpage'}]}]);} document.getElementById('view-continuous').onclick=()=>{documentLayoutMode='continuous';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-pages').onclick=()=>{documentLayoutMode='pages';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-source-comments').onclick=()=>{toggleReviewVisibility('sourceComments');};document.getElementById('view-author-notes').onclick=()=>{toggleReviewVisibility('authorNotes');};document.getElementById('view-comment-blocks').onclick=()=>{toggleReviewVisibility('commentBlocks');};document.getElementById('view-hidden-comments').onclick=()=>{restoreHiddenReviewItems();};updateCommentViewMenu();const commentInspectorClose=document.getElementById('comment-inspector-close');if(commentInspectorClose)commentInspectorClose.onclick=()=>closeCommentInspector();const projectIssuesClose=document.getElementById('project-issues-close');if(projectIssuesClose)projectIssuesClose.onclick=()=>closeProjectIssues();document.addEventListener('click',e=>{if(!e.target.closest('.top-menu'))closeTopMenus();});document.querySelectorAll('.mode-tab').forEach(btn=>btn.onclick=()=>{viewMode=btn.dataset.view;renderWorkspace();});document.getElementById('new-document').onclick=()=>{closeTopMenus();vscode.postMessage({type:'newDocument'});};document.getElementById('open-file').onclick=()=>{closeTopMenus();vscode.postMessage({type:'open'});};document.getElementById('save-file').onclick=()=>{closeTopMenus();const el=document.getElementById('save-status');el.textContent='Saving…';vscode.postMessage({type:'save'});};document.getElementById('save-as').onclick=()=>{closeTopMenus();vscode.postMessage({type:'saveAs'});};document.getElementById('undo').onclick=()=>vscode.postMessage({type:'undo'});document.getElementById('redo').onclick=()=>vscode.postMessage({type:'redo'});document.getElementById('find-document').onclick=()=>texflowOpenFind();document.getElementById('labs-find-replace').onclick=()=>{closeTopMenus();openLabsFindReplace();};document.getElementById('labs-copy-object').onclick=()=>{closeTopMenus();labsCopyObject();};document.getElementById('labs-paste-object').onclick=()=>{closeTopMenus();labsPasteObject();};document.getElementById('labs-duplicate-object').onclick=()=>{closeTopMenus();labsDuplicateObject();};document.getElementById('labs-move-up').onclick=()=>{closeTopMenus();labsMoveObject(-1);};document.getElementById('labs-move-down').onclick=()=>{closeTopMenus();labsMoveObject(1);};document.getElementById('project-issues-button').onclick=()=>{closeTopMenus();openProjectIssues();};document.getElementById('project-diagnostics').onclick=()=>{closeTopMenus();vscode.postMessage({type:'showProjectDiagnostics'});};document.getElementById('top-compile').onclick=()=>vscode.postMessage({type:'compile'});document.getElementById('spell-language-automatic').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'auto'});document.getElementById('spell-language-english').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'en'});document.getElementById('spell-language-spanish').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'es'});document.getElementById('spell-check-toggle').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'enabled',value:!texflowSpellState.enabled});const body=document.body;const toggleNav=document.getElementById('toggle-nav');const focusBtn=document.getElementById('focus-mode');const exitFocus=document.getElementById('exit-focus');const findInput=document.getElementById('texflow-find-input'),findPrev=document.getElementById('texflow-find-prev'),findNext=document.getElementById('texflow-find-next'),findClose=document.getElementById('texflow-find-close');if(findInput){findInput.addEventListener('input',()=>{texflowFindState.query=findInput.value||'';texflowFindRefresh(true,true);});findInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();texflowFindNavigate(e.shiftKey?-1:1);}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();texflowCloseFind();}});}if(findPrev)findPrev.onclick=()=>texflowFindNavigate(-1);if(findNext)findNext.onclick=()=>texflowFindNavigate(1);if(findClose)findClose.onclick=()=>texflowCloseFind();const texflowFindObserver=new MutationObserver(()=>texflowFindScheduleRefresh(false));const texflowFindContent=document.getElementById('content');if(texflowFindContent)texflowFindObserver.observe(texflowFindContent,{subtree:true,childList:true,characterData:true});function setNav(open){body.classList.toggle('nav-open',open);body.classList.toggle('nav-closed',!open);localStorage.setItem('texflow-nav',open?'open':'closed');}function setFocus(on){body.classList.toggle('focus-mode',on);localStorage.setItem('texflow-focus',on?'on':'off');}// Every TeXFlow document starts with its navigator visible on desktop.
 // On narrow panes it starts closed and the Index button opens it as an overlay.
-setNav(window.innerWidth>=900);setFocus(localStorage.getItem('texflow-focus')==='on');toggleNav.onclick=()=>{setNav(body.classList.contains('nav-closed'));closeTopMenus();};focusBtn.onclick=()=>{setFocus(!body.classList.contains('focus-mode'));closeTopMenus();};exitFocus.onclick=()=>setFocus(false);document.addEventListener('click',e=>{if(window.innerWidth<900&&body.classList.contains('nav-open')&&!e.target.closest('.side')&&!e.target.closest('#toggle-nav'))setNav(false);});window.addEventListener('resize',()=>{if(window.innerWidth<900&&body.classList.contains('nav-open'))setNav(false);});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(texflowFindState.open){e.preventDefault();texflowCloseFind();return;}if(body.classList.contains('comment-inspector-open')){e.preventDefault();closeCommentInspector();return;}closeTopMenus();if(body.classList.contains('focus-mode'))setFocus(false);}if(e.ctrlKey||e.metaKey){const k=e.key.toLowerCase();if(k==='f'){e.preventDefault();texflowOpenFind();}else if(k==='s'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'saveAs':'save'});}else if(k==='o'){e.preventDefault();vscode.postMessage({type:'open'});}else if(k==='z'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'redo':'undo'});}}});vscode.postMessage({type:'ready'});
+setNav(window.innerWidth>=900);setFocus(localStorage.getItem('texflow-focus')==='on');toggleNav.onclick=()=>{setNav(body.classList.contains('nav-closed'));closeTopMenus();};focusBtn.onclick=()=>{setFocus(!body.classList.contains('focus-mode'));closeTopMenus();};exitFocus.onclick=()=>setFocus(false);document.addEventListener('click',e=>{if(window.innerWidth<900&&body.classList.contains('nav-open')&&!e.target.closest('.side')&&!e.target.closest('#toggle-nav'))setNav(false);});window.addEventListener('resize',()=>{if(window.innerWidth<900&&body.classList.contains('nav-open'))setNav(false);});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(texflowFindState.open){e.preventDefault();texflowCloseFind();return;}if(body.classList.contains('project-issues-open')){e.preventDefault();closeProjectIssues();return;}if(body.classList.contains('comment-inspector-open')){e.preventDefault();closeCommentInspector();return;}closeTopMenus();if(body.classList.contains('focus-mode'))setFocus(false);}if(e.ctrlKey||e.metaKey){const k=e.key.toLowerCase();if(k==='f'){e.preventDefault();texflowOpenFind();}else if(k==='s'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'saveAs':'save'});}else if(k==='o'){e.preventDefault();vscode.postMessage({type:'open'});}else if(k==='z'){e.preventDefault();vscode.postMessage({type:e.shiftKey?'redo':'undo'});}}});document.addEventListener('dblclick',e=>{if(e.target&&e.target.closest&&e.target.closest('.comment-inspector-preview,.commented-preview-paragraph,.commented-preview-list,.commented-preview-quote'))return;const ref=e.target&&e.target.closest?e.target.closest('.tex-reference[data-ref-key]'):null;if(ref){e.preventDefault();if(ref.classList.contains('missing')){openProjectIssues();return;}vscode.postMessage({type:'navigateReference',key:ref.dataset.refKey||''});return;}const cite=e.target&&e.target.closest?e.target.closest('.bib-citation[data-cite-keys]'):null;if(cite){e.preventDefault();if(cite.classList.contains('missing')){openProjectIssues();return;}const key=String(cite.dataset.citeKeys||'').split(',').map(x=>x.trim()).find(Boolean)||'';if(key)vscode.postMessage({type:'navigateCitation',key});}});vscode.postMessage({type:'ready'});
 </script></body></html>`;
 }
 
