@@ -16,7 +16,8 @@ ok(source.includes('activeDocument: vscode.TextDocument;'), 'ProjectModel.active
 ok(source.includes('const masterDocument = await findRootDocument(initial);'), 'loadProject does not resolve masterDocument explicitly');
 ok(source.includes('const graph = await buildProjectIncludeGraph(masterDocument);'), 'include graph is not rooted at masterDocument');
 ok(source.includes('const activeDocument = graph.documents.get(initial.uri.toString()) ?? initial;'), 'loadProject does not preserve the initially opened active document');
-ok(source.includes('root = masterDocument'), 'temporary root compatibility alias is not explicit');
+ok(!source.includes('root: vscode.TextDocument;'), 'deprecated ProjectModel.root property still exists');
+ok(!source.includes('project.root'), 'deprecated project.root references still exist');
 ok(source.includes('masterUri: project.masterDocument.uri.toString()'), 'webview payload lacks masterUri');
 ok(source.includes('activeUri: project.activeDocument.uri.toString()'), 'webview payload lacks activeUri');
 

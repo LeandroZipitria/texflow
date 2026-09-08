@@ -1,15 +1,13 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import * as os from 'os';
-import * as fs from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { createHash } from 'crypto';
 import { spellcheckBlocks, type SpellcheckLanguage, type SpellcheckResultBlock } from './spellcheck';
 import { parseBlocks, webviewParserRuntimeSource } from './latex/blocks';
 import type { ParsedBlock } from './latex/types';
 import { buildProjectIndex, maskLatexComments, type ProjectIndex } from './project/index';
 import { buildProjectIssues, type ProjectIssue, type ProjectStructuralIssueInput } from './diagnostics/projectDiagnostics';
+import { cleanupAbandonedTikzPreviewSessions, TikzPreviewSession } from './tikzPreviewSession';
 
 const execFileAsync = promisify(execFile);
 
@@ -96,8 +94,6 @@ interface ProjectIncludeGraph {
 }
 
 interface ProjectModel {
-  /** @deprecated Foundation compatibility alias. Use masterDocument for global project operations. */
-  root: vscode.TextDocument;
   masterDocument: vscode.TextDocument;
   activeDocument: vscode.TextDocument;
   documents: Map<string, vscode.TextDocument>;
@@ -456,6 +452,7 @@ function getTeXFlowHomeHtml(): string {
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel('TeXFlow');
   context.subscriptions.push(output);
+  void cleanupAbandonedTikzPreviewSessions(output);
 
   const projectNavigator = new TeXFlowProjectNavigator(context);
   const projectTree = vscode.window.createTreeView('texflow.projectView', {
@@ -657,7 +654,7 @@ export function activate(context: vscode.ExtensionContext) {
     output.clear();
     output.appendLine('TeXFlow project check');
     output.appendLine('====================');
-    output.appendLine(`Root: ${project.root.uri.fsPath}`);
+    output.appendLine(`Root: ${project.masterDocument.uri.fsPath}`);
     output.appendLine(`Files loaded: ${project.documents.size}`);
     output.appendLine(`Include links: ${project.includeReferences.length}`);
     output.appendLine(`Missing includes: ${project.missingIncludes.length}`);
@@ -683,6 +680,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     let project = await loadProject(initialDocument, output);
     await projectNavigator.setRootDocument(project.masterDocument.uri);
+    const tikzPreviewSession = new TikzPreviewSession();
     let rootUri = project.masterDocument.uri;
     let activeUri = project.activeDocument.uri;
     const panel = vscode.window.createWebviewPanel(
@@ -691,7 +689,7 @@ export function activate(context: vscode.ExtensionContext) {
         ? `TeXFlow: ${path.basename(project.masterDocument.fileName)}`
         : `TeXFlow: ${path.basename(project.activeDocument.fileName)} · ${path.basename(project.masterDocument.fileName)}`,
       vscode.ViewColumn.Beside,
-      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media'), vscode.Uri.joinPath(project.root.uri, '..'), ...(vscode.workspace.workspaceFolders ?? []).map(f => f.uri)] }
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media'), vscode.Uri.joinPath(project.masterDocument.uri, '..'), ...(vscode.workspace.workspaceFolders ?? []).map(f => f.uri)] }
     );
 
     const nonce = String(Date.now());
@@ -1006,14 +1004,18 @@ export function activate(context: vscode.ExtensionContext) {
             throw new Error('TikZ preview requires one complete tikzpicture environment.');
           }
           panel.webview.postMessage({ type: 'tikzPreviewStatus', state: 'building' });
+          const previewOperation = tikzPreviewSession.beginOperation();
           try {
-            const pdf = await compileTikzPreview(project, source);
+            const pdf = await compileTikzPreview(project, source, tikzPreviewSession);
             await openPdfInVsCode(pdf, panel);
+            tikzPreviewSession.trackPdf(pdf);
             panel.webview.postMessage({ type: 'tikzPreviewStatus', state: 'ready' });
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             panel.webview.postMessage({ type: 'tikzPreviewStatus', state: 'error', message });
             vscode.window.showErrorMessage(`TeXFlow TikZ preview: ${message}`);
+          } finally {
+            await previewOperation.end();
           }
         }
         if (msg.type === 'updateTikzSource') {
@@ -1272,13 +1274,13 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'setMetadata') {
           const label = msg.field === 'title' ? 'Document title' : 'Author';
-          const current = getCommandValue(project.root.getText(), msg.field);
+          const current = getCommandValue(project.masterDocument.getText(), msg.field);
           const value = await vscode.window.showInputBox({ prompt: label, value: current });
-          if (value !== undefined) await setDocumentCommand(project.root, msg.field, value);
+          if (value !== undefined) await setDocumentCommand(project.masterDocument, msg.field, value);
         }
         if (msg.type === 'insertAbstract') {
           const value = await vscode.window.showInputBox({ prompt: 'Abstract text' });
-          if (value !== undefined) await insertAbstract(project.root, value);
+          if (value !== undefined) await insertAbstract(project.masterDocument, value);
         }
         if (msg.type === 'insertFrame') {
           if (!project.isBeamer) {
@@ -1310,7 +1312,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'addBibliography') {
           await refreshProject();
-          const rootDir = vscode.Uri.joinPath(project.root.uri, '..');
+          const rootDir = vscode.Uri.joinPath(project.masterDocument.uri, '..');
           let system = bibliographySystem(project);
           if (system === 'none') {
             const pickedSystem = await vscode.window.showQuickPick([
@@ -1351,21 +1353,21 @@ export function activate(context: vscode.ExtensionContext) {
             if (!existing.some(x=>x.replace(/^\.\//,'')===resourceName.replace(/^\.\//,''))) additions.push(`\\addbibresource{${resourceName}}`);
             if (additions.length) {
               await beginHistoryStep();
-              const source=project.root.getText(); const at=Math.max(0,source.indexOf('\\begin{document}'));
-              await applyReplacement(project.root, at, at, `${at>0&&!/\n\s*$/u.test(source.slice(0,at))?'\n':''}${additions.join('\n')}\n\n`);
+              const source=project.masterDocument.getText(); const at=Math.max(0,source.indexOf('\\begin{document}'));
+              await applyReplacement(project.masterDocument, at, at, `${at>0&&!/\n\s*$/u.test(source.slice(0,at))?'\n':''}${additions.join('\n')}\n\n`);
             }
           } else {
             if (system === 'natbib' && !/\\usepackage(?:\[[^\]]*\])?\{[^}]*\bnatbib\b[^}]*\}/i.test(preambleText)) {
               await beginHistoryStep();
-              const source=project.root.getText(); const at=Math.max(0,source.indexOf('\\begin{document}'));
-              await applyReplacement(project.root, at, at, '\\usepackage{natbib}\n\n');
+              const source=project.masterDocument.getText(); const at=Math.max(0,source.indexOf('\\begin{document}'));
+              await applyReplacement(project.masterDocument, at, at, '\\usepackage{natbib}\n\n');
             }
             await refreshProject();
             const style = await vscode.window.showInputBox({ prompt: 'BibTeX bibliography style (.bst name, without extension)', value: bibliographyStyle(project) || 'plainnat', placeHolder: 'e.g. econometrica, plainnat, apalike' });
             if (style === undefined) return;
             const cleanStyle=style.trim()||'plainnat';
             const bibName=resourceName.replace(/\.bib$/i,'');
-            const source=project.root.getText();
+            const source=project.masterDocument.getText();
             const placement=await chooseBibliographyPlacement(source, Number(msg.cursorPos));
             if (placement === undefined) return;
             const commands:string[]=[];
@@ -1374,7 +1376,7 @@ export function activate(context: vscode.ExtensionContext) {
             if (commands.length) {
               await beginHistoryStep();
               const block=project.isBeamer?`\n\\begin{frame}[allowframebreaks]{Bibliography}\n${commands.join('\n')}\n\\end{frame}\n\n`:`\n${commands.join('\n')}\n\n`;
-              await applyReplacement(project.root, placement, placement, block);
+              await applyReplacement(project.masterDocument, placement, placement, block);
             }
           }
           await refreshProject();
@@ -1393,7 +1395,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'addReferencesSection') {
           await refreshProject();
-          const system=bibliographySystem(project),source=project.root.getText();
+          const system=bibliographySystem(project),source=project.masterDocument.getText();
           if(system==='none'){vscode.window.showWarningMessage('TeXFlow: No bibliography is connected yet. Use Add bibliography first.');return;}
           if(system==='natbib'||system==='bibtex'){
             if(/\\bibliography\{[^}]+\}/i.test(source)) vscode.window.showInformationMessage('The BibTeX bibliography is already inserted.');
@@ -1405,7 +1407,7 @@ export function activate(context: vscode.ExtensionContext) {
           if(placement===undefined)return;
           await beginHistoryStep();
           const block=project.isBeamer?'\n\\begin{frame}[allowframebreaks]{Bibliography}\n\\printbibliography\n\\end{frame}\n\n':'\n\\printbibliography\n\n';
-          await applyReplacement(project.root,placement,placement,block);
+          await applyReplacement(project.masterDocument,placement,placement,block);
           await sendDocument();
         }
         if (msg.type === 'showProjectDiagnostics') {
@@ -1525,7 +1527,7 @@ export function activate(context: vscode.ExtensionContext) {
           const activeWasMaster = project.activeDocument.uri.toString() === project.masterDocument.uri.toString();
           const activeLengthBeforePackage = project.activeDocument.getText().length;
           const hasGraphicx = [...project.documents.values()].some(d => /\\usepackage(?:\[[^\]]*\])?\{[^}]*\bgraphicx\b[^}]*\}/.test(d.getText()));
-          if (!hasGraphicx) await ensureGraphicx(project.root);
+          if (!hasGraphicx) await ensureGraphicx(project.masterDocument);
           await refreshProject();
           const packageDelta = activeWasMaster ? project.activeDocument.getText().length - activeLengthBeforePackage : 0;
           const block = figureBlockLatex(latexPath, caption, label, placement, project.isBeamer, captionPosition, align, widthPercent, shortCaption, angle);
@@ -1672,8 +1674,8 @@ export function activate(context: vscode.ExtensionContext) {
           documentEditQueue = documentEditQueue.then(async () => {
             await refreshProject();
             if (feature === 'link') await ensurePackage(project, 'hyperref');
-            if (feature === 'index') { await ensurePackage(project, 'makeidx'); await ensurePreambleCommand(project.root, '\\makeindex'); }
-            if (feature === 'nomenclature') { await ensurePackage(project, 'nomencl'); await ensurePreambleCommand(project.root, '\\makenomenclature'); }
+            if (feature === 'index') { await ensurePackage(project, 'makeidx'); await ensurePreambleCommand(project.masterDocument, '\\makeindex'); }
+            if (feature === 'nomenclature') { await ensurePackage(project, 'nomencl'); await ensurePreambleCommand(project.masterDocument, '\\makenomenclature'); }
             if (feature === 'booktabs') await ensurePackage(project, 'booktabs');
             if (feature === 'multicol') await ensurePackage(project, 'multicol');
             if (feature === 'commentenv') await ensurePackage(project, 'comment');
@@ -1697,15 +1699,15 @@ export function activate(context: vscode.ExtensionContext) {
           if (feature === 'subfigure') { await ensurePackage(project,'graphicx'); await ensurePackage(project,'subcaption'); }
           if (feature === 'theorem') {
             await ensurePackage(project, 'amsthm');
-            await ensureTheoremDefinitions(project.root);
+            await ensureTheoremDefinitions(project.masterDocument);
           }
           if (feature === 'index') {
             await ensurePackage(project, 'makeidx');
-            await ensurePreambleCommand(project.root, '\\makeindex');
+            await ensurePreambleCommand(project.masterDocument, '\\makeindex');
           }
           if (feature === 'nomenclature') {
             await ensurePackage(project, 'nomencl');
-            await ensurePreambleCommand(project.root, '\\makenomenclature');
+            await ensurePreambleCommand(project.masterDocument, '\\makenomenclature');
           }
           if (feature === 'commentenv') await ensurePackage(project, 'comment');
           if (feature === 'tikz') await ensurePackage(project, 'tikz');
@@ -2009,7 +2011,10 @@ export function activate(context: vscode.ExtensionContext) {
       if (updatingFromWebview) return;
       if (project.documents.has(e.document.uri.toString())) await sendDocument();
     });
-    panel.onDidDispose(() => changeSub.dispose());
+    panel.onDidDispose(() => {
+      changeSub.dispose();
+      void tikzPreviewSession.disposeWhenSafe();
+    });
   }));
 }
 
@@ -2201,7 +2206,6 @@ async function loadProject(initial: vscode.TextDocument, output: vscode.OutputCh
   const masterDocument = await findRootDocument(initial);
   const graph = await buildProjectIncludeGraph(masterDocument);
   const activeDocument = graph.documents.get(initial.uri.toString()) ?? initial;
-  const root = masterDocument; // compatibility alias during the Foundation migration
 
   for (const reference of graph.missingIncludes) {
     output.appendLine(`[warning] Included file not found: ${reference.targetUri.fsPath}`);
@@ -2219,7 +2223,6 @@ async function loadProject(initial: vscode.TextDocument, output: vscode.OutputCh
   }
 
   return {
-    root,
     masterDocument,
     activeDocument,
     documents: graph.documents,
@@ -2228,22 +2231,22 @@ async function loadProject(initial: vscode.TextDocument, output: vscode.OutputCh
     includeCycles: graph.includeCycles,
     includedBy: graph.includedBy,
     frames,
-    isBeamer: isBeamerDocument(root.getText()),
-    documentClass: getDocumentClass(root.getText()),
-    metadata: getMetadata(root.getText()),
-    presentationStyle: getPresentationStyle(root.getText())
+    isBeamer: isBeamerDocument(masterDocument.getText()),
+    documentClass: getDocumentClass(masterDocument.getText()),
+    metadata: getMetadata(masterDocument.getText()),
+    presentationStyle: getPresentationStyle(masterDocument.getText())
   };
 }
 
 function getPreambleInfos(project: ProjectModel): PreambleInfo[] {
   const result: PreambleInfo[] = [];
-  const rootText = project.root.getText();
+  const rootText = project.masterDocument.getText();
   const begin = rootText.indexOf('\\begin{document}');
   const rootEnd = begin >= 0 ? begin : rootText.length;
   result.push({
     id: 'root-preamble',
-    label: `${project.root.fileName.split(/[\\/]/).pop()} — root preamble`,
-    uri: project.root.uri.toString(),
+    label: `${project.masterDocument.fileName.split(/[\\/]/).pop()} — root preamble`,
+    uri: project.masterDocument.uri.toString(),
     text: rootText.slice(0, rootEnd),
     start: 0,
     end: rootEnd,
@@ -2258,7 +2261,7 @@ function getPreambleInfos(project: ProjectModel): PreambleInfo[] {
     let target = m[1].trim();
     if (!target || /[\\#$]/.test(target)) continue;
     if (!/\.[A-Za-z0-9]+$/.test(target)) target += '.tex';
-    const uri = vscode.Uri.joinPath(project.root.uri, '..', target);
+    const uri = vscode.Uri.joinPath(project.masterDocument.uri, '..', target);
     const key = uri.toString();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -2292,7 +2295,7 @@ function packageCommand(project: ProjectModel, packageName: string): { document:
 
 async function ensurePackage(project: ProjectModel, packageName: string, options = '') {
   const found = packageCommand(project, packageName); if (found) return;
-  const root = await vscode.workspace.openTextDocument(project.root.uri); const text = root.getText(); const begin = text.indexOf('\\begin{document}'); if (begin < 0) return;
+  const root = await vscode.workspace.openTextDocument(project.masterDocument.uri); const text = root.getText(); const begin = text.indexOf('\\begin{document}'); if (begin < 0) return;
   await applyReplacement(root, begin, begin, `\\usepackage${options ? `[${options}]` : ''}{${packageName}}\n`);
 }
 
@@ -2322,7 +2325,7 @@ async function ensureTheoremDefinitions(document: vscode.TextDocument) {
 }
 
 function getDocumentSettings(project: ProjectModel): DocumentSettings {
-  const root = project.root.getText();
+  const root = project.masterDocument.getText();
   const cls = /\\documentclass(?:\[([^\]]*)\])?\{[^}]+\}/.exec(root); const opts = String(cls?.[1] || '').split(',').map(x=>x.trim()).filter(Boolean);
   const all = [...project.documents.values()].map(d=>d.getText()).join('\n');
   const fontSize = opts.find(x=>/^(?:9|10|11|12|14|17|20)pt$/.test(x)) || (project.isBeamer ? '11pt' : '12pt');
@@ -2386,15 +2389,15 @@ async function applyDocumentSettings(project: ProjectModel, raw: any, output: vs
     paragraphSkip:/^\d+(?:\.\d+)?(?:mm|cm|in|pt|em|ex)$/.test(String(raw.paragraphSkip||''))?String(raw.paragraphSkip):'',
     hyperlinks:!!raw.hyperlinks, beamerAspect:/^(?:43|169|1610|149|54|32)$/.test(String(raw.beamerAspect||''))?String(raw.beamerAspect):'43', beamerTheme:String(raw.beamerTheme||'default').replace(/[^A-Za-z0-9_-]/g,''), extraPackages:String(raw.extraPackages||'')
   };
-  let root = await vscode.workspace.openTextDocument(project.root.uri); let text=root.getText(); const cm=/\\documentclass(?:\[([^\]]*)\])?\{([^}]+)\}/.exec(text);
+  let root = await vscode.workspace.openTextDocument(project.masterDocument.uri); let text=root.getText(); const cm=/\\documentclass(?:\[([^\]]*)\])?\{([^}]+)\}/.exec(text);
   if(cm){const old=String(cm[1]||'').split(',').map(x=>x.trim()).filter(Boolean).filter(x=>!/^(?:9|10|11|12|14|17|20)pt$/.test(x)&&!/^(?:a4paper|a5paper|letterpaper|legalpaper)$/.test(x)&&x!=='landscape'&&x!=='twocolumn'&&!/^aspectratio\s*=/.test(x)); old.unshift(settings.fontSize); if(!project.isBeamer) old.push(settings.paper); if(settings.orientation==='landscape')old.push('landscape'); if(!project.isBeamer&&settings.globalColumns==='two')old.push('twocolumn'); if(project.isBeamer)old.push(`aspectratio=${settings.beamerAspect}`); const rep=`\\documentclass[${[...new Set(old)].join(',')}]{${cm[2]}}`; await applyReplacement(root,cm.index,cm.index+cm[0].length,rep);}
   // Reopen after the class edit so offsets are current.
-  project = await loadProject(await vscode.workspace.openTextDocument(project.root.uri), output);
+  project = await loadProject(await vscode.workspace.openTextDocument(project.masterDocument.uri), output);
   const updatePkg=async(name:string, options:string)=>{const found=packageCommand(project,name); if(found){await applyReplacement(found.document,found.start,found.end,`\\usepackage${options?`[${options}]`:''}{${name}}`);} else if(options||name!=='babel') await ensurePackage(project,name,options);};
   if(settings.language) await updatePkg('babel',settings.language);
   if(settings.margin) await updatePkg('geometry',`margin=${settings.margin}`);
   if(settings.hyperlinks) await ensurePackage(project,'hyperref');
-  root=await vscode.workspace.openTextDocument(project.root.uri); text=root.getText(); const begin=text.indexOf('\\begin{document}'); if(begin>=0){const startMark='% TeXFlow managed document settings'; const endMark='% End TeXFlow managed document settings'; const existingStart=text.indexOf(startMark),existingEnd=text.indexOf(endMark); let managed=`${startMark}\n`;
+  root=await vscode.workspace.openTextDocument(project.masterDocument.uri); text=root.getText(); const begin=text.indexOf('\\begin{document}'); if(begin>=0){const startMark='% TeXFlow managed document settings'; const endMark='% End TeXFlow managed document settings'; const existingStart=text.indexOf(startMark),existingEnd=text.indexOf(endMark); let managed=`${startMark}\n`;
     managed += settings.lineSpacing==='double'?'\\linespread{1.6}\n':settings.lineSpacing==='onehalf'?'\\linespread{1.3}\n':'\\linespread{1}\n';
     if(settings.paragraphIndent) managed += `\\setlength{\\parindent}{${settings.paragraphIndent}}\n`;
     if(settings.paragraphSkip) managed += `\\setlength{\\parskip}{${settings.paragraphSkip}}\n`;
@@ -2403,7 +2406,7 @@ async function applyDocumentSettings(project: ProjectModel, raw: any, output: vs
     if(existingStart>=0&&existingEnd>=existingStart) await applyReplacement(root,existingStart,existingEnd+endMark.length+(text[existingEnd+endMark.length]==='\n'?1:0),managed); else await applyReplacement(root,begin,begin,managed+'\n');
   }
   // Extra packages are additive only; unknown existing package declarations are never removed.
-  project = await loadProject(await vscode.workspace.openTextDocument(project.root.uri), output);
+  project = await loadProject(await vscode.workspace.openTextDocument(project.masterDocument.uri), output);
   for(const token of settings.extraPackages.split(',').map(x=>x.trim()).filter(Boolean)){const mm=/^([A-Za-z0-9_-]+)(?:\[([^\]]*)\])?$/.exec(token); if(mm) await ensurePackage(project,mm[1],mm[2]||'');}
 }
 
@@ -2559,7 +2562,7 @@ function bibliographyResourceNames(project: ProjectModel): string[] {
 }
 
 async function getBibliographyResources(project: ProjectModel): Promise<BibliographyResource[]> {
-  const rootDir = vscode.Uri.joinPath(project.root.uri, '..');
+  const rootDir = vscode.Uri.joinPath(project.masterDocument.uri, '..');
   const seen = new Set<string>();
   const resources: BibliographyResource[] = [];
   for (let rawName of bibliographyResourceNames(project)) {
@@ -2627,7 +2630,7 @@ function parseGraphicPaths(source: string): string[] {
 
 async function getFigureResources(project: ProjectModel, webview: vscode.Webview): Promise<Record<string, { uri: string; isPdf: boolean; extension: string }>> {
   const resources: Record<string, { uri: string; isPdf: boolean; extension: string }> = {};
-  const rootDir = vscode.Uri.joinPath(project.root.uri, '..');
+  const rootDir = vscode.Uri.joinPath(project.masterDocument.uri, '..');
   const graphicPaths = [...project.documents.values()].flatMap(d => parseGraphicPaths(d.getText()));
   const extensions = ['', '.pdf', '.png', '.jpg', '.jpeg', '.svg', '.webp', '.gif'];
 
@@ -2796,13 +2799,11 @@ function tikzPreviewDocument(project: ProjectModel, tikzRaw: string): string {
   return `${preamble.trimEnd()}\n${body}`;
 }
 
-async function compileTikzPreview(project: ProjectModel, tikzRaw: string): Promise<vscode.Uri> {
-  const digest = createHash('sha256').update(project.masterDocument.uri.toString()).update('\0').update(tikzRaw).digest('hex').slice(0, 16);
-  const dir = path.join(os.tmpdir(), 'texflow-tikz-preview', digest);
-  await fs.mkdir(dir, { recursive: true });
+async function compileTikzPreview(project: ProjectModel, tikzRaw: string, session: TikzPreviewSession): Promise<vscode.Uri> {
+  const dir = await session.buildDirectory(project.masterDocument, tikzRaw);
   const texPath = path.join(dir, 'preview.tex');
   const pdfPath = path.join(dir, 'preview.pdf');
-  await fs.writeFile(texPath, tikzPreviewDocument(project, tikzRaw), 'utf8');
+  await vscode.workspace.fs.writeFile(vscode.Uri.file(texPath), new TextEncoder().encode(tikzPreviewDocument(project, tikzRaw)));
   const cwd = PathDir(project.masterDocument.uri.fsPath);
   const common = { cwd, timeout: 30000, maxBuffer: 4 * 1024 * 1024 } as const;
   try {
@@ -2819,7 +2820,7 @@ async function compileTikzPreview(project: ProjectModel, tikzRaw: string): Promi
       throw new Error(detail || 'Neither latexmk nor pdflatex could compile the TikZ preview.');
     }
   }
-  try { await fs.access(pdfPath); } catch { throw new Error('TikZ preview compilation finished without producing a PDF.'); }
+  try { await vscode.workspace.fs.stat(vscode.Uri.file(pdfPath)); } catch { throw new Error('TikZ preview compilation finished without producing a PDF.'); }
   return vscode.Uri.file(pdfPath);
 }
 
