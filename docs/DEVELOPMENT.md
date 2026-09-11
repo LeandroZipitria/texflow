@@ -73,6 +73,62 @@ Before adding a new write path, determine explicitly whether the target is:
 
 Global metadata such as packages or bibliography configuration normally belongs to the master document. Visual content edits normally belong to the active document.
 
+
+## Visual typing, save pipeline, and TextDocument lifecycle
+
+The ordinary Visual typing path is performance- and lifecycle-sensitive. It has regressed more than once from changes that appeared locally harmless. Treat this path as a protected contract rather than an incidental implementation detail.
+
+### Validated typing/save contract
+
+For ordinary prose and inline metadata editing:
+
+1. the webview handles keystrokes locally;
+2. `scheduleSave` resets a 500 ms debounce and shows `Editing…`;
+3. only after the user pauses does the webview send the semantic edit to the Extension Host;
+4. the host serializes the edit through `documentEditQueue`;
+5. history/stale-source checks remain enabled;
+6. the edit is applied through the established replacement path and persisted with `document.save()`;
+7. ordinary typing uses `refresh=false`, so save must not rebuild the Visual DOM or destroy the caret/selection.
+
+Do **not** casually replace this path with per-keystroke host messages, additional save timers, speculative project rebuilds, or alternate “lightweight” write branches. `document.save()` was already part of the validated `0.20.0` path; a future performance investigation must measure the complete pipeline before attributing latency to the physical save itself.
+
+A typing-performance regression is a **release blocker**. Before changing this pipeline, compare against the last validated implementation and test continuous typing for at least 20–30 seconds in both ordinary paragraphs and editable metadata.
+
+### TextDocument objects are not durable identities
+
+A `vscode.TextDocument` object retained by TeXFlow may later be closed by VS Code even though TeXFlow still retains the JavaScript object. This was observed on macOS while editing cloud-backed project files and produced `Document has been closed` during Visual autosave.
+
+Use the document URI as the durable session identity. Immediately before reading or mutating a document whose lifetime may have crossed asynchronous work, re-resolve it with:
+
+```ts
+const document = await vscode.workspace.openTextDocument(uri);
+```
+
+`openTextDocument()` loads/retrieves the document in the workspace; it does **not** reveal a Source editor. Never use `showTextDocument()` as part of ordinary Visual autosave or metadata editing. A Visual edit must not open or focus Source as a side effect.
+
+This rule currently applies especially to:
+
+- `updateDocumentNode` before editing `activeUri`;
+- Title/Author metadata before editing `rootUri`;
+- Undo/history snapshots before calling `getText()` on project documents.
+
+The project model may still expose `masterDocument` and `activeDocument` for current project state, but long-lived asynchronous edit code must not assume that a previously retained `TextDocument` object remains live.
+
+### Regression checklist for typing/lifecycle bugs
+
+When ordinary Visual editing becomes slow, loses the caret, opens Source unexpectedly, or reports a closed document, do not redesign the pipeline first. Check in this order:
+
+1. reproduce against the last released VSIX on the same machine and same file;
+2. verify that `scheduleSave` still debounces locally and does not post to the host on every keystroke;
+3. verify that ordinary typing still uses `refresh=false`;
+4. search the typing path for new project rebuilds, extra timers, or `showTextDocument()` calls;
+5. distinguish `openTextDocument()` (safe re-resolution) from `showTextDocument()` (visible Source navigation);
+6. verify that retained documents are re-resolved by URI before `getText()`, range edits, or metadata writes;
+7. compare the same VSIX on another supported OS/machine before concluding that a platform-specific slowdown is a code regression;
+8. profile before changing save timing or persistence semantics.
+
+The `0.20.1` regression coverage pins these invariants in `tests/build_0201_runtime.js` and `tests/keyboard_navigation_runtime.js`.
+
 ## Visual ↔ Source navigation
 
 Location-aware view switching is part of the source-preservation architecture, not only UI polish.
@@ -144,7 +200,9 @@ High-value behavioral coverage in `0.20.0` includes:
 - TODO/FIXME serialization and editing;
 - `masterDocument != activeDocument` during Visual editing;
 - TikZ temporary lifecycle;
-- project-wide references, bibliography, diagnostics, and navigation.
+- project-wide references, bibliography, diagnostics, and navigation;
+- Visual typing keeps the validated debounce/non-refreshing save contract;
+- live `TextDocument` re-resolution by URI without unsolicited Source navigation.
 
 ## Performance rule
 
