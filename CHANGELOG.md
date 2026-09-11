@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.20.1 — 2026-09-11
+
+### Added
+
+- **Insert → Included file...** for building multi-file LaTeX projects directly from Visual.
+- Creation of new included `.tex` files with separate folder/name fields and automatic `.tex` extension handling.
+- Linking of existing `.tex` files with `\input` or `\include`, including files outside the master-project folder when a valid relative path can be generated.
+- A remove control on included-file cards that removes only the `\input`/`\include` relationship and never deletes the physical `.tex` file.
+- **Structure → Table of contents** insertion using the existing visual TOC renderer.
+- Semantic Visual editing for `abstract` environments.
+- Inline Visual creation/editing for Title, Author, and Abstract without moving focus to VS Code input boxes.
+- Visual insertion points before the first structural block and after supported structural objects such as the table of contents and included-file cards.
+
+### Improved
+
+- Included-file cards now follow the same selected-object removal pattern as other semantic objects.
+- The project/document sidebar resize handle is aligned with the visible divider and no longer visually cuts through open top menus.
+- Beamer empty-paragraph Backspace/Delete behavior now rejoins adjacent content without breaking transient `Start typing…` placeholders.
+- Unsupported **Add label to selected object...** is no longer shown in Beamer.
+- Table-of-contents creation preserves the established `0.20.0` visual representation instead of introducing a second TOC UI.
+- Title rendering again uses the intended large, bold Visual presentation and ensures `\maketitle` is present for standard documents.
+
+### Reliability
+
+- Fixed `Document has been closed` failures during Visual editing by treating document URIs as durable identities and re-resolving live `TextDocument` objects immediately before asynchronous reads/writes.
+- Visual autosave re-resolution uses `openTextDocument()` only; it does not use `showTextDocument()` and therefore does not open Source as an editing side effect.
+- Undo/history snapshots and Title/Author metadata updates now avoid stale retained `TextDocument` instances.
+- Preserved the validated Visual typing contract: local editing, 500 ms debounce, serialized host edit, `document.save()`, and no Visual DOM refresh during ordinary typing.
+
+### Tests
+
+- Added `build_0201_runtime.js` for 0.20.1 feature and lifecycle coverage.
+- Updated Build D behavioral coverage to require live active-document re-resolution while preserving `masterDocument != activeDocument`.
+- Kept the complete fast regression gate passing across parser, project navigation, references, bibliography, diagnostics, structured math, comments, TikZ, Beamer, Visual ↔ Source, spellcheck, and parser parity.
+
+### Notes
+
+TeXFlow `0.20.1` is a focused follow-up to `0.20.0`. It closes creation/editing gaps in the Visual workflow—especially multi-file project construction, abstract/TOC/title metadata workflows—and hardens document lifecycle handling without changing the core source-of-truth model.
+
+
 ## 0.20.0 — 2026-09-08
 
 ### Added

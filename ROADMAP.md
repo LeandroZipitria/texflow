@@ -10,13 +10,14 @@ This document collects possible directions for future development. It is intenti
 
 ## Current baseline
 
-Stable release: **v0.20.0**
+Stable release: **v0.20.1**
 
 The current release includes, among other features:
 
 - visual editing of LaTeX documents inside VS Code;
 - article/report/book and Beamer workflows;
 - project-aware Visual editing across `\input` and `\include` files;
+- direct creation/linking/removal of `\input` and `\include` relationships from Visual;
 - explicit `masterDocument` / `activeDocument` semantics;
 - a project navigator that lists real project files separately from document structure;
 - project-relative file labels and a resizable persistent project/document sidebar;
@@ -29,12 +30,14 @@ The current release includes, among other features:
 - TikZ insertion, Figure properties, inline source editing, PDF preview, Source navigation, and bare-picture → Figure promotion;
 - Beamer frame duplication, movement, disable/restore, blocks, columns, and frame options;
 - comments, TODO, FIXME, Author note, commented-out blocks, and comment navigation;
+- inline Visual creation/editing of Title, Author, Abstract, and table of contents;
 - Visual ↔ Source location-aware switching;
 - local spell checking in English and Spanish;
 - Focus mode and simplified menus/presentation;
 - conservative custom-environment support;
 - source preservation and round-trip editing;
 - session-scoped TikZ preview temporaries with conservative cleanup;
+- live `TextDocument` re-resolution by URI for robust asynchronous Visual edits without opening Source;
 - optimized project-index construction without adding cache complexity.
 
 Validated functionality from the current baseline should not be reopened unless a new feature requires it or a reproducible bug is found.
@@ -170,10 +173,6 @@ Possible future improvements:
 - drag and drop.
 
 Structural editing actions should be introduced incrementally because they modify source ranges and therefore carry more source-preservation risk than read-only navigation.
-
-### Minor UI polish
-
-- align the sidebar resize hit area exactly with the visible vertical divider so resize is immediately discoverable.
 
 ---
 
@@ -523,6 +522,9 @@ The visual settings panel should never attempt to replace the full LaTeX preambl
 Current support includes:
 
 - `\input` and `\include` discovery;
+- **Insert → Included file...** to create a new `.tex` file or link an existing file;
+- explicit `\input` / `\include` choice;
+- removal of the relationship from the document without deleting the physical file;
 - nested include graph;
 - explicit master document;
 - explicit active document;
@@ -622,7 +624,7 @@ AI should not silently rewrite the document. All modifications should remain rev
 
 ## Current position
 
-`0.20.0` includes a targeted project-index optimization after measurement. Parser, spellcheck, TikZ caching, activation behavior, and packaging were deliberately not reworked where measurements did not justify the additional complexity.
+`0.20.0` introduced a targeted project-index optimization after measurement. `0.20.1` preserves that performance architecture while hardening Visual typing/TextDocument lifecycle behavior. Parser, spellcheck, TikZ caching, activation behavior, and packaging were not broadly reworked where measurements did not justify the additional complexity.
 
 Possible future work:
 
@@ -698,6 +700,7 @@ Future features should preserve the following principles:
 - keep advanced LaTeX accessible;
 - avoid turning TeXFlow into a replacement for VS Code, LaTeX, Zotero, or a general-purpose graphics editor;
 - keep the interface simple, comfortable, clear, and clean;
+- require explicit lifecycle parity decisions for visual features: view, create, edit, remove-from-document, and Source navigation;
 - keep the document itself as the primary visual surface.
 
 ---
@@ -715,4 +718,4 @@ Features should be promoted into release plans only after:
 5. automated/manual validation;
 6. decision on scope and version.
 
-`1.0.0` remains a separate product decision. Completing `0.20.0` does not automatically trigger a 1.0 release.
+`1.0.0` remains a separate product decision. Completing `0.20.x` does not automatically trigger a 1.0 release.

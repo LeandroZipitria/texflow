@@ -8,7 +8,7 @@
 
 TeXFlow is a visual editor for real LaTeX files inside VS Code. It lets you focus on writing while keeping your `.tex` files intact, editable, and fully accessible.
 
-**Current stable release: 0.20.0.**
+**Current stable release: 0.20.1.**
 
 TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files remain the source of truth. When TeXFlow cannot safely edit a complex construct visually, it preserves the underlying LaTeX rather than silently rewriting it.
 
@@ -16,12 +16,14 @@ TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files rema
 
 - Visual editing for `article`, `report`, `book`, and Beamer documents.
 - Project-aware Visual editing across `\input` and `\include` files while preserving every source file separately.
+- Build multi-file documents directly from Visual with **Insert → Included file...**: create a new `.tex` file or link an existing one, choose `\input` or `\include`, and remove the relationship later without deleting the file.
 - Explicit master-document and active-document handling for multi-file projects.
 - Project navigator with real `.tex`, `.bib`, and supported figure files; project-relative paths; and a resizable persistent sidebar.
 - Project-wide labels and cross-references, including navigation, missing references, duplicate labels, and unused labels.
 - Project-wide bibliography intelligence with search by citation key, author, title, and year; missing keys; unused entries; and citation/BibTeX navigation.
 - **Project Issues** for project-wide reference, bibliography, and include diagnostics.
 - Semantic paragraphs, headings, lists, and document structure.
+- Visual creation/editing of title, author, abstract, and table of contents, including insertion points before the first structural block and after supported structural objects.
 - Bold, italic, underline, color, and paragraph alignment.
 - Unified Equation, Matrix, and System workflows with inline/display placement, semantic numbering, aligned equations, cases, matrices, delimiters, and common accents/symbols.
 - Numbered/unnumbered structural editing, including safe `align` ↔ `align*` and `section` ↔ `section*` round trips.
@@ -30,6 +32,7 @@ TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files rema
 - TikZ figures with insertion, Figure properties, inline source editing, PDF preview, Source navigation, and promotion of a bare `tikzpicture` to a Figure.
 - Beamer frame operations including duplicate, move, disable/restore, blocks, columns, frame options, and frame-local text sizes.
 - Comments and notes with Comment, TODO, FIXME, Author note, commented-out blocks, and document-order navigation.
+- More robust Visual editing when VS Code closes background `TextDocument` objects: TeXFlow re-resolves documents by URI without opening Source as a side effect.
 - Visual ↔ Source navigation that preserves the relevant document location, including cross-file navigation.
 - Visual, Source, Split, and PDF workflows.
 - Local spell checking with English and Spanish dictionaries and automatic/manual language selection.
@@ -73,7 +76,7 @@ https://marketplace.visualstudio.com/items?itemName=leandrozipitria.texflow
 
 In multi-file projects, opening an included `.tex` file in TeXFlow keeps the master document for project-wide metadata and compilation while making the included file the active Visual editing target.
 
-TeXFlow saves accepted visual edits back to the active `.tex` source immediately, so ordinary Visual editing does not require a separate save step. Standard **Save** and **Save as...** actions remain available when needed.
+TeXFlow saves accepted visual edits back to the active `.tex` source automatically. While you type, the status shows **Editing…**; after a short pause TeXFlow writes the edit and returns to **Saved**. Ordinary Visual editing therefore does not require a separate save step. Standard **Save** and **Save as...** actions remain available when needed.
 
 You can also right-click a folder in the VS Code Explorer to create a TeXFlow document there, or right-click a `.tex` file to open it with TeXFlow.
 

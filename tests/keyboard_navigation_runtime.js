@@ -62,9 +62,9 @@ ok(!source.includes("if((e.key==='ArrowUp'||e.key==='ArrowDown')&&!e.shiftKey)")
 
 ok(
   source.includes('function flushSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);send(false);}'),
-  'blur/focus save still requests a webview refresh and can destroy the caret'
+  'blur/focus save must preserve the validated v0.20.0 non-refreshing contract'
 );
 ok(
-  source.includes('Structural actions already request refresh explicitly with save(true).'),
+  source.includes('A refresh replaces the focused contenteditable node and destroys the caret.'),
   'caret-preservation rationale for non-refreshing blur saves is missing'
 );
