@@ -179,9 +179,11 @@ Keep me exactly.
   assert(extension.includes('doc-metadata-edit doc-title-heading'), 'editable title must keep a title-specific visual class');
   assert(extension.includes('.doc-title .doc-title-heading{display:block;width:100%;font-size:2.05em!important;'), 'editable title must preserve the validated large/bold v0.20 presentation');
 
-  // Ordinary prose must keep the exact v0.20.0 typing/save contract. This path
-  // has regressed twice, so tests intentionally pin the validated implementation:
-  // 500 ms debounce, the original queued host edit path, and no source reopening.
+  // Ordinary prose keeps the validated v0.20.0 typing/save contract: 500 ms
+  // debounce and the original queued host edit path. The host may re-resolve a
+  // TextDocument by URI immediately before editing because TextDocument objects
+  // can be closed by VS Code. openTextDocument must never be confused with
+  // showTextDocument: re-resolving in memory must not reveal a Source editor.
   assert(extension.includes("let activeEditable=null;const saveTimers=new WeakMap();function scheduleSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);document.getElementById('save-status').textContent='Editing…';saveTimers.set(el,setTimeout(()=>send(false),500));}"), 'ordinary Visual typing must preserve the validated v0.20.0 500 ms debounce');
   assert(extension.includes("function flushSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);send(false);}"), 'blur/focus must preserve the validated v0.20.0 non-refreshing save contract');
   const hostEditStart = extension.indexOf("if (msg.type === 'updateDocumentNode') {");
@@ -189,9 +191,10 @@ Keep me exactly.
   const hostEdit = extension.slice(hostEditStart, hostEditEnd);
   assert(hostEditStart >= 0 && hostEditEnd > hostEditStart, 'updateDocumentNode host handler missing');
   assert(hostEdit.includes("postStatus('saving');\n            await beginHistoryStep();\n            await refreshProject();"), 'ordinary document edits must use the validated v0.20.0 queued project path');
-  assert(hostEdit.includes("await updateDocumentRange(project.activeDocument, Number(msg.start), Number(msg.end), String(msg.expected ?? ''), String(msg.replacement ?? ''), String(msg.feature || ''));"), 'ordinary document edits must target the validated active TextDocument path');
+  assert(hostEdit.includes('const activeDocument = await vscode.workspace.openTextDocument(activeUri);'), 'ordinary document edits must re-resolve the active TextDocument from the durable URI before editing');
+  assert(hostEdit.includes("await updateDocumentRange(activeDocument, Number(msg.start), Number(msg.end), String(msg.expected ?? ''), String(msg.replacement ?? ''), String(msg.feature || ''));"), 'ordinary document edits must use the live active TextDocument');
   assert(!hostEdit.includes('lightweightTextEdit'), 'do not reintroduce the post-v0.20 lightweight autosave branch');
-  assert(!hostEdit.includes('openTextDocument(activeUri)'), 'ordinary typing must not reopen Source documents');
+  assert(!hostEdit.includes('showTextDocument'), 'ordinary typing must never reveal a Source editor while re-resolving the document');
   assert(extension.includes('async function applyReplacement(document: vscode.TextDocument, start: number, end: number, value: string)'), 'replacement helper must use the established immediate-save contract');
   assert(extension.includes('else await document.save();'), 'accepted Visual edits must leave the source clean on disk');
   assert(!extension.includes("type:'visualTyping'"), 'typing must not post host messages on every keystroke');
@@ -199,10 +202,11 @@ Keep me exactly.
   assert(!extension.includes('scheduleDocumentDiskSave'), 'disk saves must not be rescheduled independently of Visual edits');
   assert(extension.includes("if (msg.type === 'compile') {\n          await documentEditQueue;"), 'Compile must wait for queued Visual edits before LaTeX reads the document');
 
-  // Title/Author are new in 0.20.1, but their write path must stay as close as
-  // possible to the validated v0.20.0 metadata update: use the already-loaded
-  // master TextDocument, do not reopen Source, and do not rebuild the webview.
-  assert(extension.includes("await setDocumentCommand(project.masterDocument, field, String(msg.value ?? ''));"), 'inline metadata must write through the already-loaded master document');
+  // Title/Author are new in 0.20.1. Preserve the validated non-refreshing
+  // webview behavior, but resolve the master TextDocument from rootUri at the
+  // moment of the edit so a closed retained object cannot break autosave.
+  assert(extension.includes('const masterDocument = await vscode.workspace.openTextDocument(rootUri);'), 'inline metadata must re-resolve the master TextDocument from the durable URI');
+  assert(extension.includes("await setDocumentCommand(masterDocument, field, String(msg.value ?? ''));"), 'inline metadata must write through the live master document');
   assert(extension.includes("function mirrorMetadataSource(field,value)"), 'metadata typing must mirror source and offsets locally');
   assert(extension.includes("el.addEventListener('blur',()=>flushSave(el,save));"), 'metadata blur must persist without rebuilding the visual DOM');
 
@@ -240,6 +244,22 @@ Text.
   const once = document.text;
   sandbox.ensureMakeTitle(document);
   assert.strictEqual(document.text, once, 'ensuring a title twice must not duplicate \\maketitle');
+}
+
+
+// 12. TextDocument lifecycle: durable URIs, live documents, no unsolicited Source editor.
+{
+  const captureStart = extension.indexOf('const captureSnapshot = async (): Promise<Snapshot> => {');
+  const captureEnd = extension.indexOf('const restoreSnapshot = async', captureStart);
+  const capture = extension.slice(captureStart, captureEnd);
+  assert(captureStart >= 0 && captureEnd > captureStart, 'snapshot capture block missing');
+  assert(capture.includes('await vscode.workspace.openTextDocument(storedDocument.uri)'), 'history snapshots must not read retained TextDocument objects directly');
+
+  const metadataStart = extension.indexOf("if (msg.type === 'setMetadataValue') {");
+  const metadataEnd = extension.indexOf("if (msg.type === 'insertAbstract') {", metadataStart);
+  const metadata = extension.slice(metadataStart, metadataEnd);
+  assert(metadata.includes('await vscode.workspace.openTextDocument(rootUri)'), 'metadata edits must re-resolve the master TextDocument by durable URI');
+  assert(!metadata.includes('showTextDocument'), 'metadata edits must not reveal a Source editor');
 }
 
 console.log('PASS build_0201_runtime');

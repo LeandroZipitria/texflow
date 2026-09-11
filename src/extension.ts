@@ -704,7 +704,17 @@ export function activate(context: vscode.ExtensionContext) {
     const redoStack: Snapshot[] = [];
     const captureSnapshot = async (): Promise<Snapshot> => {
       await refreshProject();
-      return { files: [...project.documents.values()].map(d => ({ uri: d.uri.toString(), text: d.getText() })) };
+      const files: Snapshot['files'] = [];
+      for (const storedDocument of project.documents.values()) {
+        // TextDocument objects are not durable session identities. macOS file
+        // providers (including cloud-backed folders) can cause VS Code to close
+        // an in-memory TextDocument even while TeXFlow still retains the object.
+        // Re-resolve by URI immediately before reading; openTextDocument loads the
+        // document into the workspace but does not reveal a Source editor.
+        const liveDocument = await vscode.workspace.openTextDocument(storedDocument.uri);
+        files.push({ uri: liveDocument.uri.toString(), text: liveDocument.getText() });
+      }
+      return { files };
     };
     const restoreSnapshot = async (snapshot: Snapshot) => {
       updatingFromWebview = true;
@@ -1241,9 +1251,14 @@ export function activate(context: vscode.ExtensionContext) {
             postStatus('saving');
             await beginHistoryStep();
             await refreshProject();
+            // activeUri is the durable identity for the Visual session. Do not
+            // retain/reuse a TextDocument object across autosaves: VS Code may
+            // close it when a Source editor disappears or a macOS file provider
+            // refreshes the file. openTextDocument does not show a Source tab.
+            const activeDocument = await vscode.workspace.openTextDocument(activeUri);
             updatingFromWebview = true;
             try {
-              await updateDocumentRange(project.activeDocument, Number(msg.start), Number(msg.end), String(msg.expected ?? ''), String(msg.replacement ?? ''), String(msg.feature || ''));
+              await updateDocumentRange(activeDocument, Number(msg.start), Number(msg.end), String(msg.expected ?? ''), String(msg.replacement ?? ''), String(msg.feature || ''));
               if (String(msg.feature || '') === 'multicol') {
                 await refreshProject();
                 await ensurePackage(project, 'multicol');
@@ -1273,7 +1288,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (msg.type === 'ensureMetadataField') {
           const field = msg.field === 'author' ? 'author' : 'title';
           await refreshProject();
-          const document = project.masterDocument;
+          const document = await vscode.workspace.openTextDocument(rootUri);
           const source = document.getText();
           const re = new RegExp('\\\\' + field + '\\{');
           const activeSource = stripLatexCommentsForIncludes(source);
@@ -1302,10 +1317,11 @@ export function activate(context: vscode.ExtensionContext) {
             postStatus('saving');
             updatingFromWebview = true;
             try {
-              // Match the validated v0.20.0 metadata write path: operate on the
-              // already-loaded master TextDocument and persist through setDocumentCommand.
-              // Do not reopen/focus Source and do not rebuild the Visual DOM.
-              await setDocumentCommand(project.masterDocument, field, String(msg.value ?? ''));
+              // Preserve the validated non-refreshing metadata write path, but
+              // re-resolve the master TextDocument from its durable URI first.
+              // openTextDocument does not reveal/focus Source or rebuild the Visual DOM.
+              const masterDocument = await vscode.workspace.openTextDocument(rootUri);
+              await setDocumentCommand(masterDocument, field, String(msg.value ?? ''));
             } finally {
               updatingFromWebview = false;
             }

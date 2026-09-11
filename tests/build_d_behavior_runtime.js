@@ -146,8 +146,8 @@ z &= w`;
 }
 
 // 5. When the active document is an include, the webview mirror must mutate
-// that include only. The host route is separately required to target
-// project.activeDocument, not masterDocument.
+// that include only. The host route must re-resolve a live document from
+// activeUri immediately before editing, and must never target masterDocument.
 {
   const updateFnSource = extractFunction('updateDocumentNode', 'serializeDocumentList');
   const messages = [];
@@ -169,8 +169,18 @@ z &= w`;
   assert.strictEqual(sandbox.sources[0].text, String.raw`\input{sections/part}`, 'master source must remain untouched');
   assert.strictEqual(sandbox.sources[1].text, 'gamma beta', 'active include source must receive the visual edit');
   assert.strictEqual(messages[0].type, 'updateDocumentNode');
-  assert(src.includes('await updateDocumentRange(project.activeDocument,'), 'host update route must target project.activeDocument');
-  assert(!src.includes('await updateDocumentRange(project.masterDocument,'), 'host update route must not target masterDocument');
+  assert(
+    src.includes('const activeDocument = await vscode.workspace.openTextDocument(activeUri);'),
+    'host update route must re-resolve a live active document from activeUri before editing'
+  );
+  assert(
+    src.includes('await updateDocumentRange(activeDocument,'),
+    'host update route must target the live active document'
+  );
+  assert(
+    !src.includes('await updateDocumentRange(project.masterDocument,'),
+    'host update route must not target masterDocument'
+  );
 }
 
 
