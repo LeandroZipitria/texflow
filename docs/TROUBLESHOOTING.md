@@ -1,5 +1,19 @@
 # TeXFlow troubleshooting
 
+## “Document has been closed”
+
+TeXFlow `0.20.1` re-resolves active/master sources from their URI immediately before asynchronous Visual edits and history snapshots. This protects against VS Code closing a background `TextDocument` object while TeXFlow still retains project state.
+
+If this message still appears:
+
+1. stop editing the affected block;
+2. reopen/refresh TeXFlow;
+3. note whether the file was an included source, cloud-backed file, or recently closed Source tab;
+4. record whether a Source tab opened unexpectedly;
+5. report the smallest reproducible sequence.
+
+Ordinary Visual autosave may use `openTextDocument()` internally to obtain a live document, but it must not use `showTextDocument()` or open Source as a side effect.
+
 ## “Document changed before the visual edit could be saved”
 
 TeXFlow detected that Source no longer matches the range Visual intended to edit. This guard prevents overwriting unrelated or externally modified LaTeX.
@@ -59,3 +73,7 @@ TeXFlow can insert supported package/setup commands, but the local build toolcha
 ## A package is missing
 
 Install it through the user's LaTeX distribution (TeX Live/MiKTeX). TeXFlow may add `\usepackage` declarations, but it does not install system LaTeX packages.
+
+## Removing an included file did not delete the `.tex` file
+
+This is intentional. The remove control on an included-file card removes only the `\input{...}` or `\include{...}` relationship from the active document. TeXFlow does not delete the referenced file from disk.

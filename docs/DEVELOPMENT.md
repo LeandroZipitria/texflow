@@ -167,6 +167,20 @@ LyX is useful because it has already confronted many structural-editor problems:
 
 When a construct cannot be round-tripped safely, preserve it as Raw/LaTeX preserved. Do not broaden parsing until there is an explicit serialization model and a regression fixture.
 
+## Feature lifecycle parity
+
+Every Visual feature must explicitly declare which lifecycle operations are supported:
+
+- detect/view existing source;
+- create/insert;
+- edit;
+- remove from the document;
+- navigate to Source.
+
+A missing operation may be an intentional safety boundary, but it must not be an accidental omission. Before release, audit new semantic objects for view/create/edit/remove/Source parity. `0.20.1` adopted this rule after identifying cases such as TikZ and included files that could be understood visually before they could be created from Visual.
+
+For source-backed relationships such as `\input` / `\include`, removal means removing the relationship from the active document, not deleting the referenced file unless a separate explicit destructive action is designed and confirmed.
+
 ## New semantic object gate
 
 Every new semantic object should be tested for:
@@ -192,7 +206,7 @@ For multi-file behavior, also verify that edits target the intended active sourc
 
 A new feature is not considered integrated merely because TypeScript compiles.
 
-High-value behavioral coverage in `0.20.0` includes:
+High-value behavioral coverage across `0.20.0`–`0.20.1` includes:
 
 - `align*` → `align` → `align*` numbering behavior;
 - `section` → `section*` → `section` serialization;
@@ -229,6 +243,8 @@ Never overwrite a build that has been given to the tester. Each experiment/fix g
 
 `0.19.0` is the public baseline immediately before the project-aware/structured-editing expansion.
 
-`0.20.0` is the target release after Foundation plus Builds A–D. It should remain reproducible once released and should not be reopened unless a reproducible bug requires it.
+`0.20.0` is the stable Foundation + Builds A–D baseline and must remain reproducible.
+
+`0.20.1` is the focused follow-up release for Visual feature lifecycle parity (included-file creation/removal, Abstract/TOC/metadata creation, insertion points, Beamer caret cleanup) and live `TextDocument` lifecycle hardening. Its validated typing/save contract must not be redesigned as incidental cleanup.
 
 A future `1.0.0` should be an explicit product/release decision, not an automatic consequence of feature count.

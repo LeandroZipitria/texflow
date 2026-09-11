@@ -28,6 +28,8 @@ npm run check
 - Prefer small regression fixtures with clear expected behavior.
 - Preserve the distinction between `masterDocument` and `activeDocument` in multi-file tests.
 - Do not weaken stale-source guards to make a test pass.
+- For Visual semantic features, test the lifecycle explicitly: detect/view, create, edit, remove-from-document, and Source navigation. Missing lifecycle operations should be deliberate, not accidental.
+- Treat ordinary Visual typing/save and live-`TextDocument` resolution as protected contracts; do not add per-keystroke host work, extra save timers, unsolicited Source navigation, or long-lived assumptions that a retained `TextDocument` is still open.
 
 ## Packaging
 

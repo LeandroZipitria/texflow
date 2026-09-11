@@ -8,7 +8,7 @@ TeXFlow is a visual editor for LaTeX and Beamer inside VS Code. It is designed t
 
 TeXFlow follows a conservative rule: structures it understands are shown as semantic visual objects; structures it does not understand are preserved as LaTeX rather than silently rewritten.
 
-> This manual documents TeXFlow `0.20.0`.
+> This manual documents TeXFlow `0.20.1`.
 
 ## 2. Installation and requirements
 
@@ -30,13 +30,15 @@ For a multi-file project TeXFlow distinguishes:
 
 Opening an included source file does not merge it into the master. The active file remains a real independent `.tex` file and accepted Visual edits are written to that file.
 
+Use **Insert → Included file...** to build the relationship from Visual. You can create a new `.tex` file or choose an existing one, then choose `\input` or `\include`. Existing files may live outside the master-project folder when TeXFlow can express the relationship with a valid relative path. Selecting an included-file card exposes a remove control; removing it deletes only the `\input`/`\include` command from the active document and never deletes the physical file.
+
 The **Project Files** section of the sidebar lists real project files. The **Article** or Beamer outline below it represents the internal structure of the active document. These are deliberately separate concepts.
 
 Project file paths are displayed relative to the master-project folder. The sidebar can be resized by dragging its right edge; the width is remembered between sessions. Double-clicking the resize area restores the default width.
 
 ## 4. Saving and source ownership
 
-TeXFlow does not maintain a second document format. Accepted Visual edits are applied to the active `.tex` source and saved through VS Code as part of the editing flow. This means ordinary text, mathematics, notes, and supported object edits persist without requiring a separate manual Save after every change.
+TeXFlow does not maintain a second document format. Accepted Visual edits are applied to the active `.tex` source and saved through VS Code as part of the editing flow. While you type, TeXFlow shows **Editing…**; after a short pause the semantic edit is written and the status returns to **Saved**. This means ordinary text, mathematics, notes, and supported object edits persist without requiring a separate manual Save after every change.
 
 The **File** menu still provides **Save** and **Save as...** for explicit file workflows.
 
@@ -57,7 +59,7 @@ The top-level menus are:
 
 The view switcher provides **Visual**, **Source**, **Split**, and **PDF**. **Compile** is a single global action.
 
-The former separate Layout and Language top-level menus are not used in `0.20.0`: their functions are placed with File, Insert, and Format where they are needed.
+The former separate Layout and Language top-level menus are not used in `0.20.x`: their functions are placed with File, Insert, and Format where they are needed.
 
 ## 6. Text editing
 
@@ -83,9 +85,13 @@ Spell checking runs locally. Mathematics, citations, labels, references, URLs, a
 
 ## 7. Structure and headings
 
-Use **Structure** for title, author, abstract, normal text, chapter/section/subsection commands, lists, and supported containers.
+Use **Structure** for title, author, abstract, table of contents, normal text, chapter/section/subsection commands, lists, and supported containers.
+
+Title, Author, and Abstract are created directly inside the Visual surface rather than through VS Code input boxes. A standard-document Title ensures the corresponding `\maketitle` output command is present. The Abstract is a semantic `abstract` environment and remains editable after creation. **Structure → Table of contents** inserts `\tableofcontents` while preserving TeXFlow's existing visual TOC representation.
 
 Headings are semantic objects. Pressing `Enter` from a heading exits the heading and creates or enters normal body text.
+
+TeXFlow also exposes Visual insertion points before the first structural block and after supported structural objects such as the table of contents and included-file cards, so a document that begins with a section or TOC does not trap the caret on one side of the structure.
 
 Supported headings can be toggled between numbered and unnumbered forms while preserving their structural meaning, for example `\section{...}` ↔ `\section*{...}`.
 
@@ -349,6 +355,8 @@ Use Source when you need to edit that construct directly. After editing, return 
 If a document fails to compile, inspect the LaTeX log first. TeXFlow cannot make an unsupported image format compilable merely because VS Code can preview it. Bibliography, index, nomenclature, and TikZ workflows may require external LaTeX tools/packages installed locally.
 
 If Visual reports that the document changed before an edit could be saved, refresh Visual and identify whether the source changed externally. Do not disable the stale-document guard as a workaround.
+
+TeXFlow `0.20.1` also hardens Visual editing against VS Code closing background `TextDocument` objects. Visual autosave re-resolves the active source by URI without opening a Source editor. A reproducible **Document has been closed** error should therefore be treated as a bug and reported with the smallest project/action sequence.
 
 See `TROUBLESHOOTING.md` for common cases.
 
