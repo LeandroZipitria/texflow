@@ -160,7 +160,7 @@ export function findMatchingEnvEnd(source: string, env: string, from: number): {
 
 export function parseBlocks(body: string): ParsedBlock[] {
   const out: ParsedBlock[] = [];
-  const re = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|comment|tikzpicture)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
+  const re = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|abstract|comment|tikzpicture)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
   let cur = 0;
   let m: RegExpExecArray | null;
   let n = 0;
@@ -375,6 +375,7 @@ export function parseBlocks(body: string): ParsedBlock[] {
     else if (env === 'quote' || env === 'quotation') kind = 'quote';
     else if (env === 'minipage') kind = 'container';
     else if (['theorem', 'lemma', 'proposition', 'corollary', 'definition', 'proof'].includes(env)) kind = 'theorem';
+    else if (env === 'abstract') kind = 'abstract';
     else if (env === 'comment') kind = 'commentblock';
     else if (env === 'tikzpicture') kind = 'tikz';
     else if (['flushleft', 'center', 'flushright'].includes(env)) kind = 'paragraph';

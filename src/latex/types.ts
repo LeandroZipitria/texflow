@@ -18,6 +18,7 @@ export interface ParsedBlock {
     | 'comment'
     | 'commentblock'
     | 'tikz'
+    | 'abstract'
     | 'raw';
   start: number;
   end: number;
