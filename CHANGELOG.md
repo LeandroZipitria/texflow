@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.20.3 — 2026-09-13
+
+### Added
+- Visual editing of multiple Beamer authors and institutions.
+- Direct author-to-institution affiliation assignment from the Visual editor.
+- Support for assigning one or multiple institutions to each author.
+
+### Fixed
+- Rendering and editing of nested Beamer metadata such as `\inst{...}`.
+- Preservation of existing Beamer author and institution affiliations.
+- Automatic institution numbering when affiliations are created visually.
+- Isolation of Beamer affiliation handling from the general Visual renderer.
+
 ## 0.20.2 — 2026-09-13
 
 ### Improved
