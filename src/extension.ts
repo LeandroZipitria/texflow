@@ -1337,6 +1337,28 @@ export function activate(context: vscode.ExtensionContext) {
           documentEditQueue = queued.then(() => undefined, () => undefined);
           await queued;
         }
+        if (msg.type === 'setMetadataValues') {
+          if (!project.isBeamer) return;
+          const requestedValues = msg.values && typeof msg.values === 'object' ? msg.values as Record<string, unknown> : {};
+          const fields: Array<'institute' | 'author'> = ['institute', 'author'];
+          const updates = fields.filter(field => Object.prototype.hasOwnProperty.call(requestedValues, field));
+          if (!updates.length) return;
+          const runMetadataEdits = async () => {
+            postStatus('saving');
+            updatingFromWebview = true;
+            try {
+              const masterDocument = await vscode.workspace.openTextDocument(rootUri);
+              for (const field of updates) await setDocumentCommand(masterDocument, field, String(requestedValues[field] ?? ''));
+              await refreshProject();
+            } finally {
+              updatingFromWebview = false;
+            }
+            postStatus('saved');
+          };
+          const queued = documentEditQueue.then(runMetadataEdits, runMetadataEdits);
+          documentEditQueue = queued.then(() => undefined, () => undefined);
+          await queued;
+        }
         if (msg.type === 'insertAbstract') {
           if (project.isBeamer) return;
           await refreshProject();
@@ -2668,12 +2690,57 @@ function getPresentationStyle(source: string): PresentationStyle {
   return { aspectWidth, aspectHeight, aspectLabel, baseFontPt, bodyFontPx, titleFontPx, lineHeight };
 }
 
+type LatexCommandArgumentMatch = {
+  start: number;
+  end: number;
+  contentStart: number;
+  contentEnd: number;
+  prefix: string;
+  value: string;
+};
+
+function findBalancedLatexClose(source: string, openIndex: number, openChar: string, closeChar: string): number {
+  let depth = 0;
+  for (let i = openIndex; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") { i++; continue; }
+    if (ch === openChar) depth++;
+    else if (ch === closeChar) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function findLatexCommandArgument(source: string, command: string): LatexCommandArgumentMatch | undefined {
+  const re = new RegExp("\\\\" + command + "\\b", "g");
+  for (let commandMatch = re.exec(source); commandMatch; commandMatch = re.exec(source)) {
+    let cursor = commandMatch.index + commandMatch[0].length;
+    while (/\s/.test(source[cursor] ?? "")) cursor++;
+    if (source[cursor] === "[") {
+      const optionalEnd = findBalancedLatexClose(source, cursor, "[", "]");
+      if (optionalEnd < 0) continue;
+      cursor = optionalEnd + 1;
+      while (/\s/.test(source[cursor] ?? "")) cursor++;
+    }
+    if (source[cursor] !== "{") continue;
+    const close = findBalancedLatexClose(source, cursor, "{", "}");
+    if (close < 0) continue;
+    return {
+      start: commandMatch.index,
+      end: close + 1,
+      contentStart: cursor + 1,
+      contentEnd: close,
+      prefix: source.slice(commandMatch.index, cursor + 1),
+      value: source.slice(cursor + 1, close)
+    };
+  }
+  return undefined;
+}
+
 function getCommandValue(source: string, command: string): string {
-  // Beamer metadata commonly uses a short form such as
-  // \title[Short title]{Long title}. Visual displays/edits the long value
-  // while the optional short value stays untouched in Source.
-  const re = new RegExp('\\\\' + command + '(?:\\s*\\[[^\\]]*\\])?\\s*\\{([^}]*)\\}');
-  return re.exec(source)?.[1] ?? '';
+  return findLatexCommandArgument(source, command)?.value ?? "";
 }
 
 
@@ -3129,12 +3196,10 @@ async function setDocumentCommand(
   value: string
 ) {
   const source = document.getText();
-  const re = new RegExp('(\\\\' + command + '(?:\\s*\\[[^\\]]*\\])?\\s*)\\{[^}]*\\}');
-  const match = re.exec(source);
-  const clean = value.replace(/[{}]/g, '');
-  // Preserve an existing Beamer optional short form exactly as written.
-  const replacement = match ? `${match[1]}{${clean}}` : `\\${command}{${clean}}`;
-  if (match) await applyReplacement(document, match.index, match.index + match[0].length, replacement);
+  const match = findLatexCommandArgument(source, command);
+  const clean = String(value ?? "").replace(/\r\n?/g, "\n").trim();
+  const replacement = match ? `${match.prefix}${clean}}` : `\\${command}{${clean}}`;
+  if (match) await applyReplacement(document, match.start, match.end, replacement);
   else {
     const begin = source.indexOf('\\begin{document}');
     const pos = begin >= 0 ? begin : 0;
@@ -3874,10 +3939,10 @@ body.figure-resizing{cursor:nwse-resize!important}body.figure-resizing *{user-se
 .preamble-code{display:block;width:100%;min-height:620px;resize:vertical;border:0;outline:none;padding:18px 20px;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-editor-font-family,monospace);font-size:var(--vscode-editor-font-size,13px);line-height:1.55;tab-size:2}
 .empty{color:var(--muted);padding:54px;text-align:center}
 .title-page{display:flex;flex-direction:column;justify-content:center}
-.title-page .beamer-metadata-edit{outline:none;border-radius:5px;min-height:1.2em;cursor:text}
+.title-page .beamer-metadata-edit{outline:none;border-radius:5px;min-height:1.2em;cursor:text}.title-page .beamer-metadata-and{display:inline-block;margin:0 .45em;opacity:.68;font-style:italic;user-select:none}.title-page .beamer-inst{font-size:.62em;vertical-align:super;opacity:.72;margin-left:.08em}.title-page .beamer-inst.beamer-affiliation-trigger{cursor:pointer;border-radius:3px;padding:0 .08em}.title-page .beamer-inst.beamer-affiliation-trigger:hover,.title-page .beamer-inst.beamer-affiliation-trigger:focus{opacity:1;background:var(--hover);outline:none}.title-page .beamer-affiliation-add{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:.56em;vertical-align:super;line-height:1;padding:.08em .18em;margin-left:.08em;border-radius:3px;cursor:pointer;opacity:.22}.title-page .beamer-author-edit:hover .beamer-affiliation-add,.title-page .beamer-affiliation-add:focus{opacity:.85;background:var(--hover);color:var(--vscode-foreground)}.title-page .beamer-metadata-row{position:relative;display:flex;align-items:center;justify-content:center;gap:.45em;width:100%}.title-page .beamer-metadata-row>.beamer-metadata-edit{min-width:1ch;max-width:92%;white-space:normal;overflow-wrap:anywhere}.title-page .beamer-metadata-add{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:.72em;line-height:1;padding:.28em .36em;border-radius:4px;cursor:pointer;opacity:.32;flex:0 0 auto}.title-page .beamer-metadata-row:hover .beamer-metadata-add,.title-page .beamer-metadata-add:focus{opacity:.9;background:var(--hover);color:var(--vscode-foreground)}.title-page .beamer-affiliation-popover{position:absolute;top:calc(100% + 8px);z-index:120;min-width:220px;max-width:min(360px,90vw);padding:8px;background:var(--vscode-editorWidget-background);color:var(--vscode-editorWidget-foreground,var(--vscode-foreground));border:1px solid var(--vscode-editorWidget-border,var(--line-strong));border-radius:7px;box-shadow:0 10px 28px rgba(0,0,0,.28);text-align:left;font-size:12px}.title-page .beamer-affiliation-head{display:flex;align-items:center;gap:8px;padding:2px 2px 7px;font-weight:600}.title-page .beamer-affiliation-head span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.title-page .beamer-affiliation-close{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;cursor:pointer;border-radius:4px;padding:1px 5px}.title-page .beamer-affiliation-close:hover{background:var(--hover);color:var(--vscode-foreground)}.title-page .beamer-affiliation-option{display:flex;align-items:flex-start;gap:7px;padding:6px;border-radius:5px;cursor:pointer}.title-page .beamer-affiliation-option:hover{background:var(--hover)}.title-page .beamer-affiliation-option input{margin-top:2px}.title-page .beamer-affiliation-code{display:inline-block;min-width:1.5em;font-weight:650}.title-page .beamer-affiliation-empty{padding:6px;color:var(--muted)}
 .title-page .beamer-subtitle-edit{font-size:1.25em;margin:.5em 0 1.6em}
-.title-page .beamer-author-edit{font-size:1.08em;margin-top:2.5em}
-.title-page .beamer-institute-edit{margin-top:.75em;color:var(--muted)}
+.title-page .beamer-author-row{margin-top:2.5em}.title-page .beamer-author-edit{font-size:1.08em;margin-top:0;text-align:center}.title-page .beamer-author-edit .beamer-metadata-and{display:inline-block;margin:0 .5em}
+.title-page .beamer-institute-row{margin-top:.75em;align-items:flex-start}.title-page .beamer-institute-edit{margin-top:0;color:var(--muted);text-align:center;line-height:1.42}.title-page .beamer-institute-edit .beamer-metadata-and{display:block;height:.18em;margin:.22em 0;font-size:0;line-height:0;opacity:0}
 .title-page .beamer-date-edit{margin-top:2em}
 body{display:flex;flex-direction:column}
 .topbar{height:48px;flex:0 0 48px;display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--panel);border-bottom:1px solid var(--line-strong);z-index:60}
@@ -4383,6 +4448,64 @@ function latexToHtml(text){
  x=x.replace(/@@TEXFLOW_PRINT_BIB@@/g,'<span class="bib-print-placeholder" contenteditable="false">References — rendered from the loaded .bib file. See PDF for final bibliography formatting.</span>');
  return x;
 }
+function splitBeamerMetadataSegments(text){
+ const source=String(text??''),parts=[];let start=0,depth=0;
+ for(let i=0;i<source.length;i++){
+  const ch=source[i];
+  if(ch==='\\'){
+   if(depth===0&&source.slice(i,i+4)==='\\and'&&!/[A-Za-z@]/.test(source[i+4]||'')){
+    parts.push(source.slice(start,i).trim());i+=3;start=i+1;continue;
+   }
+   i++;continue;
+  }
+  if(ch==='{')depth++;else if(ch==='}')depth=Math.max(0,depth-1);
+ }
+ parts.push(source.slice(start).trim());
+ return parts.filter((part,index,array)=>part||array.length===1||index<array.length-1);
+}
+function beamerMetadataChunkToHtml(text,authorIndex=-1){
+ const source=String(text??'');let html='',last=0,m;const re=/\\inst\{([^{}]*)\}/g;
+ while((m=re.exec(source))){
+  html+=latexToHtml(source.slice(last,m.index));
+  const authorAttr=authorIndex>=0?' data-author-index="'+authorIndex+'" tabindex="0" role="button" title="Change institution"':'';
+  html+='<sup class="beamer-inst'+(authorIndex>=0?' beamer-affiliation-trigger':'')+'" contenteditable="false" data-inst="'+esc(m[1]||'')+'"'+authorAttr+'>'+esc(m[1]||'')+'</sup><span class="math-caret-anchor">&#8203;</span>';
+  last=re.lastIndex;
+ }
+ return html+latexToHtml(source.slice(last));
+}
+function beamerMetadataToHtml(text,field=''){
+ const parts=splitBeamerMetadataSegments(text),label=field==='institute'?'':'and';
+ return parts.map((part,index)=>{
+  let html=beamerMetadataChunkToHtml(part,field==='author'?index:-1);
+  if(field==='author'&&!/\\inst\{[^{}]*\}/.test(part))html+='<button type="button" class="beamer-affiliation-add" data-author-index="'+index+'" data-texflow-ui="true" contenteditable="false" title="Assign institution" aria-label="Assign institution">+</button>';
+  return html;
+ }).join('<span class="beamer-metadata-and" contenteditable="false" data-texflow-beamer-and="true">'+label+'</span>');
+}
+function beamerInstitutionEntries(text){
+ const parts=splitBeamerMetadataSegments(text),explicit=new Set();
+ parts.forEach(part=>{const m=/\\inst\{([^{}]*)\}/.exec(part);if(m)String(m[1]||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(x=>explicit.add(x));});
+ let next=1;const used=new Set(explicit);
+ return parts.filter(part=>part.trim()).map(raw=>{
+  const m=/\\inst\{([^{}]*)\}/.exec(raw);let id=m?String(m[1]||'').split(',').map(x=>x.trim()).find(Boolean)||'':'';
+  if(!id){while(used.has(String(next)))next++;id=String(next++);used.add(id);}
+  const label=raw.replace(/\\inst\{[^{}]*\}/g,'').replace(/\\[A-Za-z@]+\*?(?:\[[^\]]*\])?/g,'').replace(/[{}]/g,'').replace(/\s+/g,' ').trim()||('Institution '+id);
+  return{id,label,raw,explicit:!!m};
+ });
+}
+function beamerAuthorInstitutionIds(text,authorIndex){
+ const parts=splitBeamerMetadataSegments(text),part=parts[authorIndex]||'',ids=[];let m;const re=/\\inst\{([^{}]*)\}/g;
+ while((m=re.exec(part)))String(m[1]||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(id=>{if(!ids.includes(id))ids.push(id);});
+ return ids;
+}
+function withBeamerAuthorInstitutions(text,authorIndex,ids){
+ const parts=splitBeamerMetadataSegments(text);if(authorIndex<0||authorIndex>=parts.length)return String(text??'');
+ const base=parts[authorIndex].replace(/\s*\\inst\{[^{}]*\}/g,'').trim();
+ parts[authorIndex]=base+(ids&&ids.length?'\\inst{'+ids.join(',')+'}':'');
+ return parts.join(' \\and ');
+}
+function normalizedBeamerInstitutionValue(entries){
+ return (entries||[]).map(entry=>entry.explicit?entry.raw:('\\inst{'+entry.id+'} '+entry.raw).trim()).join(' \\and ');
+}
 function renderInlineMaths(root){
  if(!root)return;
  root.querySelectorAll('.inline-color').forEach(node=>{const color=String(node.dataset.texColor||'');if(/^[A-Za-z][A-Za-z0-9_-]*$/.test(color))node.style.color=color;});
@@ -4414,6 +4537,8 @@ function nodeToLatex(node){
  if(el.classList&&el.classList.contains('tex-link')){const kind=el.dataset.linkKind||'url',url=decodeURIComponent(el.dataset.linkUrl||''),label=decodeURIComponent(el.dataset.linkLabel||'');return kind==='href'?'\\href{'+url+'}{'+label+'}':'\\url{'+url+'}';}
  if(el.classList&&el.classList.contains('tex-index'))return '\\index{'+decodeURIComponent(el.dataset.index||'')+'}';
  if(el.classList&&el.classList.contains('tex-nomenclature'))return '\\nomenclature{'+decodeURIComponent(el.dataset.symbol||'')+'}{'+decodeURIComponent(el.dataset.description||'')+'}';
+ if(el.classList&&el.classList.contains('beamer-metadata-and'))return ' \\and ';
+ if(el.classList&&el.classList.contains('beamer-inst'))return '\\inst{'+(el.dataset.inst||'')+'}';
  if(el.classList&&el.classList.contains('tex-field'))return '\\'+(el.dataset.field||'today');
  if(el.classList&&el.classList.contains('bib-print-placeholder'))return '\\printbibliography';
  if(el.classList&&el.classList.contains('math-caret-anchor'))return '';
@@ -4434,6 +4559,7 @@ function normalizeEditorLatex(value){
 function editorToLatex(el){return normalizeEditorLatex([...el.childNodes].map(nodeToLatex).join(''));}
 function placeCaretEnd(el){const r=document.createRange();r.selectNodeContents(el);r.collapse(false);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
 function placeCaretStart(el){const r=document.createRange();r.selectNodeContents(el);r.collapse(true);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
+function selectTrailingText(el,text){const target=String(text||'');if(!el||!target){placeCaretEnd(el);return;}const walker=document.createTreeWalker(el,4);let node,last=null;while((node=walker.nextNode()))if(String(node.nodeValue||'').endsWith(target))last=node;if(!last){placeCaretEnd(el);return;}const end=String(last.nodeValue||'').length,start=Math.max(0,end-target.length),r=document.createRange(),sel=getSelection();r.setStart(last,start);r.setEnd(last,end);sel.removeAllRanges();sel.addRange(r);}
 function insertSemanticParagraphBreak(edit){
  const sel=getSelection();if(!sel||!sel.rangeCount||!edit.contains(sel.anchorNode))return false;
  const range=sel.getRangeAt(0);range.deleteContents();
@@ -5444,15 +5570,52 @@ function serializeRichDocumentBlock(node,text){
 function bindDocumentRichBlock(el,node){const edit=el.querySelector('.doc-rich-edit');let saveEdit=null;if(edit){attachEditor(edit);const save=refresh=>updateDocumentNode(node,serializeRichDocumentBlock(node,editableLatex(edit)),refresh);saveEdit=save;edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}if(node&&node.block&&(node.block.kind==='comment'||node.block.kind==='commentblock')){const key=reviewDocumentKey(node);if(node.block.kind==='commentblock'){const toggle=el.querySelector('.review-edit-source');if(toggle&&edit)toggle.onclick=e=>{e.preventDefault();e.stopPropagation();const editing=el.classList.contains('review-editing');if(editing){if(saveEdit)flushSave(edit,saveEdit);el.classList.remove('review-editing');toggle.textContent='Edit source';toggle.title='Edit the preserved LaTeX inside this commented-out block';}else{reviewCollapsedItems.delete(key);el.classList.remove('review-collapsed');const collapse=el.querySelector('.review-card-collapse');if(collapse){collapse.textContent='−';collapse.title='Collapse';}el.classList.add('review-editing');toggle.textContent='Done';toggle.title='Return to visual preview';edit.focus();}};}bindReviewCardControls(el,key,()=>vscode.postMessage({type:'deleteReviewDocumentNode',start:Number(node.start),end:Number(node.end),expected:String(node.raw||'')}));return;}bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));}
 
 function headingLatex(command,starred,title){return '\\'+String(command||'section')+(starred?'*':'')+'{'+String(title||'')+'}';}
+function findBeamerMetadataCommandArgument(source,field){
+ const re=new RegExp('\\\\'+field+'\\b','g');let commandMatch;
+ while((commandMatch=re.exec(source))){
+  let cursor=commandMatch.index+commandMatch[0].length;
+  while(/\s/.test(source[cursor]||''))cursor++;
+  if(source[cursor]==='['){
+   let depth=0,close=-1;
+   for(let i=cursor;i<source.length;i++){
+    const ch=source[i];
+    if(ch==='\\'){i++;continue;}
+    if(ch==='[')depth++;
+    else if(ch===']'){depth--;if(depth===0){close=i;break;}}
+   }
+   if(close<0)continue;
+   cursor=close+1;
+   while(/\s/.test(source[cursor]||''))cursor++;
+  }
+  if(source[cursor]!=='{')continue;
+  let depth=0,close=-1;
+  for(let i=cursor;i<source.length;i++){
+   const ch=source[i];
+   if(ch==='\\'){i++;continue;}
+   if(ch==='{')depth++;
+   else if(ch==='}'){depth--;if(depth===0){close=i;break;}}
+  }
+  if(close<0)continue;
+  return{start:commandMatch.index,end:close+1,prefix:source.slice(commandMatch.index,cursor+1)};
+ }
+ return null;
+}
 function mirrorMetadataSource(field,value){
-  const clean=String(value||'').replace(/[{}]/g,'');
+  const isBeamerMetadata=!!isBeamer&&['title','subtitle','author','institute','date'].includes(String(field||''));
+  const clean=isBeamerMetadata?String(value||'').replace(/\r\n?/g,'\n').trim():String(value||'').replace(/[{}]/g,'');
   const masterSource=sources.find(x=>String(x.uri||'')===String(masterUri));
   let source=masterSource?String(masterSource.text||''):(activeUri===masterUri?String(documentSource||''):'');
   if(!source)return;
-  const re=new RegExp('(\\\\'+field+'(?:\\s*\\[[^\\]]*\\])?\\s*)\\{[^}]*\\}'),match=re.exec(source);
   let start,end,replacement;
-  if(match){start=match.index;end=start+match[0].length;replacement=match[1]+'{'+clean+'}';}
-  else{const begin=source.indexOf('\\begin{document}');start=end=begin>=0?begin:0;replacement='\\'+field+'{'+clean+'}\n';}
+  if(isBeamerMetadata){
+   const match=findBeamerMetadataCommandArgument(source,field);
+   if(match){start=match.start;end=match.end;replacement=match.prefix+clean+'}';}
+   else{const begin=source.indexOf('\\begin{document}');start=end=begin>=0?begin:0;replacement='\\'+field+'{'+clean+'}\n';}
+  }else{
+   const re=new RegExp('(\\\\'+field+'(?:\\s*\\[[^\\]]*\\])?\\s*)\\{[^}]*\\}'),match=re.exec(source);
+   if(match){start=match.index;end=start+match[0].length;replacement=match[1]+'{'+clean+'}';}
+   else{const begin=source.indexOf('\\begin{document}');start=end=begin>=0?begin:0;replacement='\\'+field+'{'+clean+'}\n';}
+  }
   const delta=replacement.length-(end-start),next=source.slice(0,start)+replacement+source.slice(end);
   if(masterSource)masterSource.text=next;if(activeUri===masterUri)documentSource=next;if(metadata)metadata[field]=clean;
   if(delta){
@@ -5461,6 +5624,44 @@ function mirrorMetadataSource(field,value){
    (projectIncludes||[]).forEach(ref=>{if(String(ref.sourceUri||'')!==String(masterUri))return;if(Number(ref.start)>=end){ref.start+=delta;ref.end+=delta;}else if(Number(ref.end)>=end)ref.end+=delta;});
   }
  }
+
+function commitBeamerMetadataValues(values,host){
+ const clean={};['institute','author'].forEach(field=>{if(Object.prototype.hasOwnProperty.call(values||{},field))clean[field]=String(values[field]??'').trim();});
+ if(!Object.keys(clean).length)return;
+ ['institute','author'].forEach(field=>{if(!Object.prototype.hasOwnProperty.call(clean,field))return;metadata[field]=clean[field];mirrorMetadataSource(field,clean[field]);});
+ vscode.postMessage({type:'setMetadataValues',values:clean});
+ if(host){
+  const authorEdit=host.querySelector('.beamer-author-edit'),instituteEdit=host.querySelector('.beamer-institute-edit');
+  if(authorEdit&&Object.prototype.hasOwnProperty.call(clean,'author')){authorEdit.innerHTML=beamerMetadataToHtml(clean.author,'author');renderInlineMaths(authorEdit);if(authorEdit.__texflowSetLastSent)authorEdit.__texflowSetLastSent(clean.author);}
+  if(instituteEdit&&Object.prototype.hasOwnProperty.call(clean,'institute')){instituteEdit.innerHTML=beamerMetadataToHtml(clean.institute,'institute');renderInlineMaths(instituteEdit);if(instituteEdit.__texflowSetLastSent)instituteEdit.__texflowSetLastSent(clean.institute);}
+  bindBeamerAffiliationControls(host);const slide=host.querySelector('.slide');if(slide)scheduleSlideFit(slide);
+ }
+}
+function beamerAuthorDisplayLabel(text,authorIndex){
+ const part=splitBeamerMetadataSegments(text)[authorIndex]||'';
+ return part.replace(/\\inst\{[^{}]*\}/g,'').replace(/\\[A-Za-z@]+\*?(?:\[[^\]]*\])?/g,'').replace(/[{}]/g,'').replace(/\s+/g,' ').trim()||('Author '+(authorIndex+1));
+}
+function closeBeamerAffiliationPopover(host){const pop=host&&host.querySelector?host.querySelector('.beamer-affiliation-popover'):null;if(pop)pop.remove();}
+function openBeamerAffiliationPopover(host,authorIndex,anchor){
+ const row=host&&host.querySelector?host.querySelector('.beamer-author-row'):null;if(!row)return;closeBeamerAffiliationPopover(host);
+ const entries=beamerInstitutionEntries(metadata.institute||''),selected=new Set(beamerAuthorInstitutionIds(metadata.author||'',authorIndex)),name=beamerAuthorDisplayLabel(metadata.author||'',authorIndex);
+ const pop=document.createElement('div');pop.className='beamer-affiliation-popover';pop.dataset.texflowUi='true';pop.contentEditable='false';
+ pop.innerHTML='<div class="beamer-affiliation-head"><span>Institution · '+esc(name)+'</span><button type="button" class="beamer-affiliation-close" data-texflow-ui="true" aria-label="Close">×</button></div>'+(entries.length?entries.map(entry=>'<label class="beamer-affiliation-option"><input type="checkbox" value="'+esc(entry.id)+'" '+(selected.has(entry.id)?'checked':'')+'><span><span class="beamer-affiliation-code">'+esc(entry.id)+'</span>'+esc(entry.label)+'</span></label>').join(''):'<div class="beamer-affiliation-empty">Add an institution first.</div>');
+ row.appendChild(pop);const rr=row.getBoundingClientRect(),ar=anchor.getBoundingClientRect(),width=pop.offsetWidth||240;pop.style.left=Math.max(6,Math.min(Math.max(6,row.clientWidth-width-6),ar.left-rr.left+ar.width/2-width/2))+'px';
+ const close=pop.querySelector('.beamer-affiliation-close');if(close)close.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();closeBeamerAffiliationPopover(host);});
+ pop.querySelectorAll('input[type=checkbox]').forEach(input=>input.addEventListener('change',()=>{
+  const ids=[...pop.querySelectorAll('input[type=checkbox]:checked')].map(x=>String(x.value||'')).filter(Boolean),newAuthor=withBeamerAuthorInstitutions(metadata.author||'',authorIndex,ids),newInstitute=normalizedBeamerInstitutionValue(entries),values={author:newAuthor};
+  if(newInstitute!==String(metadata.institute||''))values.institute=newInstitute;commitBeamerMetadataValues(values,host);
+ }));
+}
+function bindBeamerAffiliationControls(host){
+ if(!host||!host.querySelectorAll)return;const authorEdit=host.querySelector('.beamer-author-edit');
+ host.querySelectorAll('.beamer-affiliation-trigger[data-author-index],.beamer-affiliation-add[data-author-index]').forEach(control=>{
+  if(control.dataset.texflowAffiliationBound==='true')return;control.dataset.texflowAffiliationBound='true';
+  const open=e=>{e.preventDefault();e.stopPropagation();if(authorEdit&&authorEdit.__texflowSaveNow)authorEdit.__texflowSaveNow();openBeamerAffiliationPopover(host,Number(control.dataset.authorIndex||0),control);};
+  control.addEventListener('click',open);control.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){open(e);}});
+ });
+}
 
 function bindVisualDocument(host){
  bindVisualNavigationSpine(host);
@@ -5556,8 +5757,8 @@ function revealVisualSourceLocation(uri,offset,end=offset){uri=String(uri||activ
 function switchViewMode(target){target=String(target||'visual');if(target===viewMode)return;if(target==='source'||target==='split'){if(viewMode==='visual'&&sourceFocus.target!=='source'){const loc=currentVisualSourceLocation();if(loc)sourceFocus={...loc,target:'source'};}viewMode=target;renderWorkspace();return;}if(target==='visual'){const loc=currentSourceCaretLocation();if(loc&&loc.dirty&&!confirm('Source has unsaved changes. Switch to Visual without saving them?'))return;if(loc){sourceFocus={uri:loc.uri,offset:loc.offset,end:loc.end,target:'visual'};revealVisualSourceLocation(loc.uri,loc.offset,loc.end);}else{viewMode='visual';renderWorkspace();}return;}viewMode=target;renderWorkspace();}
 function sourceEditorHtml(compact=false){const src=currentSource();if(!src)return'<div class="empty">No LaTeX source loaded.</div>';const options=sources.map(x=>'<option value="'+esc(x.uri)+'"'+(x.uri===src.uri?' selected':'')+'>'+esc(x.label)+'</option>').join('');return'<section class="source-shell"><div class="source-head"><select class="source-select">'+options+'</select><span class="source-location">Ln 1, Col 1</span><button class="source-visual-here secondary" type="button">Visual here</button><button class="source-open-vscode secondary" type="button">Open in VS Code</button><button class="source-save">Save source</button></div><textarea class="source-code" spellcheck="false"></textarea></section>';}
 function bindSourceEditor(host){const src=currentSource();if(!src)return;const ta=host.querySelector('.source-code');if(!ta)return;ta.value=src.text;ta.dataset.dirty='0';const shell=ta.closest('.source-shell')||host,select=host.querySelector('.source-select'),save=host.querySelector('.source-save'),visual=host.querySelector('.source-visual-here'),open=host.querySelector('.source-open-vscode');const update=()=>updateSourceLocationLabel(ta,shell);['click','keyup','select'].forEach(type=>ta.addEventListener(type,update));ta.addEventListener('input',()=>{ta.dataset.dirty='1';update();});if(select)select.onchange=e=>{const target=sources.find(x=>x.uri===e.target.value);if(target){sourceFocus={uri:String(target.uri),offset:0,end:0,target:'source'};vscode.postMessage({type:'navigateProjectLocation',uri:target.uri,start:0,end:0,preferVisual:true});}};if(save)save.onclick=()=>{vscode.postMessage({type:'saveSource',uri:src.uri,text:ta.value});ta.dataset.dirty='0';};if(visual)visual.onclick=()=>{if(ta.dataset.dirty==='1'){vscode.postMessage({type:'showWarning',message:'Save Source before returning to Visual so TeXFlow can map the current position safely.'});return;}sourceFocus={uri:String(src.uri),offset:Number(ta.selectionStart||0),end:Number(ta.selectionEnd||ta.selectionStart||0),target:'visual'};revealVisualSourceLocation(src.uri,ta.selectionStart,ta.selectionEnd);};if(open)open.onclick=()=>vscode.postMessage({type:'openSourceRange',uri:src.uri,start:Number(ta.selectionStart||0),end:Number(ta.selectionEnd||ta.selectionStart||0)});if(sourceFocus.target==='source'&&String(sourceFocus.uri||'')===String(src.uri)){requestAnimationFrame(()=>{focusSourceTextarea(host,src.uri,sourceFocus.offset,sourceFocus.end);sourceFocus.target='';});}else update();}
-function visualFrameHtml(f){if(!f)return'<div class="empty">No Beamer frames found.</div>';const v=frameVerticalClass(f),z=frameTextSizeClass(f);if(f.disabled)return'<article class="slide frame-disabled'+v+z+'"><div class="frame-disabled-banner"><span>Disabled frame · excluded from PDF</span><span><button type="button" class="frame-disabled-source">Source</button> <button type="button" class="frame-disabled-restore">Restore frame</button></span></div><div class="title">'+esc(f.title||'Untitled frame')+'</div><div class="disabled-frame-body">'+latexToHtml(f.body||'')+'</div></article>';if(/\\(?:titlepage|maketitle)\b/.test(f.body))return'<article class="slide title-page align-center'+v+z+'"><div class="blocks-host"><div class="title align-center doc-metadata-edit beamer-metadata-edit beamer-title-edit" data-field="title" data-placeholder="Title" contenteditable="true">'+latexToHtml(metadata.title||'')+'</div><div class="doc-metadata-edit beamer-metadata-edit beamer-subtitle-edit" data-field="subtitle" data-placeholder="Subtitle" contenteditable="true">'+latexToHtml(metadata.subtitle||'')+'</div><div class="doc-metadata-edit beamer-metadata-edit beamer-author-edit" data-field="author" data-placeholder="Author" contenteditable="true">'+latexToHtml(metadata.author||'')+'</div><div class="doc-metadata-edit beamer-metadata-edit beamer-institute-edit" data-field="institute" data-placeholder="Institution" contenteditable="true">'+latexToHtml(metadata.institute||'')+'</div><div class="doc-metadata-edit beamer-metadata-edit beamer-date-edit" data-field="date" data-placeholder="Date" contenteditable="true">'+latexToHtml(metadata.date||'')+'</div></div></article>';return'<article class="slide'+v+z+'"><div class="title" contenteditable="true">'+esc(f.title)+'</div><div class="blocks-host"></div></article>';}
-function bindVisualFrame(host,i){const f=frames[i];if(!f)return;if(f.disabled){const restore=host.querySelector('.frame-disabled-restore'),source=host.querySelector('.frame-disabled-source');if(restore)restore.onclick=()=>vscode.postMessage({type:'toggleFrameDisabled',frameIndex:i});if(source)source.onclick=()=>vscode.postMessage({type:'openSourceRange',uri:f.sourceUri||activeUri,start:Number(f.start||0),end:Number(f.end||f.start||0)});return;}if(/\\(?:titlepage|maketitle)\b/.test(f.body)){bindVisualNavigationSpine(host);const fields=[...host.querySelectorAll('.beamer-metadata-edit[contenteditable=true]')];fields.forEach((el,index)=>{attachEditor(el);const field=String(el.dataset.field||'title');let lastSent=editableLatex(el);const save=()=>{const value=editableLatex(el);if(value===lastSent)return;lastSent=value;mirrorMetadataSource(field,value);vscode.postMessage({type:'setMetadataValue',field,value});const slide=host.querySelector('.slide');if(slide)scheduleSlideFit(slide);};el.addEventListener('input',()=>scheduleSave(el,save));el.addEventListener('blur',()=>flushSave(el,save));el.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();flushSave(el,save);const next=fields[index+1];if(next){next.focus();placeCaretEnd(next);}}});});const slide=host.querySelector('.slide');if(slide)scheduleSlideFit(slide);return;}bindVisualNavigationSpine(host);const title=host.querySelector('.title');attachEditor(title);const saveTitle=refresh=>vscode.postMessage({type:'updateFrameTitle',frameIndex:i,title:editorToLatex(title),refresh});title.addEventListener('input',()=>scheduleSave(title,saveTitle));title.addEventListener('blur',()=>flushSave(title,saveTitle));const blockHost=host.querySelector('.blocks-host');const parsed=parseBlocks(f.body);parsed.forEach(b=>blockHost.appendChild(renderBlock(b,i)));bindTikzCards(blockHost);if(!parsed.length){const empty=document.createElement('div');empty.className='block paragraph empty-frame-body';empty.contentEditable='true';empty.dataset.placeholder='Start typing slide content…';attachEditor(empty);const saveEmpty=refresh=>vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text:editorToLatex(empty),refresh});empty.__texflowCommit=(text,feature='')=>{setEditableLatex(empty,text);vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text,refresh:true,feature});};empty.__texflowCommentOutSupported=true;empty.__texflowSaveNow=()=>saveEmpty(false);bindBeamerProseEnter(empty,i);empty.addEventListener('input',()=>scheduleSave(empty,saveEmpty));empty.addEventListener('blur',()=>flushSave(empty,saveEmpty));blockHost.appendChild(empty);}else{const trailing=document.createElement('div');trailing.className='trailing-paragraph editable';trailing.contentEditable='true';trailing.dataset.placeholder='Continue typing…';attachEditor(trailing);let saved='';const saveTrailing=refresh=>{const text=editableLatex(trailing);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh});saved=text;};trailing.__texflowCommit=(text,feature='')=>{setEditableLatex(trailing,text);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh:true,feature});saved=text;};trailing.__texflowCommentOutSupported=true;trailing.__texflowSaveNow=()=>saveTrailing(false);bindBeamerProseEnter(trailing,i);trailing.addEventListener('input',()=>scheduleSave(trailing,saveTrailing));trailing.addEventListener('blur',()=>flushSave(trailing,saveTrailing));blockHost.appendChild(trailing);}title.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();flushSave(title,saveTitle);moveVisualEditableCaret(title,1);}});const slide=host.querySelector('.slide');if(slide){scheduleSlideFit(slide);slide.addEventListener('input',()=>scheduleSlideFit(slide));}}
+function visualFrameHtml(f){if(!f)return'<div class="empty">No Beamer frames found.</div>';const v=frameVerticalClass(f),z=frameTextSizeClass(f);if(f.disabled)return'<article class="slide frame-disabled'+v+z+'"><div class="frame-disabled-banner"><span>Disabled frame · excluded from PDF</span><span><button type="button" class="frame-disabled-source">Source</button> <button type="button" class="frame-disabled-restore">Restore frame</button></span></div><div class="title">'+esc(f.title||'Untitled frame')+'</div><div class="disabled-frame-body">'+latexToHtml(f.body||'')+'</div></article>';if(/\\(?:titlepage|maketitle)\b/.test(f.body))return'<article class="slide title-page align-center'+v+z+'"><div class="blocks-host"><div class="title align-center doc-metadata-edit beamer-metadata-edit beamer-title-edit" data-field="title" data-placeholder="Title" contenteditable="true">'+latexToHtml(metadata.title||'')+'</div><div class="doc-metadata-edit beamer-metadata-edit beamer-subtitle-edit" data-field="subtitle" data-placeholder="Subtitle" contenteditable="true">'+latexToHtml(metadata.subtitle||'')+'</div><div class="beamer-metadata-row beamer-author-row"><div class="doc-metadata-edit beamer-metadata-edit beamer-author-edit" data-field="author" data-placeholder="Author" contenteditable="true">'+beamerMetadataToHtml(metadata.author||'','author')+'</div><button type="button" class="beamer-metadata-add" data-field="author" data-texflow-ui="true" title="Add another author">+ Author</button></div><div class="beamer-metadata-row beamer-institute-row"><div class="doc-metadata-edit beamer-metadata-edit beamer-institute-edit" data-field="institute" data-placeholder="Institution" contenteditable="true">'+beamerMetadataToHtml(metadata.institute||'','institute')+'</div><button type="button" class="beamer-metadata-add" data-field="institute" data-texflow-ui="true" title="Add another institution">+ Institution</button></div><div class="doc-metadata-edit beamer-metadata-edit beamer-date-edit" data-field="date" data-placeholder="Date" contenteditable="true">'+latexToHtml(metadata.date||'')+'</div></div></article>';return'<article class="slide'+v+z+'"><div class="title" contenteditable="true">'+esc(f.title)+'</div><div class="blocks-host"></div></article>';}
+function bindVisualFrame(host,i){const f=frames[i];if(!f)return;if(f.disabled){const restore=host.querySelector('.frame-disabled-restore'),source=host.querySelector('.frame-disabled-source');if(restore)restore.onclick=()=>vscode.postMessage({type:'toggleFrameDisabled',frameIndex:i});if(source)source.onclick=()=>vscode.postMessage({type:'openSourceRange',uri:f.sourceUri||activeUri,start:Number(f.start||0),end:Number(f.end||f.start||0)});return;}if(/\\(?:titlepage|maketitle)\b/.test(f.body)){bindVisualNavigationSpine(host);const fields=[...host.querySelectorAll('.beamer-metadata-edit[contenteditable=true]')];fields.forEach((el,index)=>{attachEditor(el);const field=String(el.dataset.field||'title');let lastSent=editableLatex(el);const save=()=>{const value=editableLatex(el);if(value===lastSent)return;lastSent=value;metadata[field]=value;mirrorMetadataSource(field,value);vscode.postMessage({type:'setMetadataValue',field,value});const slide=host.querySelector('.slide');if(slide)scheduleSlideFit(slide);};el.__texflowSaveNow=save;el.__texflowSetLastSent=value=>{lastSent=String(value??'');};el.addEventListener('input',()=>scheduleSave(el,save));el.addEventListener('blur',()=>flushSave(el,save));el.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();flushSave(el,save);const next=fields[index+1];if(next){next.focus();placeCaretEnd(next);}}});const add=host.querySelector('.beamer-metadata-add[data-field="'+field+'"]');if(add)add.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();flushSave(el,save);const current=editableLatex(el).trim(),placeholder=field==='author'?'Author':'Institution',value=current?current+' \\and '+placeholder:placeholder;el.innerHTML=beamerMetadataToHtml(value,field);renderInlineMaths(el);lastSent=value;if(field==='author')bindBeamerAffiliationControls(host);el.focus();selectTrailingText(el,placeholder);const slide=host.querySelector('.slide');if(slide)scheduleSlideFit(slide);});});bindBeamerAffiliationControls(host);const slide=host.querySelector('.slide');if(slide)scheduleSlideFit(slide);return;}bindVisualNavigationSpine(host);const title=host.querySelector('.title');attachEditor(title);const saveTitle=refresh=>vscode.postMessage({type:'updateFrameTitle',frameIndex:i,title:editorToLatex(title),refresh});title.addEventListener('input',()=>scheduleSave(title,saveTitle));title.addEventListener('blur',()=>flushSave(title,saveTitle));const blockHost=host.querySelector('.blocks-host');const parsed=parseBlocks(f.body);parsed.forEach(b=>blockHost.appendChild(renderBlock(b,i)));bindTikzCards(blockHost);if(!parsed.length){const empty=document.createElement('div');empty.className='block paragraph empty-frame-body';empty.contentEditable='true';empty.dataset.placeholder='Start typing slide content…';attachEditor(empty);const saveEmpty=refresh=>vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text:editorToLatex(empty),refresh});empty.__texflowCommit=(text,feature='')=>{setEditableLatex(empty,text);vscode.postMessage({type:'updateEmptyFrameBody',frameIndex:i,text,refresh:true,feature});};empty.__texflowCommentOutSupported=true;empty.__texflowSaveNow=()=>saveEmpty(false);bindBeamerProseEnter(empty,i);empty.addEventListener('input',()=>scheduleSave(empty,saveEmpty));empty.addEventListener('blur',()=>flushSave(empty,saveEmpty));blockHost.appendChild(empty);}else{const trailing=document.createElement('div');trailing.className='trailing-paragraph editable';trailing.contentEditable='true';trailing.dataset.placeholder='Continue typing…';attachEditor(trailing);let saved='';const saveTrailing=refresh=>{const text=editableLatex(trailing);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh});saved=text;};trailing.__texflowCommit=(text,feature='')=>{setEditableLatex(trailing,text);vscode.postMessage({type:'updateTrailingParagraph',frameIndex:i,previous:saved,text,refresh:true,feature});saved=text;};trailing.__texflowCommentOutSupported=true;trailing.__texflowSaveNow=()=>saveTrailing(false);bindBeamerProseEnter(trailing,i);trailing.addEventListener('input',()=>scheduleSave(trailing,saveTrailing));trailing.addEventListener('blur',()=>flushSave(trailing,saveTrailing));blockHost.appendChild(trailing);}title.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();flushSave(title,saveTitle);moveVisualEditableCaret(title,1);}});const slide=host.querySelector('.slide');if(slide){scheduleSlideFit(slide);slide.addEventListener('input',()=>scheduleSlideFit(slide));}}
 function renderWorkspace(){mode='frames';current=Math.max(0,Math.min(current,frames.length-1));renderNav();updateFrameTextSizeMenu();updateBeamerFrameActions();document.querySelectorAll('.mode-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===viewMode));const c=document.getElementById('content');c.className='workspace';if(viewMode==='source'){c.innerHTML=sourceEditorHtml();bindSourceEditor(c);return;}if(viewMode==='pdf'){const hasPdf=!!pdfUri;const status=pdfBuildState==='building'?'Compiling…':pdfBuildState==='error'?pdfBuildMessage:(hasPdf?(pdfBuildMessage||'PDF ready.'):'No compiled PDF found.');c.innerHTML='<section class="pdf-shell"><div class="pdf-head"><span>Compiled PDF</span><button class="top-action" id="pdf-refresh">Refresh</button>'+(hasPdf?'<button class="top-action" id="pdf-open">Open PDF</button>':'')+'<button class="top-action primary" id="pdf-compile">Compile</button></div><div class="pdf-empty"><div><div style="font-size:28px;margin-bottom:12px">'+(pdfBuildState==='building'?'⏳':pdfBuildState==='error'?'⚠':'✓')+'</div><div>'+esc(status)+'</div>'+(hasPdf?'<div style="margin-top:8px;font-size:12px">TeXFlow uses the native VS Code PDF viewer to avoid the blank grey embedded-PDF bug.</div>':'')+'</div></div></section>';document.getElementById('pdf-refresh').onclick=()=>vscode.postMessage({type:'refreshPdf'});const open=document.getElementById('pdf-open');if(open)open.onclick=()=>vscode.postMessage({type:'openPdf'});document.getElementById('pdf-compile').onclick=()=>vscode.postMessage({type:'compile'});return;}if(!isBeamer){if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane document-pane">'+visualDocumentHtml()+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualDocument(c.querySelector('.visual-pane'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualDocumentHtml();bindVisualDocument(c);return;}if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane">'+visualFrameHtml(frames[current])+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualFrame(c.querySelector('.visual-pane'),current);scheduleSlideFit(c.querySelector('.visual-pane .slide'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualFrameHtml(frames[current]);bindVisualFrame(c,current);scheduleSlideFit(c.querySelector('.slide'));}
 function renderFrame(i){current=i;renderWorkspace();if(window.innerWidth<900&&typeof setNav==='function')setNav(false);}
 function renderBlock(b,fi){const wrap=document.createElement('div');wrap.className='block '+alignClass(b.align,b.kind==='itemize'?'left':'justify');wrap.dataset.blockId=String(b.id||'');if(b.hidden){wrap.style.display='none';return wrap;}

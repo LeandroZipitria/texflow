@@ -263,37 +263,102 @@ Text.
 }
 
 
-// 13. Beamer title-page metadata: optional short forms parse correctly and the
-// title page remains visually editable without losing Source shorthand.
+// 13. Beamer title-page metadata: optional short forms, multiple authors,
+// institutions, and nested affiliation commands parse without losing Source.
 {
-  let helper = extract('function getCommandValue', 'function cleanBibValue');
-  helper = helper.replace('function getCommandValue(source: string, command: string): string', 'function getCommandValue(source, command)');
-  helper = helper.replace('function getMetadata(source: string)', 'function getMetadata(source)');
+  let helper = extract('function findBalancedLatexClose', 'function cleanBibValue');
+  helper = helper
+    .replace('function findBalancedLatexClose(source: string, openIndex: number, openChar: string, closeChar: string): number', 'function findBalancedLatexClose(source, openIndex, openChar, closeChar)')
+    .replace('function findLatexCommandArgument(source: string, command: string): LatexCommandArgumentMatch | undefined', 'function findLatexCommandArgument(source, command)')
+    .replace('function getCommandValue(source: string, command: string): string', 'function getCommandValue(source, command)')
+    .replace('function getMetadata(source: string)', 'function getMetadata(source)');
   const sandbox = {};
   vm.runInNewContext(helper + '\nthis.getMetadata=getMetadata;', sandbox);
   const parsed = sandbox.getMetadata(String.raw`\title[Income dispersion]{Income Dispersion and Spatial Inequality}
 \subtitle{Montevideo, 1984--2024}
-\author[L. Zipitría]{Leandro Zipitría}
-\institute{Department of Economics}
+\author[L. Zipitría]{Leandro Zipitría \inst{1} \and Ana Pérez \inst{2}}
+\institute{Universidad de la República \inst{1} \and Example University \inst{2}}
 \date{September 2026}`);
   assert.strictEqual(parsed.title, 'Income Dispersion and Spatial Inequality', 'Beamer long title must win over optional short title');
   assert.strictEqual(parsed.subtitle, 'Montevideo, 1984--2024');
-  assert.strictEqual(parsed.author, 'Leandro Zipitría', 'Beamer long author must win over optional short author');
-  assert.strictEqual(parsed.institute, 'Department of Economics');
+  assert.strictEqual(parsed.author, String.raw`Leandro Zipitría \inst{1} \and Ana Pérez \inst{2}`, 'multiple Beamer authors and nested affiliations must be preserved');
+  assert.strictEqual(parsed.institute, String.raw`Universidad de la República \inst{1} \and Example University \inst{2}`, 'multiple Beamer institutions and nested affiliations must be preserved');
   assert.strictEqual(parsed.date, 'September 2026');
 
   assert(extension.includes("command: 'title' | 'subtitle' | 'author' | 'institute' | 'date'"), 'metadata writer must support the full Beamer title-page field set');
-  assert(extension.includes("const replacement = match ? `${match[1]}{${clean}}`"), 'metadata writer must preserve an existing optional short form');
+  assert(extension.includes('const match = findLatexCommandArgument(source, command);'), 'metadata writer must use balanced command parsing');
+  assert(extension.includes('`${match.prefix}${clean}}`'), 'metadata writer must preserve an existing optional short form');
   assert(extension.includes("new Set(['title', 'subtitle', 'author', 'institute', 'date'])"), 'Beamer metadata host allowlist is incomplete');
   assert(extension.includes('beamer-metadata-edit beamer-title-edit'), 'Beamer title must be editable in Visual');
   assert(extension.includes('beamer-subtitle-edit'), 'Beamer subtitle must be editable in Visual');
   assert(extension.includes('beamer-author-edit'), 'Beamer author must be editable in Visual');
   assert(extension.includes('beamer-institute-edit'), 'Beamer institution must be editable in Visual');
   assert(extension.includes('beamer-date-edit'), 'Beamer date must be editable in Visual');
+  assert(extension.includes("function beamerMetadataToHtml(text,field='')"), 'Beamer metadata renderer must preserve semantic separators');
+  assert(extension.includes('data-texflow-beamer-and="true"'), 'Beamer \\and must render as a semantic separator');
+  assert(extension.includes("label=field==='institute'?'':'and'"), 'authors must show and while institutions use vertical separation');
+  assert(extension.includes("contains('beamer-metadata-and'))return ' \\\\and ';"), 'Beamer and separator must serialize back to \\and');
+  assert(extension.includes("contains('beamer-inst'))return '\\\\inst{'"), 'Beamer affiliation markers must serialize back to \\inst');
   assert(extension.includes("data-placeholder=\"Institution\" contenteditable=\"true\""), 'empty Beamer institution needs an inline Visual placeholder');
   assert(extension.includes("data-placeholder=\"Date\" contenteditable=\"true\""), 'empty Beamer date needs an inline Visual placeholder');
   assert(extension.includes("host.querySelectorAll('.beamer-metadata-edit[contenteditable=true]')"), 'Beamer title page metadata binder missing');
   assert(!extension.includes("if(/\\\\(?:titlepage|maketitle)\\b/.test(f.body))return;bindVisualNavigationSpine(host)"), 'Beamer title page must no longer return before metadata binding');
+
+  const latexRendererStart = extension.indexOf('function latexToHtml(text)');
+  const latexRendererEnd = extension.indexOf('function splitBeamerMetadataSegments', latexRendererStart);
+  const latexRenderer = extension.slice(latexRendererStart, latexRendererEnd);
+  assert(!latexRenderer.includes('beamerInst'), 'Beamer affiliation handling must not leak into the generic Visual renderer');
+  assert(!latexRenderer.includes('TEXFLOW_BEAMER_INST'), 'generic Visual renderer must stay unchanged by affiliation rendering');
+  assert(extension.includes('function beamerMetadataChunkToHtml(text,authorIndex=-1)'), 'Beamer affiliations need a title-page-local renderer');
+  assert(extension.includes('class="beamer-metadata-row beamer-author-row"'), 'authors need a dedicated horizontal metadata row');
+  assert(extension.includes('class="beamer-metadata-row beamer-institute-row"'), 'institutions need a dedicated vertical metadata row');
+  assert(extension.includes('>+ Author</button>'), 'Visual title page must expose Add Author');
+  assert(extension.includes('>+ Institution</button>'), 'Visual title page must expose Add Institution');
+  assert(extension.includes('function selectTrailingText(el,text)'), 'Add Author/Institution must select the temporary label for direct replacement');
+  assert(!extension.includes("lastSent=value;mirrorMetadataSource(field,value);vscode.postMessage({type:'setMetadataValue',field,value});el.focus();placeCaretEnd(el)"), 'Add Author/Institution must not persist temporary placeholder text before the user types');
+  assert(extension.includes('function findBeamerMetadataCommandArgument(source,field)'), 'local metadata mirroring must use balanced Beamer parsing');
+}
+
+
+// 14. Beamer author affiliations can be assigned from Visual without editing Source.
+{
+  let helper = extract('function splitBeamerMetadataSegments', 'function renderInlineMaths');
+  const sandbox = {};
+  vm.runInNewContext(
+    helper + '\nthis.splitBeamerMetadataSegments=splitBeamerMetadataSegments;this.beamerInstitutionEntries=beamerInstitutionEntries;this.beamerAuthorInstitutionIds=beamerAuthorInstitutionIds;this.withBeamerAuthorInstitutions=withBeamerAuthorInstitutions;this.normalizedBeamerInstitutionValue=normalizedBeamerInstitutionValue;',
+    sandbox
+  );
+
+  const institutions = sandbox.beamerInstitutionEntries(String.raw`\inst{1} Universidad de la República \and University B`);
+  assert.strictEqual(institutions.length, 2);
+  assert.strictEqual(institutions[0].id, '1');
+  assert.strictEqual(institutions[1].id, '2', 'unnumbered institutions need a stable Visual affiliation id');
+  assert.strictEqual(
+    sandbox.normalizedBeamerInstitutionValue(institutions),
+    String.raw`\inst{1} Universidad de la República \and \inst{2} University B`,
+    'linking must materialize missing institution ids in canonical Beamer source'
+  );
+
+  const authors = String.raw`Leandro Zipitría \and Ana Pérez\inst{2}`;
+  assert.strictEqual(
+    sandbox.withBeamerAuthorInstitutions(authors, 0, ['1', '2']),
+    String.raw`Leandro Zipitría\inst{1,2} \and Ana Pérez\inst{2}`,
+    'one author must be able to link to multiple institutions'
+  );
+  assert.deepStrictEqual(Array.from(sandbox.beamerAuthorInstitutionIds(authors, 1)), ['2']);
+  assert.strictEqual(
+    sandbox.withBeamerAuthorInstitutions(authors, 1, []),
+    String.raw`Leandro Zipitría \and Ana Pérez`,
+    'clearing the Visual affiliation must remove only that author inst marker'
+  );
+
+  assert(extension.includes('class="beamer-affiliation-add"'), 'authors without an affiliation need a subtle Visual assignment control');
+  assert(extension.includes('beamer-affiliation-trigger'), 'existing affiliation superscripts must be clickable in Visual');
+  assert(extension.includes('function bindBeamerAffiliationControls(host)'), 'Beamer affiliation controls need an isolated title-page binder');
+  assert(extension.includes("vscode.postMessage({type:'setMetadataValues',values:clean});"), 'author/institution affiliation edits must be committed together');
+  assert(extension.includes("if (msg.type === 'setMetadataValues')"), 'host batch metadata handler missing');
+  assert(extension.includes("const fields: Array<'institute' | 'author'> = ['institute', 'author'];"), 'batch affiliation writes must remain limited to author/institute');
+  assert(extension.includes('Add an institution first.'), 'Visual must explain why affiliation assignment is unavailable without institutions');
 }
 
 console.log('PASS build_0201_runtime');
