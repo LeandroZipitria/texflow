@@ -8,7 +8,7 @@
 
 TeXFlow is a visual editor for real LaTeX files inside VS Code. It lets you focus on writing while keeping your `.tex` files intact, editable, and fully accessible.
 
-**Current stable release: 0.20.1.**
+**Current stable release: 0.20.2.**
 
 TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files remain the source of truth. When TeXFlow cannot safely edit a complex construct visually, it preserves the underlying LaTeX rather than silently rewriting it.
 
@@ -30,7 +30,7 @@ TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files rema
 - Figures with captions, labels, resize, rotation, subfigures, and unified figure insertion.
 - Tables with row/column editing, alignment, captions, labels, Booktabs, and CSV/TSV paste/import.
 - TikZ figures with insertion, Figure properties, inline source editing, PDF preview, Source navigation, and promotion of a bare `tikzpicture` to a Figure.
-- Beamer frame operations including duplicate, move, disable/restore, blocks, columns, frame options, and frame-local text sizes.
+- Beamer title-page editing for title, subtitle, author, institution, and date, plus frame operations including duplicate, move, disable/restore, blocks, columns, frame options, and frame-local text sizes.
 - Comments and notes with Comment, TODO, FIXME, Author note, commented-out blocks, and document-order navigation.
 - More robust Visual editing when VS Code closes background `TextDocument` objects: TeXFlow re-resolves documents by URI without opening Source as a side effect.
 - Visual ↔ Source navigation that preserves the relevant document location, including cross-file navigation.

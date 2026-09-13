@@ -8,7 +8,7 @@ TeXFlow is a visual editor for LaTeX and Beamer inside VS Code. It is designed t
 
 TeXFlow follows a conservative rule: structures it understands are shown as semantic visual objects; structures it does not understand are preserved as LaTeX rather than silently rewritten.
 
-> This manual documents TeXFlow `0.20.1`.
+> This manual documents TeXFlow `0.20.2`.
 
 ## 2. Installation and requirements
 
@@ -272,7 +272,7 @@ Hiding a marker is visual-only. Deleting source is a separate explicit action wi
 
 ## 18. Beamer
 
-Beamer documents expose a dedicated **Beamer** menu. Supported features include:
+Beamer documents expose a dedicated **Beamer** menu. The Beamer title slide supports direct Visual editing of Title, Subtitle, Author, Institution, and Date. Optional short forms such as `\title[short]{long}` and `\author[short]{long}` are preserved when the long title or author is edited. Empty Institution and Date fields remain available as unobtrusive placeholders so they can be filled directly from the title slide. Supported features include:
 
 - new frame;
 - duplicate frame;

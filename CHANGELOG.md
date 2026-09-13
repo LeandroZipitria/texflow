@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.20.2 — 2026-09-13
+
+### Improved
+
+* Beamer title pages now support direct Visual editing of Title, Subtitle, Author, Institution, and Date.
+* Empty Institution and Date fields are shown as unobtrusive editable placeholders.
+* Pressing Enter in title-page metadata moves naturally to the next metadata field.
+* Beamer `\title[short]{long}` and `\author[short]{long}` now display and edit the long form correctly while preserving the optional short form unchanged.
+
+### Reliability
+
+* Title-page metadata editing stays inside the Visual surface without VS Code input boxes.
+* Metadata edits use the existing stabilized autosave pipeline and do not trigger a Visual DOM refresh while typing.
+
+### Tests
+
+* Extended `build_0201_runtime.js` with regression coverage for Beamer optional metadata and direct title-page editing.
+
+### Notes
+
+TeXFlow `0.20.2` is a focused Beamer fix release. It makes presentation metadata editable directly from the title slide while preserving optional short metadata and the existing Visual autosave behavior.
+
 ## 0.20.1 — 2026-09-11
 
 ### Added
