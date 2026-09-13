@@ -262,6 +262,40 @@ Text.
   assert(!metadata.includes('showTextDocument'), 'metadata edits must not reveal a Source editor');
 }
 
+
+// 13. Beamer title-page metadata: optional short forms parse correctly and the
+// title page remains visually editable without losing Source shorthand.
+{
+  let helper = extract('function getCommandValue', 'function cleanBibValue');
+  helper = helper.replace('function getCommandValue(source: string, command: string): string', 'function getCommandValue(source, command)');
+  helper = helper.replace('function getMetadata(source: string)', 'function getMetadata(source)');
+  const sandbox = {};
+  vm.runInNewContext(helper + '\nthis.getMetadata=getMetadata;', sandbox);
+  const parsed = sandbox.getMetadata(String.raw`\title[Income dispersion]{Income Dispersion and Spatial Inequality}
+\subtitle{Montevideo, 1984--2024}
+\author[L. Zipitría]{Leandro Zipitría}
+\institute{Department of Economics}
+\date{September 2026}`);
+  assert.strictEqual(parsed.title, 'Income Dispersion and Spatial Inequality', 'Beamer long title must win over optional short title');
+  assert.strictEqual(parsed.subtitle, 'Montevideo, 1984--2024');
+  assert.strictEqual(parsed.author, 'Leandro Zipitría', 'Beamer long author must win over optional short author');
+  assert.strictEqual(parsed.institute, 'Department of Economics');
+  assert.strictEqual(parsed.date, 'September 2026');
+
+  assert(extension.includes("command: 'title' | 'subtitle' | 'author' | 'institute' | 'date'"), 'metadata writer must support the full Beamer title-page field set');
+  assert(extension.includes("const replacement = match ? `${match[1]}{${clean}}`"), 'metadata writer must preserve an existing optional short form');
+  assert(extension.includes("new Set(['title', 'subtitle', 'author', 'institute', 'date'])"), 'Beamer metadata host allowlist is incomplete');
+  assert(extension.includes('beamer-metadata-edit beamer-title-edit'), 'Beamer title must be editable in Visual');
+  assert(extension.includes('beamer-subtitle-edit'), 'Beamer subtitle must be editable in Visual');
+  assert(extension.includes('beamer-author-edit'), 'Beamer author must be editable in Visual');
+  assert(extension.includes('beamer-institute-edit'), 'Beamer institution must be editable in Visual');
+  assert(extension.includes('beamer-date-edit'), 'Beamer date must be editable in Visual');
+  assert(extension.includes("data-placeholder=\"Institution\" contenteditable=\"true\""), 'empty Beamer institution needs an inline Visual placeholder');
+  assert(extension.includes("data-placeholder=\"Date\" contenteditable=\"true\""), 'empty Beamer date needs an inline Visual placeholder');
+  assert(extension.includes("host.querySelectorAll('.beamer-metadata-edit[contenteditable=true]')"), 'Beamer title page metadata binder missing');
+  assert(!extension.includes("if(/\\\\(?:titlepage|maketitle)\\b/.test(f.body))return;bindVisualNavigationSpine(host)"), 'Beamer title page must no longer return before metadata binding');
+}
+
 console.log('PASS build_0201_runtime');
 
 // Performance guard: typing must not force layout on every keystroke.
