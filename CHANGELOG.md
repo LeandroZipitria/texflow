@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.20.5 — 2026-09-14
+
+### Added
+- Visual table border editing with Formal, Grid, None, and Custom modes.
+- Custom top, bottom, left, and right table border controls.
+- Replace action for single-image figures.
+
+### Improved
+- Table borders now distinguish editable cell guides from actual LaTeX rules.
+- Table border rendering adapts automatically to VS Code light and dark themes.
+- Figure replacement controls are consistent across single and multi-image figures.
+- Figure width controls now use a clearer `W(%)` format.
+- Single-image Beamer figures use a more compact Visual preview consistent with tables and multi-image figures.
+
+### Fixed
+- Existing `\toprule`, `\midrule`, `\bottomrule`, `\hline`, and vertical table rules are reflected correctly in Visual.
+- Single-image figure previews no longer appear disproportionately large in Beamer Visual mode.
+
 ## 0.20.4 — 2026-09-13
 
 ### Added
