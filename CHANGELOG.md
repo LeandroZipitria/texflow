@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.20.4 — 2026-09-13
+
+### Added
+- Paste LaTeX tables directly into the Visual editor.
+- Paste LaTeX, CSV, or TSV tables from the Insert Table panel.
+- Visual support for multiple images inside a single figure.
+- Side-by-side and stacked layouts for multi-image figures.
+- Individual resizing, replacement, and captions for subfigures.
+
+### Improved
+- More compact Beamer table and figure rendering, closer to the compiled PDF.
+- More accurate Beamer overflow detection by excluding Visual editing controls.
+- Clearer figure width controls and more compact image filenames.
+- Menu and insertion-panel lifecycle after actions are applied.
+
+### Fixed
+- Frame titles no longer lose the editing caret after autosave.
+- Multiple images inside `subfigure` environments are preserved and editable.
+- Figure and table editing no longer produces false Visual overflow warnings.
+- `\small` and related table formatting are preserved when editing pasted tables.
+
 ## 0.20.3 — 2026-09-13
 
 ### Added
