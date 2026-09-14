@@ -24,7 +24,9 @@ export interface TableParseData {
   label: string;
   placement: string;
   captionPosition: 'above' | 'below';
-  tableStyle: 'plain' | 'booktabs';
+  tableStyle: 'plain' | 'booktabs' | 'grid' | 'custom';
+  verticalBorders: boolean[];
+  horizontalBorders: boolean[];
   tableSize: '' | 'normalsize' | 'small' | 'footnotesize' | 'scriptsize' | 'tiny';
 }
 
@@ -191,21 +193,116 @@ export function tableData(raw: string): TableParseData {
   const placement = (/\\begin\{table\}(?:\[([^\]]*)\])?/.exec(text) || [])[1] || '';
   const beforeTabular = tab ? text.slice(0, tab.index) : text;
   const tableSize = ((/\\(normalsize|small|footnotesize|scriptsize|tiny)\b/.exec(beforeTabular) || [])[1] || '') as TableParseData['tableSize'];
-  if (!tab) return { simple: false, columns: [], rows: [], caption, label, placement, captionPosition, tableStyle: 'plain', tableSize };
+  const emptyResult = (tableStyle: TableParseData['tableStyle'] = 'plain', columns: string[] = []): TableParseData => ({
+    simple: false,
+    columns,
+    rows: [],
+    caption,
+    label,
+    placement,
+    captionPosition,
+    tableStyle,
+    verticalBorders: Array.from({ length: columns.length + 1 }, () => false),
+    horizontalBorders: [],
+    tableSize
+  });
+  if (!tab) return emptyResult();
+
   const spec = tab[1].trim();
-  const tableStyle: 'plain' | 'booktabs' = /\\(?:toprule|midrule|bottomrule)\b/.test(tab[2]) ? 'booktabs' : 'plain';
-  const unsupported = /\\(?:multicolumn|multirow|cline|cmidrule|begin\{|end\{)/.test(tab[2]);
-  const columns = [...spec.matchAll(/[lcr]/g)].map(m => m[0]);
-  if (!columns.length || unsupported || spec.replace(/[lcr|\s]/g, '') !== '') {
-    return { simple: false, columns, rows: [], caption, label, placement, captionPosition, tableStyle, tableSize };
+  const cleanSpec = spec.replace(/\s+/g, '');
+  if (!cleanSpec || /\|\|/.test(cleanSpec) || /[^lcr|]/.test(cleanSpec)) return emptyResult();
+  const columns: string[] = [];
+  const verticalBorders: boolean[] = [false];
+  let boundary = 0;
+  for (const token of cleanSpec) {
+    if (token === '|') {
+      verticalBorders[boundary] = true;
+      continue;
+    }
+    columns.push(token);
+    boundary += 1;
+    verticalBorders[boundary] = false;
   }
-  let tbody = tab[2]
-    .replace(/^[\s\n]+|[\s\n]+$/g, '')
-    .replace(/(^|\n)\s*\\(?:hline|toprule|midrule|bottomrule)\s*(?=\n|$)/g, '$1');
-  const rawRows = tbody.split(/\\\\(?:\s*\[[^\]]*\])?/).map(x => x.trim()).filter(Boolean);
-  const rows = rawRows.map(r => r.split(/(?<!\\)&/).map(c => c.trim()));
+  if (!columns.length) return emptyResult('plain', columns);
+
+  const body = String(tab[2] || '').replace(/^[\s\n]+|[\s\n]+$/g, '');
+  const unsupported = /\\(?:multicolumn|multirow|cline|cmidrule|begin\{|end\{)/.test(body);
+  const hasBooktabs = /\\(?:toprule|midrule|bottomrule)\b/.test(body);
+  const hasHline = /\\hline\b/.test(body);
+  if (unsupported || (hasBooktabs && (hasHline || verticalBorders.some(Boolean)))) return emptyResult(hasBooktabs ? 'booktabs' : 'plain', columns);
+
+  const rows: string[][] = [];
+  const horizontalBorders: boolean[] = [false];
+  const bookRules = new Map<number, Set<string>>();
+  const rawSegments = body.split(/\\\\(?:\s*\[[^\]]*\])?/);
+  const takeRules = (value: string): { text: string; rules: string[] } => {
+    let rest = String(value || '').trim();
+    const rules: string[] = [];
+    while (true) {
+      const m = /^\\(hline|toprule|midrule|bottomrule)\b\s*/.exec(rest);
+      if (!m) break;
+      rules.push(m[1]);
+      rest = rest.slice(m[0].length).trim();
+    }
+    return { text: rest, rules };
+  };
+  const recordRules = (at: number, rules: string[]) => {
+    for (const rule of rules) {
+      if (rule === 'hline') horizontalBorders[at] = true;
+      else {
+        if (!bookRules.has(at)) bookRules.set(at, new Set());
+        bookRules.get(at)!.add(rule);
+      }
+    }
+  };
+
+  for (const rawSegment of rawSegments) {
+    const leading = takeRules(rawSegment);
+    recordRules(rows.length, leading.rules);
+    let rowText = leading.text;
+    const trailingMatch = /((?:\s*\\(?:hline|toprule|midrule|bottomrule)\b\s*)+)$/.exec(rowText);
+    let trailingRules: string[] = [];
+    if (trailingMatch) {
+      const trailing = takeRules(trailingMatch[1]);
+      trailingRules = trailing.rules;
+      rowText = rowText.slice(0, trailingMatch.index).trim();
+    }
+    if (rowText) {
+      const row = rowText.split(/(?<!\\)&/).map(c => c.trim());
+      rows.push(row);
+      if (horizontalBorders.length < rows.length + 1) horizontalBorders.push(false);
+      recordRules(rows.length, trailingRules);
+    } else if (trailingRules.length) {
+      recordRules(rows.length, trailingRules);
+    }
+  }
+  while (horizontalBorders.length < rows.length + 1) horizontalBorders.push(false);
+
+  if (!rows.length || rows.some(r => r.length !== columns.length)) return emptyResult(hasBooktabs ? 'booktabs' : 'plain', columns);
+
+  let tableStyle: TableParseData['tableStyle'] = 'plain';
+  if (hasBooktabs) {
+    const onlyExpectedRules = [...bookRules.entries()].every(([at, rules]) => {
+      for (const rule of rules) {
+        if (rule === 'toprule' && at !== 0) return false;
+        if (rule === 'bottomrule' && at !== rows.length) return false;
+        if (rule === 'midrule' && (rows.length < 2 || at !== 1)) return false;
+      }
+      return true;
+    });
+    const hasTop = !!bookRules.get(0)?.has('toprule');
+    const hasBottom = !!bookRules.get(rows.length)?.has('bottomrule');
+    if (!onlyExpectedRules || !hasTop || !hasBottom) return emptyResult('booktabs', columns);
+    tableStyle = 'booktabs';
+  } else {
+    const allVertical = verticalBorders.length === columns.length + 1 && verticalBorders.every(Boolean);
+    const allHorizontal = horizontalBorders.length === rows.length + 1 && horizontalBorders.every(Boolean);
+    const anyBorder = verticalBorders.some(Boolean) || horizontalBorders.some(Boolean);
+    tableStyle = allVertical && allHorizontal ? 'grid' : anyBorder ? 'custom' : 'plain';
+  }
+
   return {
-    simple: !!rows.length && rows.every(r => r.length === columns.length),
+    simple: true,
     columns,
     rows,
     caption,
@@ -213,6 +310,8 @@ export function tableData(raw: string): TableParseData {
     placement,
     captionPosition,
     tableStyle,
+    verticalBorders,
+    horizontalBorders,
     tableSize
   };
 }
@@ -538,6 +637,8 @@ export function parseBlocks(body: string): ParsedBlock[] {
         tablePlacement: d.placement,
         tableCaptionPosition: d.captionPosition,
         tableStyle: d.tableStyle,
+        tableVerticalBorders: d.verticalBorders,
+        tableHorizontalBorders: d.horizontalBorders,
         tableSize: d.tableSize
       });
     }

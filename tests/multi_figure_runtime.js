@@ -66,7 +66,7 @@ const stacked = sample.replace('\\end{subfigure}\\hfill\n\\begin{subfigure}', '\
 assert.strictEqual(figureData(stacked).layout, 'stacked', 'stacked separator must be detected');
 
 assert(extension.includes("Layout <select class=\"figure-layout-input\""), 'multi-figure layout control missing');
-assert(extension.includes("class=\"multi-figure-replace\""), 'per-image replace control missing');
+assert(extension.includes('class="figure-replace-action multi-figure-replace"'), 'per-image replace control missing');
 assert(extension.includes("class=\"figure-resize multi-figure-resize\""), 'per-image drag resize handle missing');
 assert(extension.includes("class=\"multi-figure-caption\""), 'per-image subcaption editor missing');
 assert(extension.includes("querySelectorAll('.multi-figure-resize')"), 'per-image drag resize binding missing');
@@ -75,6 +75,7 @@ assert(extension.includes("msg.type === 'replaceFigureItem'"), 'host replace-ima
 assert(extension.includes("payload.items=multiPayload();payload.layout="), 'multi-figure edits must serialize through updateBlock');
 assert(extension.includes('.slide .multi-figure-grid'), 'compact Beamer multi-figure styling missing');
 assert(extension.includes('protectedSubfigures'), 'float-level edits must protect nested subfigure contents');
-assert(extension.includes('input.multi-figure-width{width:60px;min-width:60px}'), 'multi-figure width control must remain readable');
+assert(extension.includes('input.multi-figure-width{width:68px;min-width:68px}'), 'multi-figure width control must remain readable');
+assert(extension.includes('<label>W(%) <input class="multi-figure-width"'), 'multi-figure width label must keep the percent unit visible');
 
 console.log('PASS multi_figure_runtime');

@@ -65,7 +65,9 @@ export interface ParsedBlock {
   tablePlacement?: string;
   tableCaptionPosition?: 'above' | 'below';
   tableSimple?: boolean;
-  tableStyle?: 'plain' | 'booktabs';
+  tableStyle?: 'plain' | 'booktabs' | 'grid' | 'custom';
+  tableVerticalBorders?: boolean[];
+  tableHorizontalBorders?: boolean[];
   tableSize?: '' | 'normalsize' | 'small' | 'footnotesize' | 'scriptsize' | 'tiny';
   spaceAmount?: string;
   spaceStarred?: boolean;
