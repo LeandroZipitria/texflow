@@ -20,7 +20,7 @@ const extension = fs.readFileSync(extensionPath, 'utf8');
 const blocksSource = fs.readFileSync(blocksSourcePath, 'utf8');
 const parser = require(blocksOutPath);
 
-ok(extension.includes("import { parseBlocks, webviewParserRuntimeSource } from './latex/blocks';"), 'shared parser import missing');
+ok(extension.includes("import { parseBlocks, pastedTableData, webviewParserRuntimeSource } from './latex/blocks';"), 'shared parser import missing');
 ok(extension.includes('${webviewParserRuntimeSource()}'), 'shared parser webview injection missing');
 ok(!extension.includes('function parseFigureData('), 'old host figure parser remains in extension.ts');
 ok(!extension.includes('function parseTableData('), 'old host table parser remains in extension.ts');
@@ -28,6 +28,7 @@ ok(!extension.includes('function figureData(raw){'), 'old webview figure parser 
 ok(!extension.includes('function tableData(raw){'), 'old webview table parser remains in extension.ts');
 ok(!extension.includes('function parseBlocks(body){'), 'old webview parseBlocks remains in extension.ts');
 ok(blocksSource.includes('export function parseBlocks'), 'shared parseBlocks export missing');
+ok(blocksSource.includes('export function pastedTableData'), 'shared pastedTableData export missing');
 ok(blocksSource.includes('export function webviewParserRuntimeSource'), 'runtime generator missing');
 
 const fakeComment = '\\begin{comment}\n\\label{fake:label}\n\\input{fake-file}\n\\end{comment}\n\nVisible text.';

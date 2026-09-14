@@ -1,5 +1,19 @@
 export type BlockAlignment = 'left' | 'center' | 'right' | 'justify';
 
+export interface ParsedFigureItem {
+  path: string;
+  options?: string;
+  width?: number;
+  widthUnit?: string;
+  height?: number;
+  heightUnit?: string;
+  angle?: number;
+  containerWidth?: number;
+  containerWidthUnit?: string;
+  subfigure?: boolean;
+  caption?: string;
+}
+
 export interface ParsedBlock {
   id: string;
   kind:
@@ -42,6 +56,8 @@ export interface ParsedBlock {
   figurePlacement?: string;
   figureCaptionPosition?: 'above' | 'below';
   figureAlign?: 'left' | 'center' | 'right';
+  figureItems?: ParsedFigureItem[];
+  figureLayout?: 'side-by-side' | 'stacked';
   tableColumns?: string[];
   tableRows?: string[][];
   tableCaption?: string;
@@ -50,6 +66,7 @@ export interface ParsedBlock {
   tableCaptionPosition?: 'above' | 'below';
   tableSimple?: boolean;
   tableStyle?: 'plain' | 'booktabs';
+  tableSize?: '' | 'normalsize' | 'small' | 'footnotesize' | 'scriptsize' | 'tiny';
   spaceAmount?: string;
   spaceStarred?: boolean;
   columnCount?: number;

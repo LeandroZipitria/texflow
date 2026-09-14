@@ -1,4 +1,4 @@
-import type { BlockAlignment, ParsedBlock } from './types';
+import type { BlockAlignment, ParsedBlock, ParsedFigureItem } from './types';
 
 export interface FigureParseData {
   path: string;
@@ -12,6 +12,8 @@ export interface FigureParseData {
   placement: string;
   captionPosition: 'above' | 'below';
   align: 'left' | 'center' | 'right';
+  items: ParsedFigureItem[];
+  layout: 'side-by-side' | 'stacked';
 }
 
 export interface TableParseData {
@@ -23,6 +25,12 @@ export interface TableParseData {
   placement: string;
   captionPosition: 'above' | 'below';
   tableStyle: 'plain' | 'booktabs';
+  tableSize: '' | 'normalsize' | 'small' | 'footnotesize' | 'scriptsize' | 'tiny';
+}
+
+export interface PastedTableParseData extends TableParseData {
+  latex: string;
+  wrapped: boolean;
 }
 
 export function splitTopItems(inner: string): string[] {
@@ -65,7 +73,8 @@ export function isOnlyAlignmentDirective(raw: string): boolean {
 
 export function figureData(raw: string): FigureParseData {
   const text = String(raw || '');
-  const graphic = /\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/.exec(text);
+  const graphicRe = /\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/g;
+  const graphic = graphicRe.exec(text);
   const options = graphic?.[1] || '';
   const figurePath = graphic?.[2]?.trim() || '';
   const parts = options.split(',').map(x => x.trim()).filter(Boolean);
@@ -89,18 +98,86 @@ export function figureData(raw: string): FigureParseData {
       : 'left';
   const angleToken = parts.find(x => /^angle\s*=/.test(x));
   const angle = angleToken ? Number(angleToken.slice(angleToken.indexOf('=') + 1).trim()) || 0 : 0;
+
+  const parseDimValue = (value: string): { value?: number; unit?: string } => {
+    const textValue = String(value || '').trim();
+    const m = /^([0-9]*\.?[0-9]+)\s*(\\(?:textwidth|linewidth|columnwidth|paperwidth|textheight)|[a-zA-Z]+)$/.exec(textValue);
+    if (m) return { value: Number(m[1]), unit: m[2] };
+    const bare = /^(\\(?:textwidth|linewidth|columnwidth|paperwidth|textheight))$/.exec(textValue);
+    return bare ? { value: 1, unit: bare[1] } : {};
+  };
+  const parseGraphicItem = (m: RegExpExecArray, subfigure = false, container = ''): ParsedFigureItem => {
+    const itemOptions = String(m[1] || '');
+    const itemParts = itemOptions.split(',').map(x => x.trim()).filter(Boolean);
+    const itemDim = (name: string) => {
+      const token = itemParts.find(x => new RegExp('^' + name + '\\s*=').test(x));
+      return token ? parseDimValue(token.slice(token.indexOf('=') + 1)) : {};
+    };
+    const anglePart = itemParts.find(x => /^angle\s*=/.test(x));
+    const containerDim = parseDimValue(container);
+    return {
+      path: String(m[2] || '').trim(),
+      options: itemOptions,
+      width: itemDim('width').value,
+      widthUnit: itemDim('width').unit,
+      height: itemDim('height').value,
+      heightUnit: itemDim('height').unit,
+      angle: anglePart ? Number(anglePart.slice(anglePart.indexOf('=') + 1).trim()) || 0 : 0,
+      containerWidth: containerDim.value,
+      containerWidthUnit: containerDim.unit,
+      subfigure
+    };
+  };
+
+  const items: ParsedFigureItem[] = [];
+  const subMatches: Array<{ start: number; end: number; item: ParsedFigureItem }> = [];
+  const subRe = /\\begin\{subfigure\}(?:\[[^\]]*\])?\{([^}]*)\}([\s\S]*?)\\end\{subfigure\}/g;
+  let sm: RegExpExecArray | null;
+  while ((sm = subRe.exec(text))) {
+    const gm = /\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/.exec(sm[2]);
+    if (!gm) continue;
+    const item = parseGraphicItem(gm, true, sm[1]);
+    item.caption = (/\\caption(?:\[[^\]]*\])?\{([^}]*)\}/.exec(sm[2]) || [])[1] || '';
+    items.push(item);
+    subMatches.push({ start: sm.index, end: subRe.lastIndex, item });
+  }
+  if (!items.length) {
+    graphicRe.lastIndex = 0;
+    let gm: RegExpExecArray | null;
+    while ((gm = graphicRe.exec(text))) items.push(parseGraphicItem(gm));
+  }
+
+  let layout: 'side-by-side' | 'stacked' = 'side-by-side';
+  if (subMatches.length > 1) {
+    for (let i = 0; i < subMatches.length - 1; i++) {
+      const between = text.slice(subMatches[i].end, subMatches[i + 1].start);
+      if (/\\par\b|\\(?:small|med|big)skip\b|\\vspace\b|\n\s*\n/.test(between) && !/\\hfill\b/.test(between)) {
+        layout = 'stacked';
+        break;
+      }
+    }
+  }
+  const insideSubfigure = (index: number) => subMatches.some(x => index >= x.start && index < x.end);
+  const topCaptionMatch = [...text.matchAll(/\\caption(?:\[([^\]]*)\])?\{([^}]*)\}/g)].find(m => !insideSubfigure(m.index ?? -1));
+  const topShortCaption = topCaptionMatch?.[1] || '';
+  const topCaption = topCaptionMatch?.[2] || '';
+  const topCaptionPosition: 'above' | 'below' = topCaptionMatch && graphic && (topCaptionMatch.index ?? 0) < graphic.index ? 'above' : 'below';
+  const topLabelMatch = [...text.matchAll(/\\label\{([^}]+)\}/g)].find(m => !insideSubfigure(m.index ?? -1));
+  const topLabel = topLabelMatch?.[1] || '';
   return {
     path: figurePath,
     options,
     width: dim('width'),
     height: dim('height'),
-    caption,
-    shortCaption,
+    caption: topCaption,
+    shortCaption: topShortCaption,
     angle,
-    label,
+    label: topLabel,
     placement,
-    captionPosition,
-    align
+    captionPosition: topCaptionPosition,
+    align,
+    items,
+    layout
   };
 }
 
@@ -112,13 +189,15 @@ export function tableData(raw: string): TableParseData {
   const captionPosition: 'above' | 'below' = captionMatch && tab && captionMatch.index < tab.index ? 'above' : 'below';
   const label = (/\\label\{([^}]+)\}/.exec(text) || [])[1] || '';
   const placement = (/\\begin\{table\}(?:\[([^\]]*)\])?/.exec(text) || [])[1] || '';
-  if (!tab) return { simple: false, columns: [], rows: [], caption, label, placement, captionPosition, tableStyle: 'plain' };
+  const beforeTabular = tab ? text.slice(0, tab.index) : text;
+  const tableSize = ((/\\(normalsize|small|footnotesize|scriptsize|tiny)\b/.exec(beforeTabular) || [])[1] || '') as TableParseData['tableSize'];
+  if (!tab) return { simple: false, columns: [], rows: [], caption, label, placement, captionPosition, tableStyle: 'plain', tableSize };
   const spec = tab[1].trim();
   const tableStyle: 'plain' | 'booktabs' = /\\(?:toprule|midrule|bottomrule)\b/.test(tab[2]) ? 'booktabs' : 'plain';
   const unsupported = /\\(?:multicolumn|multirow|cline|cmidrule|begin\{|end\{)/.test(tab[2]);
   const columns = [...spec.matchAll(/[lcr]/g)].map(m => m[0]);
   if (!columns.length || unsupported || spec.replace(/[lcr|\s]/g, '') !== '') {
-    return { simple: false, columns, rows: [], caption, label, placement, captionPosition, tableStyle };
+    return { simple: false, columns, rows: [], caption, label, placement, captionPosition, tableStyle, tableSize };
   }
   let tbody = tab[2]
     .replace(/^[\s\n]+|[\s\n]+$/g, '')
@@ -133,7 +212,26 @@ export function tableData(raw: string): TableParseData {
     label,
     placement,
     captionPosition,
-    tableStyle
+    tableStyle,
+    tableSize
+  };
+}
+
+export function pastedTableData(raw: string): PastedTableParseData | null {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+  const fullTable = /^\\begin\{table\}(?:\[[^\]]*\])?[\s\S]*\\end\{table\}$/.test(text);
+  const bareTabular = /^\\begin\{tabular\}\{[^}]*\}[\s\S]*\\end\{tabular\}$/.test(text);
+  if (!fullTable && !bareTabular) return null;
+  const parsed = tableData(text);
+  if (!parsed.simple || !parsed.columns.length || !parsed.rows.length) return null;
+  if (parsed.columns.length > 12 || parsed.rows.length > 30) return null;
+  if (parsed.placement && !['htbp','h','t','b','p'].includes(parsed.placement)) return null;
+  if (/\\caption\s*\[[^\]]*\]/.test(text)) return null;
+  return {
+    ...parsed,
+    latex: fullTable ? text : `\\begin{table}\n\\centering\n${text}\n\\end{table}`,
+    wrapped: bareTabular
   };
 }
 
@@ -332,7 +430,9 @@ export function parseBlocks(body: string): ParsedBlock[] {
         figureCaption: d.caption, figureShortCaption: d.shortCaption,
         figureAngle: d.angle, figureLabel: d.label,
         figurePlacement: d.placement, figureCaptionPosition: d.captionPosition,
-        figureAlign: d.align
+        figureAlign: d.align,
+        figureItems: d.items,
+        figureLayout: d.layout
       });
       cur = re.lastIndex;
       continue;
@@ -410,7 +510,9 @@ export function parseBlocks(body: string): ParsedBlock[] {
         figureAngle: d.angle,
         figureLabel: d.label,
         figurePlacement: d.placement,
-        figureCaptionPosition: d.captionPosition
+        figureCaptionPosition: d.captionPosition,
+        figureItems: d.items,
+        figureLayout: d.layout
       });
     }
     if (kind === 'columns') {
@@ -435,7 +537,8 @@ export function parseBlocks(body: string): ParsedBlock[] {
         tableLabel: d.label,
         tablePlacement: d.placement,
         tableCaptionPosition: d.captionPosition,
-        tableStyle: d.tableStyle
+        tableStyle: d.tableStyle,
+        tableSize: d.tableSize
       });
     }
 
@@ -462,6 +565,7 @@ export function webviewParserRuntimeSource(): string {
     isOnlyAlignmentDirective,
     figureData,
     tableData,
+    pastedTableData,
     findMatchingEnvEnd,
     parseBlocks
   ].map(fn => fn.toString()).join('\n');
