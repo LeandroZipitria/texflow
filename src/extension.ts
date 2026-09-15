@@ -3430,6 +3430,26 @@ async function ensureGraphicx(document: vscode.TextDocument) {
   await applyReplacement(document, begin, begin, '\\usepackage{graphicx}\n\n');
 }
 
+async function copyExternalFigureIntoProject(rootDir: string, original: vscode.Uri): Promise<{ uri: vscode.Uri; latexPath: string }> {
+  const figuresDir = vscode.Uri.file(path.join(rootDir, 'figures'));
+  await vscode.workspace.fs.createDirectory(figuresDir);
+  const target = vscode.Uri.file(path.join(figuresDir.fsPath, path.basename(original.fsPath)));
+
+  // Some file-system providers do not reliably replace an existing file when
+  // workspace.fs.copy(..., { overwrite: true }) is used. Remove the previous
+  // project copy explicitly so re-importing the same filename always leaves a
+  // single stable figures/<name> file instead of provider-generated -1/-2 copies.
+  try {
+    await vscode.workspace.fs.stat(target);
+    await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
+  } catch (error) {
+    if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') throw error;
+  }
+
+  await vscode.workspace.fs.copy(original, target, { overwrite: true });
+  return { uri: target, latexPath: path.relative(rootDir, target.fsPath).replace(/\\/g, '/') };
+}
+
 async function chooseFigureFile(rootDocument: vscode.TextDocument): Promise<{ uri: vscode.Uri; latexPath: string } | undefined> {
   const picked = await vscode.window.showOpenDialog({
     canSelectFiles: true,
@@ -3460,20 +3480,7 @@ async function chooseFigureFile(rootDocument: vscode.TextDocument): Promise<{ ur
   let relative = path.relative(rootDir, original.fsPath);
   const outside = relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
   if (outside) {
-    const figuresDir = vscode.Uri.file(path.join(rootDir, 'figures'));
-    await vscode.workspace.fs.createDirectory(figuresDir);
-    const parsed = path.parse(original.fsPath);
-    let candidate = vscode.Uri.file(path.join(figuresDir.fsPath, parsed.base));
-    let i = 2;
-    while (true) {
-      try {
-        await vscode.workspace.fs.stat(candidate);
-        candidate = vscode.Uri.file(path.join(figuresDir.fsPath, `${parsed.name}-${i++}${parsed.ext}`));
-      } catch { break; }
-    }
-    await vscode.workspace.fs.copy(original, candidate, { overwrite: false });
-    target = candidate;
-    relative = path.relative(rootDir, target.fsPath);
+    return copyExternalFigureIntoProject(rootDir, original);
   }
   return { uri: target, latexPath: relative.replace(/\\/g, '/') };
 }
@@ -3491,7 +3498,7 @@ async function chooseMultipleFigureFiles(rootDocument: vscode.TextDocument): Pro
     const actual=isPdf?'pdf':isPng?'png':isJpeg?'jpeg':'unsupported',expected=ext==='.pdf'?'pdf':ext==='.png'?'png':(ext==='.jpg'||ext==='.jpeg')?'jpeg':'unsupported';
     if(actual==='unsupported'||expected==='unsupported'||actual!==expected){vscode.window.showErrorMessage(`TeXFlow: ${path.basename(original.fsPath)} is not a valid PDF, PNG, or JPEG for pdfLaTeX.`);continue;}
     let target=original,relative=path.relative(rootDir,original.fsPath);const outside=relative.startsWith('..'+path.sep)||path.isAbsolute(relative);
-    if(outside){const figuresDir=vscode.Uri.file(path.join(rootDir,'figures'));await vscode.workspace.fs.createDirectory(figuresDir);const parsed=path.parse(original.fsPath);let candidate=vscode.Uri.file(path.join(figuresDir.fsPath,parsed.base)),i=2;while(true){try{await vscode.workspace.fs.stat(candidate);candidate=vscode.Uri.file(path.join(figuresDir.fsPath,`${parsed.name}-${i++}${parsed.ext}`));}catch{break;}}await vscode.workspace.fs.copy(original,candidate,{overwrite:false});target=candidate;relative=path.relative(rootDir,target.fsPath);}
+    if(outside){out.push(await copyExternalFigureIntoProject(rootDir,original));continue;}
     out.push({uri:target,latexPath:relative.replace(/\\/g,'/')});
   }
   return out;
