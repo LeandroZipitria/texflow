@@ -73,6 +73,52 @@ export function isOnlyAlignmentDirective(raw: string): boolean {
   return /^(?:\s|%[^\n]*(?:\n|$))*\\(?:centering|raggedright|raggedleft|justifying)\b\s*(?:%[^\n]*)?\s*$/.test(String(raw || ''));
 }
 
+
+function balancedCommandArguments(text: string, command: string): Array<{ start: number; end: number; optional: string; content: string }> {
+  const source = String(text || '');
+  const out: Array<{ start: number; end: number; optional: string; content: string }> = [];
+  const needle = '\\' + command;
+  let at = 0;
+  const balancedEnd = (openAt: number, openChar: string, closeChar: string): number => {
+    let depth = 0;
+    for (let i = openAt; i < source.length; i++) {
+      const ch = source[i];
+      if (ch === '\\') { i++; continue; }
+      if (ch === openChar) depth++;
+      else if (ch === closeChar) { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+  };
+  while ((at = source.indexOf(needle, at)) >= 0) {
+    const after = at + needle.length;
+    if (/[A-Za-z@]/.test(source[after] || '')) { at = after; continue; }
+    let cursor = after;
+    while (/\s/.test(source[cursor] || '')) cursor++;
+    let optional = '';
+    if (source[cursor] === '[') {
+      const end = balancedEnd(cursor, '[', ']');
+      if (end < 0) { at = after; continue; }
+      optional = source.slice(cursor + 1, end);
+      cursor = end + 1;
+      while (/\s/.test(source[cursor] || '')) cursor++;
+    }
+    if (source[cursor] !== '{') { at = after; continue; }
+    const end = balancedEnd(cursor, '{', '}');
+    if (end < 0) { at = after; continue; }
+    out.push({ start: at, end: end + 1, optional, content: source.slice(cursor + 1, end) });
+    at = end + 1;
+  }
+  return out;
+}
+
+function captionContentData(content: string): { caption: string; label: string } {
+  const source = String(content || '');
+  const labelMatch = /\\label\{([^{}]+)\}/.exec(source);
+  const label = labelMatch?.[1] || '';
+  const caption = labelMatch ? (source.slice(0, labelMatch.index) + source.slice((labelMatch.index || 0) + labelMatch[0].length)).trim() : source.trim();
+  return { caption, label };
+}
+
 export function figureData(raw: string): FigureParseData {
   const text = String(raw || '');
   const graphicRe = /\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/g;
@@ -87,11 +133,12 @@ export function figureData(raw: string): FigureParseData {
     const m = /^([0-9]*\.?[0-9]+)\s*(\\(?:textwidth|linewidth|columnwidth|paperwidth|textheight)|[a-zA-Z]+)$/.exec(value);
     return m ? { value: Number(m[1]), unit: m[2] } : {};
   };
-  const captionMatch = /\\caption(?:\[([^\]]*)\])?\{([^}]*)\}/.exec(text);
-  const shortCaption = captionMatch?.[1] || '';
-  const caption = captionMatch?.[2] || '';
-  const captionPosition: 'above' | 'below' = captionMatch && graphic && captionMatch.index < graphic.index ? 'above' : 'below';
-  const label = (/\\label\{([^}]+)\}/.exec(text) || [])[1] || '';
+  const captionCommand = balancedCommandArguments(text, 'caption')[0];
+  const captionInfo = captionContentData(captionCommand?.content || '');
+  const shortCaption = captionCommand?.optional || '';
+  const caption = captionInfo.caption;
+  const captionPosition: 'above' | 'below' = captionCommand && graphic && captionCommand.start < graphic.index ? 'above' : 'below';
+  const label = captionInfo.label || ((/\\label\{([^}]+)\}/.exec(text) || [])[1] || '');
   const placement = (/\\begin\{figure\}(?:\[([^\]]*)\])?/.exec(text) || [])[1] || '';
   const align: 'left' | 'center' | 'right' = /\\raggedleft|\\begin\{flushright\}/.test(text)
     ? 'right'
@@ -139,7 +186,8 @@ export function figureData(raw: string): FigureParseData {
     const gm = /\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}/.exec(sm[2]);
     if (!gm) continue;
     const item = parseGraphicItem(gm, true, sm[1]);
-    item.caption = (/\\caption(?:\[[^\]]*\])?\{([^}]*)\}/.exec(sm[2]) || [])[1] || '';
+    const subCaptionCommand = balancedCommandArguments(sm[2], 'caption')[0];
+    item.caption = captionContentData(subCaptionCommand?.content || '').caption;
     items.push(item);
     subMatches.push({ start: sm.index, end: subRe.lastIndex, item });
   }
@@ -160,12 +208,13 @@ export function figureData(raw: string): FigureParseData {
     }
   }
   const insideSubfigure = (index: number) => subMatches.some(x => index >= x.start && index < x.end);
-  const topCaptionMatch = [...text.matchAll(/\\caption(?:\[([^\]]*)\])?\{([^}]*)\}/g)].find(m => !insideSubfigure(m.index ?? -1));
-  const topShortCaption = topCaptionMatch?.[1] || '';
-  const topCaption = topCaptionMatch?.[2] || '';
-  const topCaptionPosition: 'above' | 'below' = topCaptionMatch && graphic && (topCaptionMatch.index ?? 0) < graphic.index ? 'above' : 'below';
+  const topCaptionCommand = balancedCommandArguments(text, 'caption').find(m => !insideSubfigure(m.start));
+  const topCaptionInfo = captionContentData(topCaptionCommand?.content || '');
+  const topShortCaption = topCaptionCommand?.optional || '';
+  const topCaption = topCaptionInfo.caption;
+  const topCaptionPosition: 'above' | 'below' = topCaptionCommand && graphic && topCaptionCommand.start < graphic.index ? 'above' : 'below';
   const topLabelMatch = [...text.matchAll(/\\label\{([^}]+)\}/g)].find(m => !insideSubfigure(m.index ?? -1));
-  const topLabel = topLabelMatch?.[1] || '';
+  const topLabel = topCaptionInfo.label || topLabelMatch?.[1] || '';
   return {
     path: figurePath,
     options,
@@ -186,10 +235,11 @@ export function figureData(raw: string): FigureParseData {
 export function tableData(raw: string): TableParseData {
   const text = String(raw || '');
   const tab = /\\begin\{tabular\}\{([^}]*)\}([\s\S]*?)\\end\{tabular\}/.exec(text);
-  const captionMatch = /\\caption(?:\[[^\]]*\])?\{([^}]*)\}/.exec(text);
-  const caption = captionMatch?.[1] || '';
-  const captionPosition: 'above' | 'below' = captionMatch && tab && captionMatch.index < tab.index ? 'above' : 'below';
-  const label = (/\\label\{([^}]+)\}/.exec(text) || [])[1] || '';
+  const captionCommand = balancedCommandArguments(text, 'caption')[0];
+  const captionInfo = captionContentData(captionCommand?.content || '');
+  const caption = captionInfo.caption;
+  const captionPosition: 'above' | 'below' = captionCommand && tab && captionCommand.start < tab.index ? 'above' : 'below';
+  const label = captionInfo.label || ((/\\label\{([^}]+)\}/.exec(text) || [])[1] || '');
   const placement = (/\\begin\{table\}(?:\[([^\]]*)\])?/.exec(text) || [])[1] || '';
   const beforeTabular = tab ? text.slice(0, tab.index) : text;
   const tableSize = ((/\\(normalsize|small|footnotesize|scriptsize|tiny)\b/.exec(beforeTabular) || [])[1] || '') as TableParseData['tableSize'];
@@ -324,7 +374,6 @@ export function pastedTableData(raw: string): PastedTableParseData | null {
   if (!fullTable && !bareTabular) return null;
   const parsed = tableData(text);
   if (!parsed.simple || !parsed.columns.length || !parsed.rows.length) return null;
-  if (parsed.columns.length > 12 || parsed.rows.length > 30) return null;
   if (parsed.placement && !['htbp','h','t','b','p'].includes(parsed.placement)) return null;
   if (/\\caption\s*\[[^\]]*\]/.test(text)) return null;
   return {
@@ -357,7 +406,7 @@ export function findMatchingEnvEnd(source: string, env: string, from: number): {
 
 export function parseBlocks(body: string): ParsedBlock[] {
   const out: ParsedBlock[] = [];
-  const re = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|abstract|comment|tikzpicture)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b|\$\$/g;
+  const re = /\\begin\{(itemize|enumerate|block|alertblock|exampleblock|equation\*?|align\*?|gather\*?|multline\*?|figure|table|columns|multicols|flushleft|center|flushright|quote|quotation|minipage|theorem|lemma|proposition|corollary|definition|proof|abstract|comment|tikzpicture)\}(?:\[[^\]]*\])?(?:\{([^}]*)\})?|\\includegraphics(?:\[([^\]]*)\])?\{([^}]+)\}|\\vspace(\*)?\{([^}]+)\}|\\(newpage|clearpage|pagebreak)\b(?:\{\})?|\$\$/g;
   let cur = 0;
   let m: RegExpExecArray | null;
   let n = 0;
@@ -392,6 +441,37 @@ export function parseBlocks(body: string): ParsedBlock[] {
       const commandEnd = commandStart + String(alignmentDirective[2] || '').length;
       if (commandStart > s) text(s, commandStart);
       currentAlign = alignmentFromDirective('\\' + command, currentAlign);
+      out.push({
+        id: 'b' + n++, kind: 'raw', start: commandStart, end: commandEnd,
+        raw: body.slice(commandStart, commandEnd), text: body.slice(commandStart, commandEnd).trim(),
+        hidden: true, align: currentAlign
+      });
+      if (commandEnd < e) text(commandEnd, e);
+      return;
+    }
+
+    const namedSpacingDirective = /(^|\r?\n)([ \t]*\\(smallskip|medskip|bigskip)(?:\{\})?[ \t]*(?:%[^\n]*)?)(?=\r?\n|$)/m.exec(raw);
+    if (namedSpacingDirective) {
+      const linePrefix = String(namedSpacingDirective[1] || '');
+      const command = String(namedSpacingDirective[3] || 'medskip');
+      const commandStart = s + (namedSpacingDirective.index || 0) + linePrefix.length;
+      const commandEnd = commandStart + String(namedSpacingDirective[2] || '').length;
+      if (commandStart > s) text(s, commandStart);
+      out.push({
+        id: 'b' + n++, kind: 'vspace', start: commandStart, end: commandEnd,
+        raw: body.slice(commandStart, commandEnd), text: body.slice(commandStart, commandEnd).trim(),
+        spaceAmount: command, spaceStarred: false, align: currentAlign
+      });
+      if (commandEnd < e) text(commandEnd, e);
+      return;
+    }
+
+    const noindentDirective = /(^|\r?\n)([ \t]*\\noindent\b[ \t]*)/m.exec(raw);
+    if (noindentDirective) {
+      const linePrefix = String(noindentDirective[1] || '');
+      const commandStart = s + (noindentDirective.index || 0) + linePrefix.length;
+      const commandEnd = commandStart + String(noindentDirective[2] || '').length;
+      if (commandStart > s) text(s, commandStart);
       out.push({
         id: 'b' + n++, kind: 'raw', start: commandStart, end: commandEnd,
         raw: body.slice(commandStart, commandEnd), text: body.slice(commandStart, commandEnd).trim(),
@@ -563,7 +643,15 @@ export function parseBlocks(body: string): ParsedBlock[] {
     if (!match) break;
     const end = match.end;
     const raw = body.slice(m.index, end);
-    const inner = raw.slice(m[0].length, raw.length - token.length).trim();
+    let inner = raw.slice(m[0].length, raw.length - token.length).trim();
+    let abstractStretch = '';
+    if (env === 'abstract') {
+      const stretch = /^(?:(?:\s*%[^\r\n]*(?:\r?\n|$))|\s)*\\setstretch\s*\{([^{}]+)\}[ \t]*(?:%[^\r\n]*)?(?:\r?\n)?/.exec(inner);
+      if (stretch) {
+        abstractStretch = String(stretch[1] || '').trim();
+        inner = inner.slice(stretch[0].length).replace(/^\s+/, '');
+      }
+    }
     let kind: ParsedBlock['kind'] = 'raw';
     if (env === 'itemize' || env === 'enumerate') kind = 'itemize';
     else if (['block', 'alertblock', 'exampleblock'].includes(env)) kind = 'block';
@@ -593,6 +681,7 @@ export function parseBlocks(body: string): ParsedBlock[] {
     };
 
     if (kind === 'itemize') b.items = splitTopItems(inner);
+    if (kind === 'abstract' && abstractStretch) b.abstractStretch = abstractStretch;
     if (kind === 'figure') {
       const d = figureData(raw);
       Object.assign(b, {
@@ -627,8 +716,33 @@ export function parseBlocks(body: string): ParsedBlock[] {
     }
     if (kind === 'table') {
       const d = tableData(raw);
-      if (!d.simple) b.kind = 'raw';
-      else Object.assign(b, {
+      if (!d.simple) {
+        // Tables that use constructs outside the safe visual-grid subset stay
+        // source-preserved, but remain editable as one complete LaTeX block.
+        b.kind = 'raw';
+        Object.assign(b, {
+          tableSourceEditable: true,
+          tableFallbackReason: 'unsupported',
+          tableRowCount: d.rows.length,
+          tableColumnCount: d.columns.length,
+          tableCaption: d.caption,
+          tableLabel: d.label
+        });
+      } else if (d.columns.length > 12 || d.rows.length > 30) {
+        // Large simple tables are valid LaTeX, but rendering dozens of editable
+        // cells in the Visual grid is both noisy and expensive. Preserve the
+        // complete source and expose a compact editable-LaTeX card instead.
+        b.kind = 'raw';
+        Object.assign(b, {
+          tableOversize: true,
+          tableSourceEditable: true,
+          tableFallbackReason: 'oversize',
+          tableRowCount: d.rows.length,
+          tableColumnCount: d.columns.length,
+          tableCaption: d.caption,
+          tableLabel: d.label
+        });
+      } else Object.assign(b, {
         tableSimple: true,
         tableColumns: d.columns,
         tableRows: d.rows,
@@ -664,6 +778,8 @@ export function webviewParserRuntimeSource(): string {
     splitTopItems,
     alignmentFromDirective,
     isOnlyAlignmentDirective,
+    balancedCommandArguments,
+    captionContentData,
     figureData,
     tableData,
     pastedTableData,

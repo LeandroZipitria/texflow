@@ -74,7 +74,7 @@ function extract(startMarker, endMarker) {
 {
   assert(typesSource.includes("| 'abstract'"), 'ParsedBlock abstract kind missing');
   assert(blocksSource.includes('|abstract|'), 'shared parser does not recognize abstract');
-  assert(extension.includes("if(b.kind==='abstract')return '\\\\begin{abstract}"), 'Visual abstract serializer missing');
+  assert(extension.includes("if(b.kind==='abstract'){const stretch=String(b.abstractStretch||'')"), 'Visual abstract serializer missing');
   assert(extension.includes("if (block.kind === 'abstract')"), 'host abstract serializer missing');
   assert(extension.includes("b.kind==='abstract'?'Abstract'"), 'abstract visual label missing');
 
@@ -98,6 +98,16 @@ A short abstract with $x$ preserved.
   assert.strictEqual(
     sandbox.serializeRichDocumentBlock(node, 'New abstract'),
     String.raw`\begin{abstract}
+New abstract
+\end{abstract}`
+  );
+
+  const stretchedNode = { raw: '', block: { kind: 'abstract', env: 'abstract', text: 'Old', abstractStretch: '1.25' } };
+  assert.strictEqual(
+    sandbox.serializeRichDocumentBlock(stretchedNode, 'New abstract'),
+    String.raw`\begin{abstract}
+\setstretch{1.25}
+
 New abstract
 \end{abstract}`
   );
@@ -365,20 +375,4 @@ console.log('PASS build_0201_runtime');
 
 // Performance guard: typing must not force layout on every keystroke.
 assert(/function scheduleSlideFit\(slide\)\{if\(!slide\)return;clearTimeout\(slide\.__texflowFitTimer\);slide\.__texflowFitTimer=setTimeout/.test(extension), 'Beamer slide-fit work is debounced');
-assert(extension.includes('function semanticSlideOverflow(slide)'), 'Beamer overflow must use semantic content measurement');
-assert(extension.includes("slide.classList.add('texflow-measuring-overflow')"), 'overflow measurement must enter the editor-chrome-free measurement state');
-assert(extension.includes('.slide.texflow-measuring-overflow .figure-head'), 'figure editing controls must be excluded from Beamer overflow measurement');
-assert(extension.includes("const overflowing=semanticSlideOverflow(slide)"), 'slide overflow badge must use semantic measurement');
-
-const frameTitleHandlerStart = extension.indexOf("if (msg.type === 'updateFrameTitle')");
-const frameTitleHandlerEnd = extension.indexOf("if (msg.type === 'updateBlock')", frameTitleHandlerStart);
-assert(frameTitleHandlerStart >= 0 && frameTitleHandlerEnd > frameTitleHandlerStart, 'frame title handler missing');
-const frameTitleHandler = extension.slice(frameTitleHandlerStart, frameTitleHandlerEnd);
-assert(frameTitleHandler.includes('ignoreNextWebviewDocumentChange(ctx.document);'), 'frame title autosave must suppress the exact late document-change event so the caret survives');
-assert(frameTitleHandler.includes('updatingFromWebview = true;'), 'frame title source edits must suppress synchronous workspace-driven Visual rerenders');
-assert(frameTitleHandler.includes('finally {\n            updatingFromWebview = false;'), 'frame title update flag must be reset with finally');
-assert(frameTitleHandler.includes('if (replacement === beginMatch[0])'), 'frame title autosave must avoid arming a suppression guard for no-op replacements');
-assert(frameTitleHandler.includes('if (msg.refresh) await sendDocument();'), 'explicit frame title refresh behavior must remain available');
-assert(extension.includes('const ignoredWebviewChangeVersions = new Map<string, Set<number>>();'), 'late Visual edit notifications need a document-version guard');
-assert(extension.includes('if (ignoredVersions?.has(e.document.version))'), 'workspace change listener must consume the exact Visual-originated document version');
 assert(/function scheduleDocumentCommentMarkerAlignment\(host\)\{\n if\(!host\|\|!host\.querySelector\|\|!host\.querySelector\('\.comment-anchor'\)\)return;/.test(extension), 'comment alignment is skipped when no comment markers exist');

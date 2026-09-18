@@ -1,0 +1,29 @@
+\documentclass{article}
+\usepackage{hyperref}
+\usepackage{setspace}
+
+\begin{document}
+
+\title{Nested Metadata Test\thanks{A title note with \protect\href{https://example.com}{a link}.}}
+\author{First Author\thanks{First affiliation.} ~and Second Author\thanks{Second affiliation.}}
+\date{}
+\maketitle
+
+\begin{abstract}
+\setstretch{1.25}
+Abstract text should stay editable without exposing the setstretch command.
+\end{abstract}
+
+\pagebreak{}
+
+\section{Introduction\label{sec:introduction}}
+\medskip{}
+\noindent \textbf{Setting.} This paragraph follows a named vertical skip.
+
+\subsection{Related work}\label{sec:related}
+\bigskip{}
+A second paragraph.
+
+\section{Data\label{sec:data}}
+Text.
+\end{document}

@@ -10,7 +10,7 @@ This document collects possible directions for future development. It is intenti
 
 ## Current baseline
 
-Stable release: **v0.20.1**
+Stable release: **v0.20.6**
 
 The current release includes, among other features:
 
@@ -19,14 +19,15 @@ The current release includes, among other features:
 - project-aware Visual editing across `\input` and `\include` files;
 - direct creation/linking/removal of `\input` and `\include` relationships from Visual;
 - explicit `masterDocument` / `activeDocument` semantics;
-- a project navigator that lists real project files separately from document structure;
+- a workspace-aware project navigator that lists real project files separately from document structure while keeping the VS Code workspace root stable;
 - project-relative file labels and a resizable persistent project/document sidebar;
 - project-wide labels, references, bibliography indexes, and diagnostics;
 - Project Issues for missing, duplicate, and unused references/bibliography items;
 - cross-file navigation between Visual targets and project sources;
 - structured Equation / Matrix / System editing;
 - semantic numbered/unnumbered math and heading transformations;
-- figures, subfigures, and tables including CSV/TSV paste;
+- figures and subfigures with preserved file locations and automatic preview refresh when referenced image files change on disk;
+- tables including CSV/TSV paste, direct LaTeX editing, and compact preserved-LaTeX fallback for large or structurally complex tables;
 - TikZ insertion, Figure properties, inline source editing, PDF preview, Source navigation, and bare-picture → Figure promotion;
 - Beamer frame duplication, movement, disable/restore, blocks, columns, and frame options;
 - comments, TODO, FIXME, Author note, commented-out blocks, and comment navigation;
@@ -39,6 +40,7 @@ The current release includes, among other features:
 - session-scoped TikZ preview temporaries with conservative cleanup;
 - live `TextDocument` re-resolution by URI for robust asynchronous Visual edits without opening Source;
 - optimized project-index construction without adding cache complexity.
+- stable insertion anchors across menus, dialogs, and file pickers for structured Visual insertions.
 
 Validated functionality from the current baseline should not be reopened unless a new feature requires it or a reproducible bug is found.
 

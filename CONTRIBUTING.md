@@ -33,6 +33,10 @@ npm run check
 
 ## Packaging
 
+Start each new release from the current stable baseline in a dedicated version branch. Bump `package.json` and `package-lock.json` to the target release version before producing the first development VSIX.
+
+Do not overwrite a VSIX that has already been used for testing. During development, keep successive packages as distinct artifacts. Reserve the canonical `texflow-X.Y.Z.vsix` filename for the final release candidate after the complete release gate passes.
+
 Use the release gate when preparing a package:
 
 ```bash

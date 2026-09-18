@@ -82,7 +82,7 @@ z &= w`;
   assert.strictEqual(fn('section', false, 'Results'), String.raw`\section{Results}`);
   assert.strictEqual(fn('section', true, 'Results'), String.raw`\section*{Results}`);
   assert.strictEqual(fn('section', false, 'Results'), String.raw`\section{Results}`);
-  assert(src.includes('updateDocumentNode(node,headingLatex(node.command,node.starred,text),refresh,feature)'), 'heading editor must use the tested serializer');
+  assert(src.includes("updateDocumentNode(node,headingLatex(node.command,node.starred,text,currentLabel(),node.headingLabelPlacement||'',node.headingLabelSeparator||''),refresh,feature)"), 'heading editor must use the tested serializer');
 }
 
 // 3. Promoting a bare tikzpicture must preserve it byte-for-byte inside one
