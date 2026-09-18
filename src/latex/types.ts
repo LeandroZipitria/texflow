@@ -69,6 +69,11 @@ export interface ParsedBlock {
   tableVerticalBorders?: boolean[];
   tableHorizontalBorders?: boolean[];
   tableSize?: '' | 'normalsize' | 'small' | 'footnotesize' | 'scriptsize' | 'tiny';
+  tableOversize?: boolean;
+  tableSourceEditable?: boolean;
+  tableFallbackReason?: 'oversize' | 'unsupported';
+  tableRowCount?: number;
+  tableColumnCount?: number;
   spaceAmount?: string;
   spaceStarred?: boolean;
   columnCount?: number;
@@ -78,4 +83,5 @@ export interface ParsedBlock {
   commentText?: string;
   commentNote?: boolean;
   commentTag?: 'TODO' | 'FIXME';
+  abstractStretch?: string;
 }

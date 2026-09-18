@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.20.6 — 2026-09-18
+
+### Added
+- Direct **Edit LaTeX** access for tables from the Visual editor.
+- Compact editable-LaTeX fallback for large tables (more than 30 rows or 12 columns).
+- Compact editable-LaTeX fallback for complex or unsupported table structures instead of forcing unsafe visual conversion.
+- Workspace-aware Projects behavior: the VS Code workspace remains the navigator root while opening a `.tex` file from another project changes the active TeXFlow project.
+
+### Improved
+- General insertion anchors are preserved across menus, dialogs, and file pickers for tables, pasted tables, figures, multi-image figures, TikZ, and structural blocks.
+- Figure import/replacement preserves the selected file in its existing physical location and writes a path relative to the master document instead of copying the image into a TeXFlow-managed folder.
+- Figure previews automatically refresh when the referenced image is overwritten externally while keeping the same filename and path; the `.tex` source does not need to change or be saved.
+- Figure and table Edit panels are more compact while keeping advanced source-preserving operations available.
+- Table captions and labels are handled separately when `\label{...}` is embedded inside `\caption{...}`.
+- Table footnotes preserve their cell position; Beamer table footnotes serialize with frame scope where required.
+
+### Fixed
+- Standard-document metadata no longer duplicates existing `\title`, `\author`, or `\date` commands during Visual editing.
+- `\thanks{...}` metadata remains editable without flattening the surrounding title/author structure.
+- Heading labels remain source-preserved while staying out of ordinary editable heading text.
+- `\smallskip`, `\medskip`, and `\bigskip` are represented as editable spacing instead of leaking as raw text.
+- `\noindent` remains source-preserved without appearing as visible document text.
+- Empty `\pagebreak{}` artifacts are no longer retained as stray editable content.
+- Nonbreaking spaces (`~`) render as nonbreaking spaces in Visual mode.
+- `\setstretch{...}` inside abstracts is represented as editable spacing.
+- Large and structurally complex tables remain editable as preserved LaTeX instead of being rejected or forced through the visual table parser.
+
+### Tests
+- Added/extended regression coverage for document metadata and flow, caption/label separation, table-cell footnotes, large-table fallback, compact object edit panels, workspace Projects behavior, insertion anchors, preserved figure paths, figure preview invalidation, and external same-path image overwrite detection.
+- Added the `table_visual_latex_fallback` fixture for visual, large-table, and complex-table modes.
+- Made `beamer_multi_figure` self-contained by including its fixture image assets.
+
+### Notes
+TeXFlow `0.20.6` strengthens the conservative editing model: supported content stays visual, while large or structurally complex tables remain directly editable as LaTeX. Figure files remain where the user placed them, and Visual previews now follow external image changes without requiring the document to be reopened.
+
 ## 0.20.5 — 2026-09-14
 
 ### Added

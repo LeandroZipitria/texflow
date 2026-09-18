@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { watchFile, unwatchFile, type Stats } from 'fs';
 import { spellcheckBlocks, type SpellcheckLanguage, type SpellcheckResultBlock } from './spellcheck';
 import { parseBlocks, pastedTableData, webviewParserRuntimeSource } from './latex/blocks';
 import type { ParsedBlock } from './latex/types';
@@ -177,22 +178,41 @@ class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectI
   private rootFolderUri: vscode.Uri | undefined;
   private includedBy = new Map<string, string[]>();
 
+  private workspaceRoots(): vscode.Uri[] {
+    return (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri);
+  }
+
+  private navigatorRoots(): vscode.Uri[] {
+    const roots = this.workspaceRoots();
+    if (roots.length) return roots;
+    return this.rootFolderUri ? [this.rootFolderUri] : [];
+  }
+
+  private isActiveProjectFolder(uri: vscode.Uri): boolean {
+    return !!this.rootFolderUri && path.resolve(uri.fsPath) === path.resolve(this.rootFolderUri.fsPath);
+  }
+
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   async restore(): Promise<void> {
     const saved = this.context.workspaceState.get<string>('texflow.projectNavigatorRootDocument');
-    if (!saved) {
-      await vscode.commands.executeCommand('setContext', 'texflow.hasProject', false);
-      return;
+    if (saved) {
+      try {
+        const uri = vscode.Uri.parse(saved);
+        await vscode.workspace.fs.stat(uri);
+        await this.setRootDocument(uri, false);
+        return;
+      } catch {
+        await this.context.workspaceState.update('texflow.projectNavigatorRootDocument', undefined);
+      }
     }
-    try {
-      const uri = vscode.Uri.parse(saved);
-      await vscode.workspace.fs.stat(uri);
-      await this.setRootDocument(uri, false);
-    } catch {
-      await this.context.workspaceState.update('texflow.projectNavigatorRootDocument', undefined);
-      await vscode.commands.executeCommand('setContext', 'texflow.hasProject', false);
-    }
+
+    // The navigator is workspace-scoped even before a TeXFlow project becomes
+    // active. This lets users move between sibling projects directly from the
+    // TeXFlow view instead of first navigating through the VS Code Explorer.
+    const hasWorkspace = this.workspaceRoots().length > 0;
+    await vscode.commands.executeCommand('setContext', 'texflow.hasProject', hasWorkspace);
+    this.refresh();
   }
 
   async setRootDocument(uri: vscode.Uri, persist = true): Promise<void> {
@@ -224,18 +244,28 @@ class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectI
   }
 
   async getChildren(element?: TeXFlowProjectItem): Promise<TeXFlowProjectItem[]> {
-    if (!this.rootFolderUri) return [];
+    const roots = this.navigatorRoots();
+    if (!roots.length) return [];
 
     if (!element) {
-      const rootLabel = path.basename(this.rootFolderUri.fsPath) || this.rootFolderUri.fsPath;
-      return [
-        new TeXFlowProjectItem(
-          this.rootFolderUri,
+      return roots.map((uri, index) => {
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+        const rootLabel = workspaceFolder?.name || path.basename(uri.fsPath) || uri.fsPath;
+        const item = new TeXFlowProjectItem(
+          uri,
           'root',
           rootLabel,
-          vscode.TreeItemCollapsibleState.Expanded
-        )
-      ];
+          roots.length === 1 ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
+        );
+        if (this.isActiveProjectFolder(uri)) {
+          item.description = 'active project';
+          item.tooltip = `${uri.fsPath}
+Active TeXFlow project`;
+        } else if (roots.length > 1) {
+          item.description = `workspace ${index + 1}`;
+        }
+        return item;
+      });
     }
 
     if (element.kind !== 'root' && element.kind !== 'folder') return [];
@@ -243,11 +273,12 @@ class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectI
   }
 
   isWithinRoot(uri: vscode.Uri): boolean {
-    if (!this.rootFolderUri) return false;
-    const root = path.resolve(this.rootFolderUri.fsPath);
     const candidate = path.resolve(uri.fsPath);
-    const rel = path.relative(root, candidate);
-    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+    return this.navigatorRoots().some(rootUri => {
+      const root = path.resolve(rootUri.fsPath);
+      const rel = path.relative(root, candidate);
+      return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+    });
   }
 
   isRelevantResource(uri: vscode.Uri): boolean {
@@ -305,17 +336,21 @@ class TeXFlowProjectNavigator implements vscode.TreeDataProvider<TeXFlowProjectI
         const lower = name.toLowerCase();
         if (TEXFLOW_IGNORED_PROJECT_DIRS.has(lower)) continue;
 
-        const commonResourceFolder = ['figures', 'figure', 'images', 'image', 'img'].includes(lower);
-        if (!commonResourceFolder && !(await this.folderContainsRelevantFiles(child))) continue;
-
-        items.push(
-          new TeXFlowProjectItem(
-            child,
-            'folder',
-            name,
-            vscode.TreeItemCollapsibleState.Collapsed
-          )
+        // Folder contents are loaded only when the user expands them. Showing
+        // folders lazily keeps the navigator workspace-oriented without doing a
+        // recursive scan of every sibling project up front.
+        const item = new TeXFlowProjectItem(
+          child,
+          'folder',
+          name,
+          vscode.TreeItemCollapsibleState.Collapsed
         );
+        if (this.isActiveProjectFolder(child)) {
+          item.description = 'active project';
+          item.tooltip = `${child.fsPath}
+Active TeXFlow project`;
+        }
+        items.push(item);
         continue;
       }
 
@@ -683,14 +718,95 @@ export function activate(context: vscode.ExtensionContext) {
     const tikzPreviewSession = new TikzPreviewSession();
     let rootUri = project.masterDocument.uri;
     let activeUri = project.activeDocument.uri;
+    const initialWebviewResourceRoots = [
+      vscode.Uri.joinPath(context.extensionUri, 'media'),
+      vscode.Uri.joinPath(project.masterDocument.uri, '..'),
+      ...(vscode.workspace.workspaceFolders ?? []).map(f => f.uri)
+    ];
     const panel = vscode.window.createWebviewPanel(
       'texflowVisualEditor',
       project.activeDocument.uri.toString() === project.masterDocument.uri.toString()
         ? `TeXFlow: ${path.basename(project.masterDocument.fileName)}`
         : `TeXFlow: ${path.basename(project.activeDocument.fileName)} · ${path.basename(project.masterDocument.fileName)}`,
       vscode.ViewColumn.Beside,
-      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media'), vscode.Uri.joinPath(project.masterDocument.uri, '..'), ...(vscode.workspace.workspaceFolders ?? []).map(f => f.uri)] }
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: initialWebviewResourceRoots }
     );
+    // Keep localResourceRoots stable for the lifetime of the panel. VS Code may
+    // apply Webview option changes asynchronously, which can race the first image
+    // request after Replace. Figure resources outside these roots are embedded as
+    // data URIs instead of widening/reconfiguring the webview sandbox at runtime.
+    //
+    // Figure previews also need to react when the physical image is overwritten
+    // outside TeXFlow while the LaTeX path stays unchanged. Track each resolved
+    // figure file and refresh Visual when VS Code reports a create/change/delete
+    // event for that exact path. A preview revision is added to local-resource URLs
+    // so Chromium cannot reuse the old bytes for the same filename.
+    let figurePreviewRevision = 0;
+    const figureFileWatchers = new Map<string, vscode.FileSystemWatcher>();
+    const figureFilePollers = new Map<string, { uri: vscode.Uri; listener: (current: Stats, previous: Stats) => void }>();
+    let figureRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let panelDisposed = false;
+
+    const scheduleFigurePreviewRefresh = (uri: vscode.Uri) => {
+      if (panelDisposed) return;
+      if (figureRefreshTimer) clearTimeout(figureRefreshTimer);
+      figureRefreshTimer = setTimeout(() => {
+        figureRefreshTimer = undefined;
+        if (panelDisposed) return;
+        figurePreviewRevision++;
+        output.appendLine(`[figure-refresh] external file changed: ${uri.fsPath}`);
+        void sendDocument().catch(error => {
+          output.appendLine(`[figure-refresh] refresh failed: ${String(error)}`);
+        });
+      }, 180);
+    };
+
+    const syncFigureFileWatchers = (uris: vscode.Uri[]) => {
+      const wanted = new Map<string, vscode.Uri>();
+      for (const uri of uris) wanted.set(uri.toString(), uri);
+
+      for (const [key, watcher] of figureFileWatchers) {
+        if (wanted.has(key)) continue;
+        watcher.dispose();
+        figureFileWatchers.delete(key);
+      }
+      for (const [key, poller] of figureFilePollers) {
+        if (wanted.has(key)) continue;
+        unwatchFile(poller.uri.fsPath, poller.listener);
+        figureFilePollers.delete(key);
+      }
+
+      for (const [key, uri] of wanted) {
+        if (!figureFileWatchers.has(key)) {
+          const watcher = vscode.workspace.createFileSystemWatcher(
+            new vscode.RelativePattern(path.dirname(uri.fsPath), path.basename(uri.fsPath))
+          );
+          watcher.onDidChange(changed => scheduleFigurePreviewRefresh(changed));
+          watcher.onDidCreate(changed => scheduleFigurePreviewRefresh(changed));
+          watcher.onDidDelete(changed => scheduleFigurePreviewRefresh(changed));
+          figureFileWatchers.set(key, watcher);
+        }
+
+        // VS Code's workspace watcher is the fast path, but cloud-backed folders
+        // and atomic same-name replacements do not always emit an event that reaches
+        // the extension host. Node's watchFile polls stat information and therefore
+        // provides a deterministic fallback for the exact physical figure file.
+        if (!figureFilePollers.has(key) && uri.scheme === 'file') {
+          const listener = (current: Stats, previous: Stats) => {
+            if (panelDisposed) return;
+            const changed =
+              current.mtimeMs !== previous.mtimeMs ||
+              current.ctimeMs !== previous.ctimeMs ||
+              current.size !== previous.size ||
+              current.ino !== previous.ino ||
+              current.nlink !== previous.nlink;
+            if (changed) scheduleFigurePreviewRefresh(uri);
+          };
+          watchFile(uri.fsPath, { interval: 500, persistent: false }, listener);
+          figureFilePollers.set(key, { uri, listener });
+        }
+      }
+    };
 
     const nonce = String(Date.now());
     const katexJs = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'katex.min.js'));
@@ -766,8 +882,16 @@ export function activate(context: vscode.ExtensionContext) {
       await refreshProject();
       const pdfUri = await getPdfWebviewUri(project.masterDocument, panel.webview);
       const spellCheckSettings = getSpellCheckSettings(project);
-      const intelligence = await projectIntelligence(project, panel.webview);
-      panel.webview.postMessage({
+      const resolvedFigureFiles = new Map<string, vscode.Uri>();
+      const intelligence = await projectIntelligence(
+        project,
+        panel.webview,
+        initialWebviewResourceRoots,
+        figurePreviewRevision,
+        uri => resolvedFigureFiles.set(uri.toString(), uri)
+      );
+      syncFigureFileWatchers([...resolvedFigureFiles.values()]);
+      await panel.webview.postMessage({
         type: 'document',
         frames: project.frames,
         fileName: project.activeDocument.fileName,
@@ -819,6 +943,51 @@ export function activate(context: vscode.ExtensionContext) {
       if (!frame) return undefined;
       const document = project.documents.get(frame.sourceUri) ?? await vscode.workspace.openTextDocument(vscode.Uri.parse(frame.sourceUri));
       return { frame, document };
+    };
+
+    const insertDocumentBlockAtAnchor = async (code: string, msg: any, offsetDelta = 0): Promise<number | undefined> => {
+      // Keep block insertion tied to the cursor location captured before dialogs
+      // and file pickers take focus. Pending Visual paragraph saves are serialized
+      // first so the structural anchor refers to the same source version.
+      await documentEditQueue;
+      await refreshProject();
+      const document = await vscode.workspace.openTextDocument(activeUri);
+      const source = document.getText();
+      const documentEnd = source.lastIndexOf('\\end{document}');
+      const max = documentEnd >= 0 ? documentEnd : source.length;
+      const anchor = msg && msg.insertAnchor && typeof msg.insertAnchor === 'object' ? msg.insertAnchor : undefined;
+      const split = anchor && anchor.split && typeof anchor.split === 'object' ? anchor.split : undefined;
+
+      if (split) {
+        let start = Number(split.start);
+        let end = Number(split.end);
+        const expected = String(split.expected ?? '');
+        if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start && expected) {
+          start = Math.trunc(start) + offsetDelta;
+          end = Math.trunc(end) + offsetDelta;
+          if (start >= 0 && end <= source.length && source.slice(start, end) === expected) {
+            const before = String(split.before ?? '').trimEnd();
+            const after = String(split.after ?? '').trimStart();
+            const block = String(code || '').trim();
+            const replacement = [before, block, after].filter(part => part.length > 0).join('\n\n');
+            const focusOffset = start + (before ? before.length + 2 : 0);
+            await applyReplacement(document, start, end, replacement);
+            return focusOffset;
+          }
+          vscode.window.showWarningMessage('TeXFlow: the document changed before the object could be inserted. Place the cursor again and retry.');
+          return undefined;
+        }
+      }
+
+      let requested = Number(anchor?.cursorPos ?? msg?.cursorPos);
+      if (Number.isFinite(requested) && offsetDelta) requested += offsetDelta;
+      if (!Number.isFinite(requested) || requested < 0 || requested > max) {
+        vscode.window.showWarningMessage('TeXFlow: place the cursor where you want to insert the object and try again.');
+        return undefined;
+      }
+      const pos = Math.trunc(requested);
+      await applyReplacement(document, pos, pos, `\n\n${String(code || '').trim()}\n\n`);
+      return pos + 2;
     };
     const prepareBeamerCommentEnvironment = async (frameIndex: number) => {
       await refreshProject();
@@ -969,15 +1138,10 @@ export function activate(context: vscode.ExtensionContext) {
             const tikzOffset = code.indexOf('\\begin{tikzpicture}');
             await sendDocument(ctx.frame.index, false, false, undefined, undefined, pos + 2 + tikzOffset);
           } else {
-            const doc = project.activeDocument;
-            const source = doc.getText();
-            const docEnd = source.lastIndexOf('\\end{document}');
-            const max = docEnd >= 0 ? docEnd : source.length;
-            const requested = Number(msg.cursorPos);
-            const pos = Number.isFinite(requested) && requested >= 0 && requested <= max ? Math.trunc(requested) : max;
-            await applyReplacement(doc, pos, pos, `\n\n${code}\n\n`);
+            const insertedAt = await insertDocumentBlockAtAnchor(code, msg);
+            if (!Number.isFinite(insertedAt)) { postStatus('saved'); return; }
             const tikzOffset = code.indexOf('\\begin{tikzpicture}');
-            await sendDocument(undefined, false, false, undefined, undefined, pos + 2 + tikzOffset);
+            await sendDocument(undefined, false, false, undefined, Number(insertedAt), Number(insertedAt) + tikzOffset);
           }
           postStatus('saved');
         }
@@ -1290,6 +1454,7 @@ export function activate(context: vscode.ExtensionContext) {
           } finally {
             updatingFromWebview = false;
           }
+          figurePreviewRevision++;
           await sendDocument();
           postStatus('saved');
         }
@@ -1691,7 +1856,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'showProjectDiagnostics') {
           await refreshProject();
-          const intelligence = await projectIntelligence(project, panel.webview);
+          const intelligence = await projectIntelligence(project, panel.webview, initialWebviewResourceRoots, figurePreviewRevision);
           const frameBlocks = project.frames.flatMap(frame => parseBlocks(frame.body));
           const rawBlocks = frameBlocks.filter(block => block.kind === 'raw').length;
           const resources = await getBibliographyResources(project);
@@ -1733,7 +1898,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'navigateReference') {
           await refreshProject();
-          const intelligence = await projectIntelligence(project, panel.webview);
+          const intelligence = await projectIntelligence(project, panel.webview, initialWebviewResourceRoots, figurePreviewRevision);
           const referenceKey = String(msg.key || '').split(',').map((value: string) => value.trim()).find(Boolean) || '';
           const label = intelligence.index.labels.find(item => item.key === referenceKey);
           if (!label) { vscode.window.showWarningMessage(`TeXFlow: Reference target not found: ${referenceKey}`); return; }
@@ -1741,7 +1906,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'navigateCitation') {
           await refreshProject();
-          const intelligence = await projectIntelligence(project, panel.webview);
+          const intelligence = await projectIntelligence(project, panel.webview, initialWebviewResourceRoots, figurePreviewRevision);
           const citationKey = String(msg.key || '').split(',').map((value: string) => value.trim()).find(Boolean) || '';
           const entry = intelligence.index.bibliographyEntries.find(item => item.key === citationKey);
           if (!entry?.uri) { vscode.window.showWarningMessage(`TeXFlow: Bibliography entry not found: ${citationKey}`); return; }
@@ -1749,7 +1914,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
         if (msg.type === 'navigateBibliographyUsage') {
           await refreshProject();
-          const intelligence = await projectIntelligence(project, panel.webview);
+          const intelligence = await projectIntelligence(project, panel.webview, initialWebviewResourceRoots, figurePreviewRevision);
           const citationKey = String(msg.key || '').trim();
           const usage = intelligence.index.citations.find(item => item.key === citationKey);
           if (!usage) { vscode.window.showInformationMessage(`TeXFlow: No citation usage found for ${citationKey}.`); return; }
@@ -1762,7 +1927,7 @@ export function activate(context: vscode.ExtensionContext) {
           const targetDocument = ctx?.document ?? project.activeDocument;
           const chosen = await chooseMultipleFigureFiles(targetDocument);
           if (!chosen.length) { postStatus('saved'); return; }
-          panel.webview.postMessage({ type:'subfiguresChosen', paths:chosen.map(x=>x.latexPath), frameIndex:Number(msg.frameIndex), cursorPos:Number(msg.cursorPos) });
+          panel.webview.postMessage({ type:'subfiguresChosen', paths:chosen.map(x=>x.latexPath), frameIndex:Number(msg.frameIndex), cursorPos:Number(msg.cursorPos), insertAnchor:msg.insertAnchor });
           postStatus('saved');
         }
         if (msg.type === 'insertFigure') {
@@ -1773,7 +1938,7 @@ export function activate(context: vscode.ExtensionContext) {
           const chosen = await chooseMultipleFigureFiles(targetDocument);
           if (!chosen.length) { postStatus('saved'); return; }
           if (chosen.length > 1) {
-            panel.webview.postMessage({ type:'subfiguresChosen', paths:chosen.map(x=>x.latexPath), frameIndex:Number(msg.frameIndex), cursorPos:Number(msg.cursorPos) });
+            panel.webview.postMessage({ type:'subfiguresChosen', paths:chosen.map(x=>x.latexPath), frameIndex:Number(msg.frameIndex), cursorPos:Number(msg.cursorPos), insertAnchor:msg.insertAnchor });
           } else {
             const one = chosen[0];
             const stem = path.parse(one.latexPath).name.replace(/[^A-Za-z0-9:_-]+/g, '-');
@@ -1782,7 +1947,8 @@ export function activate(context: vscode.ExtensionContext) {
               latexPath: one.latexPath,
               defaultLabel: `fig:${stem}`,
               frameIndex: Number(msg.frameIndex),
-              cursorPos: Number(msg.cursorPos)
+              cursorPos: Number(msg.cursorPos),
+              insertAnchor: msg.insertAnchor
             });
           }
           postStatus('saved');
@@ -1817,14 +1983,9 @@ export function activate(context: vscode.ExtensionContext) {
             await applyReplacement(insertCtx.document, pos, pos, `\n\n${block}\n`);
             await sendDocument(Number(msg.frameIndex), false, false);
           } else {
-            const source = project.activeDocument.getText();
-            const end = source.lastIndexOf('\\end{document}');
-            let requested = Number(msg.cursorPos);
-            if (Number.isFinite(requested) && packageDelta > 0) requested += packageDelta;
-            const pos = Number.isFinite(requested) && requested >= 0 && requested <= (end >= 0 ? end : source.length)
-              ? Math.trunc(requested) : (end >= 0 ? end : source.length);
-            await applyReplacement(project.activeDocument, pos, pos, `\n\n${block}\n\n`);
-            await sendDocument();
+            const insertedAt = await insertDocumentBlockAtAnchor(block, msg, packageDelta);
+            if (!Number.isFinite(insertedAt)) { postStatus('saved'); return; }
+            await sendDocument(undefined, false, false, undefined, Number(insertedAt));
           }
           postStatus('saved');
         }
@@ -1848,25 +2009,32 @@ export function activate(context: vscode.ExtensionContext) {
           const absStart = ctx.frame.start + frameBodyOffset + block.start + localStart;
           const absEnd = ctx.frame.start + frameBodyOffset + block.start + localEnd;
           await applyReplacement(ctx.document, absStart, absEnd, chosen.latexPath);
+          figurePreviewRevision++;
           await sendDocument(ctx.frame.index, false, false);
           postStatus('saved');
         }
         if (msg.type === 'insertLatexTable') {
           postStatus('saving');
           await refreshProject();
-          const parsedTable = pastedTableData(String(msg.latex || ''));
-          if (!parsedTable) {
-            vscode.window.showWarningMessage('TeXFlow: this LaTeX table is not supported for Visual paste.');
+          const pastedRaw = String(msg.latex || '');
+          const normalizedFence = pastedRaw.replace(/^\uFEFF/, '').trim();
+          const fenceMatch = /^```(?:latex|tex)?\s*\n([\s\S]*?)\n```$/i.exec(normalizedFence);
+          const rawTable = String(fenceMatch ? fenceMatch[1] : normalizedFence).trim();
+          const parsedTable = pastedTableData(rawTable);
+          const fullTable = /^\\begin\s*\{\s*table\s*\}\s*(?:\[[^\]]*\])?[\s\S]*\\end\s*\{\s*table\s*\}\s*$/.test(rawTable);
+          const bareTabular = /^\\begin\s*\{\s*tabular\s*\}\s*\{[^}]*\}[\s\S]*\\end\s*\{\s*tabular\s*\}\s*$/.test(rawTable);
+          if (!parsedTable && !fullTable && !bareTabular) {
+            vscode.window.showWarningMessage('TeXFlow: paste a complete table or tabular environment.');
             postStatus('saved');
             return;
           }
           await beginHistoryStep();
           const activeWasMaster = project.activeDocument.uri.toString() === project.masterDocument.uri.toString();
           const activeLengthBeforePackage = project.activeDocument.getText().length;
-          if (parsedTable.tableStyle === 'booktabs') await ensurePackage(project, 'booktabs');
+          if ((parsedTable && parsedTable.tableStyle === 'booktabs') || /\\(?:toprule|midrule|bottomrule|cmidrule|addlinespace)\b/.test(rawTable)) await ensurePackage(project, 'booktabs');
           await refreshProject();
           const packageDelta = activeWasMaster ? project.activeDocument.getText().length - activeLengthBeforePackage : 0;
-          const code = parsedTable.latex;
+          const code = parsedTable ? parsedTable.latex : (fullTable ? rawTable : `\\begin{table}\n\\centering\n${rawTable}\n\\end{table}`);
           if (project.isBeamer) {
             const insertCtx = await getFrameContext(Number(msg.frameIndex));
             if (!insertCtx) throw new Error('TeXFlow could not locate the target frame for the pasted table.');
@@ -1874,14 +2042,9 @@ export function activate(context: vscode.ExtensionContext) {
             await applyReplacement(insertCtx.document, pos, pos, `\n\n${code}\n`);
             await sendDocument(insertCtx.frame.index, false, false);
           } else {
-            const source = project.activeDocument.getText();
-            const docEnd = source.lastIndexOf('\\end{document}');
-            let requested = Number(msg.cursorPos);
-            if (Number.isFinite(requested) && packageDelta > 0) requested += packageDelta;
-            const max = docEnd >= 0 ? docEnd : source.length;
-            const pos = Number.isFinite(requested) && requested >= 0 && requested <= max ? Math.trunc(requested) : max;
-            await applyReplacement(project.activeDocument, pos, pos, `\n\n${code}\n\n`);
-            await sendDocument();
+            const insertedAt = await insertDocumentBlockAtAnchor(code, msg, packageDelta);
+            if (!Number.isFinite(insertedAt)) { postStatus('saved'); return; }
+            await sendDocument(undefined, false, false, undefined, Number(insertedAt));
           }
           postStatus('saved');
         }
@@ -1895,8 +2058,8 @@ export function activate(context: vscode.ExtensionContext) {
           const placement = project.isBeamer ? '' : String(msg.placement || '').trim();
           const tableStyle = normalizeTableVisualStyle(msg.tableStyle);
           const alignments = Array.isArray(msg.alignments) ? msg.alignments.map((x: unknown) => String(x || 'c')) : [];
-          if (!Number.isInteger(rows) || rows < 1 || rows > 30 || !Number.isInteger(cols) || cols < 1 || cols > 12) {
-            vscode.window.showWarningMessage('TeXFlow: tables support 1–30 rows and 1–12 columns.'); postStatus('saved'); return;
+          if (!Number.isInteger(rows) || rows < 1 || rows > 500 || !Number.isInteger(cols) || cols < 1 || cols > 100) {
+            vscode.window.showWarningMessage('TeXFlow: manual table creation supports 1–500 rows and 1–100 columns. Larger existing tables can still be inserted as LaTeX.'); postStatus('saved'); return;
           }
           if (label && !/^[^{}\\\s]+$/.test(label)) {
             vscode.window.showWarningMessage('TeXFlow: labels cannot contain spaces, braces, or backslashes.'); postStatus('saved'); return;
@@ -1921,13 +2084,9 @@ export function activate(context: vscode.ExtensionContext) {
             await applyReplacement(insertCtx.document, pos, pos, `\n\n${block}\n`);
             await sendDocument(msg.frameIndex, false, false);
           } else {
-            const source = project.activeDocument.getText();
-            const docEnd = source.lastIndexOf('\\end{document}');
-            let requested = Number(msg.cursorPos);
-            if (Number.isFinite(requested) && packageDelta > 0) requested += packageDelta;
-            const pos = Number.isFinite(requested) && requested >= 0 && requested <= (docEnd >= 0 ? docEnd : source.length) ? Math.trunc(requested) : (docEnd >= 0 ? docEnd : source.length);
-            await applyReplacement(project.activeDocument, pos, pos, `\n\n${block}\n\n`);
-            await sendDocument();
+            const insertedAt = await insertDocumentBlockAtAnchor(block, msg, packageDelta);
+            if (!Number.isFinite(insertedAt)) { postStatus('saved'); return; }
+            await sendDocument(undefined, false, false, undefined, Number(insertedAt));
           }
           postStatus('saved');
         }
@@ -2062,15 +2221,11 @@ export function activate(context: vscode.ExtensionContext) {
             const tikzLocalOffset = feature === 'tikz' ? code.indexOf('\\begin{tikzpicture}') : -1;
             await sendDocument(ctx.frame.index, false, false, undefined, undefined, tikzLocalOffset >= 0 ? pos + 2 + tikzLocalOffset : undefined);
           } else {
-            const doc = project.activeDocument;
-            const source = doc.getText(); const docEnd = source.lastIndexOf('\\end{document}');
-            let requested = Number(msg.cursorPos);
-            if (activeWasMaster && Number.isFinite(requested)) requested += Math.max(0, source.length - activeLengthBeforeFeature);
-            const max = docEnd >= 0 ? docEnd : source.length;
-            const pos = Number.isFinite(requested) && requested >= 0 && requested <= max ? Math.trunc(requested) : max;
-            await applyReplacement(doc, pos, pos, `\n\n${code}\n\n`);
+            const featureDelta = activeWasMaster ? Math.max(0, project.activeDocument.getText().length - activeLengthBeforeFeature) : 0;
+            const insertedAt = await insertDocumentBlockAtAnchor(code, msg, featureDelta);
+            if (!Number.isFinite(insertedAt)) { postStatus('saved'); return; }
             const tikzLocalOffset = feature === 'tikz' ? code.indexOf('\\begin{tikzpicture}') : -1;
-            await sendDocument(undefined, false, false, undefined, undefined, tikzLocalOffset >= 0 ? pos + 2 + tikzLocalOffset : undefined);
+            await sendDocument(undefined, false, false, undefined, Number(insertedAt), tikzLocalOffset >= 0 ? Number(insertedAt) + tikzLocalOffset : undefined);
           }
           postStatus('saved');
         }
@@ -2368,6 +2523,13 @@ export function activate(context: vscode.ExtensionContext) {
       if (project.documents.has(key)) await sendDocument();
     });
     panel.onDidDispose(() => {
+      panelDisposed = true;
+      if (figureRefreshTimer) clearTimeout(figureRefreshTimer);
+      figureRefreshTimer = undefined;
+      for (const watcher of figureFileWatchers.values()) watcher.dispose();
+      figureFileWatchers.clear();
+      for (const poller of figureFilePollers.values()) unwatchFile(poller.uri.fsPath, poller.listener);
+      figureFilePollers.clear();
       changeSub.dispose();
       void tikzPreviewSession.disposeWhenSafe();
     });
@@ -3041,7 +3203,59 @@ function parseGraphicPaths(source: string): string[] {
   return out;
 }
 
-async function getFigureResources(project: ProjectModel, webview: vscode.Webview): Promise<Record<string, { uri: string; isPdf: boolean; extension: string }>> {
+function uriWithinWebviewRoots(resource: vscode.Uri, roots: vscode.Uri[]): boolean {
+  return roots.some(root => {
+    if (resource.scheme !== root.scheme || resource.authority !== root.authority) return false;
+    if (resource.scheme === 'file') {
+      const relative = path.relative(root.fsPath, resource.fsPath);
+      return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+    }
+    const rootPath = root.path.endsWith('/') ? root.path : `${root.path}/`;
+    return resource.path === root.path || resource.path.startsWith(rootPath);
+  });
+}
+
+function figureMimeType(extension: string): string {
+  if (extension === 'png') return 'image/png';
+  if (extension === 'jpg' || extension === 'jpeg') return 'image/jpeg';
+  if (extension === 'svg') return 'image/svg+xml';
+  if (extension === 'webp') return 'image/webp';
+  if (extension === 'gif') return 'image/gif';
+  if (extension === 'pdf') return 'application/pdf';
+  return 'application/octet-stream';
+}
+
+async function figurePreviewUri(
+  resource: vscode.Uri,
+  stat: vscode.FileStat,
+  extension: string,
+  webview: vscode.Webview,
+  allowedRoots: vscode.Uri[],
+  revision: number
+): Promise<string> {
+  if (uriWithinWebviewRoots(resource, allowedRoots)) {
+    // Include an explicit preview revision as well as file metadata. This forces
+    // a fresh request after either TeXFlow Replace or an external same-path file
+    // overwrite, even when filesystem timestamp granularity is too coarse.
+    return webview.asWebviewUri(resource).with({
+      query: `v=${stat.mtime}-${stat.size}-${revision}`
+    }).toString();
+  }
+
+  // A replacement may intentionally point outside the project/workspace. Do not
+  // copy or move the user's file and do not mutate localResourceRoots after the
+  // webview is live: embed just this resolved preview in the document message.
+  const bytes = await vscode.workspace.fs.readFile(resource);
+  return `data:${figureMimeType(extension)};base64,${Buffer.from(bytes).toString('base64')}`;
+}
+
+async function getFigureResources(
+  project: ProjectModel,
+  webview: vscode.Webview,
+  allowedRoots: vscode.Uri[] = [],
+  revision = 0,
+  onResolvedFigure?: (uri: vscode.Uri) => void
+): Promise<Record<string, { uri: string; isPdf: boolean; extension: string }>> {
   const resources: Record<string, { uri: string; isPdf: boolean; extension: string }> = {};
   const rootDir = vscode.Uri.joinPath(project.masterDocument.uri, '..');
   const graphicPaths = [...project.documents.values()].flatMap(d => parseGraphicPaths(d.getText()));
@@ -3059,16 +3273,32 @@ async function getFigureResources(project: ProjectModel, webview: vscode.Webview
         bases.push(vscode.Uri.joinPath(document.uri, '..', gp));
       }
       let found: vscode.Uri | undefined;
-      for (const base of bases) {
-        for (const ext of extensions) {
-          const candidate = vscode.Uri.joinPath(base, rawPath + (/[.][A-Za-z0-9]+$/.test(rawPath) ? '' : ext));
-          try { await vscode.workspace.fs.stat(candidate); found = candidate; break; } catch { /* try next */ }
-        }
-        if (found) break;
+      let foundStat: vscode.FileStat | undefined;
+      const absoluteCandidate = path.isAbsolute(rawPath) ? vscode.Uri.file(rawPath) : undefined;
+      if (absoluteCandidate) {
+        try {
+          foundStat = await vscode.workspace.fs.stat(absoluteCandidate);
+          found = absoluteCandidate;
+        } catch { /* fall back to the regular LaTeX search below */ }
       }
-      if (!found) continue;
+      if (!found) {
+        for (const base of bases) {
+          for (const ext of extensions) {
+            const candidate = vscode.Uri.joinPath(base, rawPath + (/[.][A-Za-z0-9]+$/.test(rawPath) ? '' : ext));
+            try {
+              foundStat = await vscode.workspace.fs.stat(candidate);
+              found = candidate;
+              break;
+            } catch { /* try next */ }
+          }
+          if (found) break;
+        }
+      }
+      if (!found || !foundStat) continue;
+      onResolvedFigure?.(found);
       const extension = (/[.]([A-Za-z0-9]+)$/.exec(found.path)?.[1] ?? '').toLowerCase();
-      const value = { uri: webview.asWebviewUri(found).toString(), isPdf: extension === 'pdf', extension };
+      const previewUri = await figurePreviewUri(found, foundStat, extension, webview, allowedRoots, revision);
+      const value = { uri: previewUri, isPdf: extension === 'pdf', extension };
       resources[`${document.uri.toString()}|${rawPath}`] = value;
       if (!resources[`*|${rawPath}`]) resources[`*|${rawPath}`] = value;
     }
@@ -3143,7 +3373,10 @@ function structuralProjectIssues(
 
 async function projectIntelligence(
   project: ProjectModel,
-  webview: vscode.Webview
+  webview: vscode.Webview,
+  allowedResourceRoots: vscode.Uri[] = [],
+  figurePreviewRevision = 0,
+  onResolvedFigure?: (uri: vscode.Uri) => void
 ): Promise<{
   bibliographyEntries: BibliographyEntry[];
   figureResources: Record<string, { uri: string; isPdf: boolean; extension: string }>;
@@ -3151,7 +3384,13 @@ async function projectIntelligence(
   issues: ProjectIssue[];
 }> {
   const bibliographyEntries = await getBibliographyEntries(project);
-  const figureResources = await getFigureResources(project, webview);
+  const figureResources = await getFigureResources(
+    project,
+    webview,
+    allowedResourceRoots,
+    figurePreviewRevision,
+    onResolvedFigure
+  );
   const index = projectIndexFor(project, bibliographyEntries);
   const issues = buildProjectIssues(index, structuralProjectIssues(project, index, figureResources));
   return { bibliographyEntries, figureResources, index, issues };
@@ -3430,24 +3669,15 @@ async function ensureGraphicx(document: vscode.TextDocument) {
   await applyReplacement(document, begin, begin, '\\usepackage{graphicx}\n\n');
 }
 
-async function copyExternalFigureIntoProject(rootDir: string, original: vscode.Uri): Promise<{ uri: vscode.Uri; latexPath: string }> {
-  const figuresDir = vscode.Uri.file(path.join(rootDir, 'figures'));
-  await vscode.workspace.fs.createDirectory(figuresDir);
-  const target = vscode.Uri.file(path.join(figuresDir.fsPath, path.basename(original.fsPath)));
-
-  // Some file-system providers do not reliably replace an existing file when
-  // workspace.fs.copy(..., { overwrite: true }) is used. Remove the previous
-  // project copy explicitly so re-importing the same filename always leaves a
-  // single stable figures/<name> file instead of provider-generated -1/-2 copies.
-  try {
-    await vscode.workspace.fs.stat(target);
-    await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });
-  } catch (error) {
-    if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') throw error;
-  }
-
-  await vscode.workspace.fs.copy(original, target, { overwrite: true });
-  return { uri: target, latexPath: path.relative(rootDir, target.fsPath).replace(/\\/g, '/') };
+function figureLatexPathFromDocument(rootDocument: vscode.TextDocument, original: vscode.Uri): string {
+  const rootDir = path.dirname(rootDocument.uri.fsPath);
+  const relative = path.relative(rootDir, original.fsPath);
+  // Preserve the user's chosen file location. LaTeX resolves relative figure
+  // paths from the .tex file, so TeXFlow should not silently copy or rename
+  // graphics. On platforms where path.relative cannot produce a relative path
+  // (for example, different Windows drives), fall back to the absolute path.
+  const value = relative && !path.isAbsolute(relative) ? relative : original.fsPath;
+  return value.replace(/\\/g, '/');
 }
 
 async function chooseFigureFile(rootDocument: vscode.TextDocument): Promise<{ uri: vscode.Uri; latexPath: string } | undefined> {
@@ -3475,21 +3705,14 @@ async function chooseFigureFile(rootDocument: vscode.TextDocument): Promise<{ ur
     return undefined;
   }
 
-  const rootDir = path.dirname(rootDocument.uri.fsPath);
-  let target = original;
-  let relative = path.relative(rootDir, original.fsPath);
-  const outside = relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
-  if (outside) {
-    return copyExternalFigureIntoProject(rootDir, original);
-  }
-  return { uri: target, latexPath: relative.replace(/\\/g, '/') };
+  return { uri: original, latexPath: figureLatexPathFromDocument(rootDocument, original) };
 }
 
 
 async function chooseMultipleFigureFiles(rootDocument: vscode.TextDocument): Promise<{ uri: vscode.Uri; latexPath: string }[]> {
   const picked = await vscode.window.showOpenDialog({canSelectFiles:true,canSelectFolders:false,canSelectMany:true,filters:{Figures:['png','jpg','jpeg','pdf']},openLabel:'Insert figure(s)'});
   if(!picked?.length) return [];
-  const rootDir=path.dirname(rootDocument.uri.fsPath),out:{uri:vscode.Uri;latexPath:string}[]=[];
+  const out:{uri:vscode.Uri;latexPath:string}[]=[];
   for(const original of picked.slice(0,6)){
     const bytes=await vscode.workspace.fs.readFile(original),head=bytes.slice(0,16),ext=path.extname(original.fsPath).toLowerCase();
     const isPdf=head.length>=5&&String.fromCharCode(...head.slice(0,5))==='%PDF-';
@@ -3497,9 +3720,7 @@ async function chooseMultipleFigureFiles(rootDocument: vscode.TextDocument): Pro
     const isJpeg=head.length>=3&&head[0]===0xff&&head[1]===0xd8&&head[2]===0xff;
     const actual=isPdf?'pdf':isPng?'png':isJpeg?'jpeg':'unsupported',expected=ext==='.pdf'?'pdf':ext==='.png'?'png':(ext==='.jpg'||ext==='.jpeg')?'jpeg':'unsupported';
     if(actual==='unsupported'||expected==='unsupported'||actual!==expected){vscode.window.showErrorMessage(`TeXFlow: ${path.basename(original.fsPath)} is not a valid PDF, PNG, or JPEG for pdfLaTeX.`);continue;}
-    let target=original,relative=path.relative(rootDir,original.fsPath);const outside=relative.startsWith('..'+path.sep)||path.isAbsolute(relative);
-    if(outside){out.push(await copyExternalFigureIntoProject(rootDir,original));continue;}
-    out.push({uri:target,latexPath:relative.replace(/\\/g,'/')});
+    out.push({uri:original,latexPath:figureLatexPathFromDocument(rootDocument,original)});
   }
   return out;
 }
@@ -3782,6 +4003,7 @@ function serializeCommentSource(value: unknown, commentNote = false, commentTag?
 }
 
 function serializeBlock(block: ParsedBlock, payload: any): string {
+  if ((block.kind === 'raw' || block.kind === 'table') && typeof payload?.rawSource === 'string') return String(payload.rawSource);
   if (block.kind === 'paragraph') { const text=normalizeEditableText(payload.text); const requested=String(payload.align||''); if(requested==='justify') return text; const env=requested==='left'?'flushleft':requested==='right'?'flushright':requested==='center'?'center':(['flushleft','center','flushright'].includes(String(block.env||''))?String(block.env):''); return env?`\\begin{${env}}\n${text}\n\\end{${env}}`:text; }
   if (block.kind === 'itemize') {
     const env = block.env || 'itemize';
@@ -3819,7 +4041,9 @@ function serializeBlock(block: ParsedBlock, payload: any): string {
     return `\\begin{${env}}\n${normalizeEditableText(payload.text ?? block.text ?? '')}\n\\end{${env}}`;
   }
   if (block.kind === 'abstract') {
-    return `\\begin{abstract}\n${normalizeEditableText(payload.text ?? block.text ?? '')}\n\\end{abstract}`;
+    const stretch = String(payload.abstractStretch ?? block.abstractStretch ?? '').trim().replace(/[{}\\\s]/g, '');
+    const body = normalizeEditableText(payload.text ?? block.text ?? '');
+    return `\\begin{abstract}\n${stretch ? `\\setstretch{${stretch}}\n\n` : ''}${body}\n\\end{abstract}`;
   }
   if (block.kind === 'container') {
     const width = String(payload.width ?? '0.9\\linewidth').trim();
@@ -4017,7 +4241,7 @@ function serializeBlock(block: ParsedBlock, payload: any): string {
 function getHtml(nonce: string, katexJs: vscode.Uri, katexCss: vscode.Uri, cspSource: string): string {
   return String.raw`<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}' ${cspSource}; font-src ${cspSource}; img-src ${cspSource} data: blob:; frame-src ${cspSource}; object-src ${cspSource};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}' ${cspSource}; font-src ${cspSource}; img-src ${cspSource} data: blob:; frame-src ${cspSource} data: blob:; object-src ${cspSource} data: blob:;">
 <link rel="stylesheet" href="${katexCss}">
 <style>
 :root{
@@ -4183,6 +4407,7 @@ body.nav-closed .floating-actions,body.focus-mode .floating-actions{left:10px}
 .table-card{border:1px solid var(--line);border-radius:8px;padding:10px 12px 12px;margin:15px 0;background:color-mix(in srgb,var(--paper) 98%,var(--vscode-editorWidget-background))}.table-head{display:flex;align-items:center;gap:8px;margin-bottom:9px;color:var(--muted);font-size:11px}.table-head .tag{margin-right:auto}.table-controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.table-controls label{display:flex;align-items:center;gap:5px}.table-controls select,.table-fields input{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:5px;padding:4px 6px;font:inherit}.table-scroll{overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--paper)}.semantic-table{border-collapse:collapse;width:100%;min-width:260px}.semantic-table td{border:1px dashed var(--table-guide);padding:7px 9px;min-width:70px;vertical-align:top}.semantic-table.table-style-grid td{border:1px solid var(--table-rule)}.semantic-table td.latex-rule-top{border-top:1px solid var(--table-rule)!important}.semantic-table td.latex-rule-bottom{border-bottom:1px solid var(--table-rule)!important}.semantic-table td.latex-rule-left{border-left:1px solid var(--table-rule)!important}.semantic-table td.latex-rule-right{border-right:1px solid var(--table-rule)!important}.semantic-table td.latex-rule-top-heavy{border-top:2px solid var(--table-rule-heavy)!important}.semantic-table td.latex-rule-bottom-heavy{border-bottom:2px solid var(--table-rule-heavy)!important}.semantic-table td.table-cell-selected:not(:focus){outline:1px solid color-mix(in srgb,var(--table-rule-focus) 72%,transparent);outline-offset:-2px}.semantic-table td[contenteditable=true]:focus{outline:2px solid var(--table-rule-focus);outline-offset:-2px;background:color-mix(in srgb,var(--paper) 94%,var(--table-rule-focus) 6%)}.table-border-tools{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin:0 0 8px;padding:6px 7px;border:1px solid var(--line);border-radius:6px;background:color-mix(in srgb,var(--panel) 88%,transparent)}.table-border-tools.hidden{display:none}.table-border-target{min-width:72px;color:var(--muted);font-size:10px}.table-border-tools button{font:inherit;font-size:10px;padding:3px 7px;border:1px solid var(--line-strong);border-radius:5px;background:var(--input);color:var(--fg);cursor:pointer}.table-border-tools button:hover:not(:disabled){background:var(--hover)}.table-border-tools button.active{border-color:var(--table-rule-focus);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--table-rule-focus) 55%,transparent);color:var(--vscode-foreground)}.table-border-tools button:disabled{opacity:.45;cursor:default}.table-border-sep{width:1px;height:18px;background:var(--line-strong);margin:0 2px}.table-fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.table-fields label{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}.table-fields input{min-width:0;flex:1}.table-column-tools{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0}.table-column-tools label{display:flex;align-items:center;gap:3px;font-size:10px;color:var(--muted)}.table-column-tools select{font-size:10px;padding:2px 4px}.table-actions{display:flex;gap:6px;margin-top:8px}.table-actions button{font-size:11px;padding:4px 8px;border:1px solid var(--line-strong);border-radius:5px;background:var(--input);color:var(--fg);cursor:pointer}.table-actions button:hover{background:var(--hover)}
 .table-size-small .semantic-table{font-size:.91em}.table-size-footnotesize .semantic-table{font-size:.82em}.table-size-scriptsize .semantic-table{font-size:.73em}.table-size-tiny .semantic-table{font-size:.64em}
 .figure-controls{display:flex;gap:7px;align-items:center}.figure-controls input[type=number]{width:54px;padding:3px 4px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--line));border-radius:4px;font:inherit}
+.object-edit-toggle{appearance:none;border:1px solid var(--line-strong);border-radius:5px;background:var(--input);color:var(--fg);font:inherit;font-size:10px;line-height:1;padding:4px 7px;cursor:pointer;white-space:nowrap}.object-edit-toggle:hover{background:var(--hover)}.object-edit-toggle[aria-expanded="true"]{border-color:var(--vscode-focusBorder,var(--accent));color:var(--vscode-foreground)}.object-edit-panel{display:none;align-items:center;gap:7px;flex-wrap:wrap;margin:0 0 8px;padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:color-mix(in srgb,var(--panel) 88%,transparent);color:var(--muted);font-size:11px}.object-edit-panel.open{display:flex}.object-edit-panel label{display:flex;align-items:center;gap:5px;white-space:nowrap}.object-edit-panel input,.object-edit-panel select{min-width:0;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:5px;padding:3px 5px;font:inherit}.object-edit-panel .table-column-tools,.object-edit-panel .table-border-tools{width:100%;margin:0}.doc-figure-fields.primary-only,.table-fields.primary-only{grid-template-columns:1fr}.doc-figure>.texflow-label-badge,.table-card>.texflow-label-badge{display:none}.large-table-card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:15px 0;background:color-mix(in srgb,var(--paper) 98%,var(--vscode-editorWidget-background))}.large-table-head{display:flex;align-items:center;gap:8px}.large-table-head .tag{margin-right:auto}.large-table-note{margin-top:6px;color:var(--muted);font-size:11px}.large-table-source-wrap{display:none;margin-top:8px}.large-table-card.source-open .large-table-source-wrap,.table-card.source-open .large-table-source-wrap{display:block}.table-card.source-open>.object-edit-panel,.table-card.source-open>.table-scroll,.table-card.source-open>.table-actions,.table-card.source-open>.table-fields,.table-card.source-open>.texflow-label-badge{display:none!important}.large-table-source{width:100%;min-height:180px;box-sizing:border-box;resize:vertical;padding:8px;border:1px solid var(--line-strong);border-radius:6px;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-editor-font-family,monospace);font-size:11px;line-height:1.45}.large-table-source-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:6px}.large-table-source-actions button,.large-table-edit{font:inherit;font-size:10px;padding:4px 7px;border:1px solid var(--line-strong);border-radius:5px;background:var(--input);color:var(--fg);cursor:pointer}.large-table-source-actions button:hover,.large-table-edit:hover{background:var(--hover)}
 body.figure-resizing{cursor:nwse-resize!important}body.figure-resizing *{user-select:none!important}
 .raw pre{white-space:pre-wrap;color:var(--muted);font-size:12px;line-height:1.45;margin:6px 0 0}
 .tag{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.65px;margin-bottom:7px}
@@ -4225,7 +4450,7 @@ body{display:flex;flex-direction:column}
 
 .document-continuous-wrap{display:flex;justify-content:center;padding:18px 0 82px}.document-continuous{box-sizing:border-box;width:min(900px,calc(100% - 24px));min-height:520px;margin:0 auto;background:var(--paper);border:1px solid color-mix(in srgb,var(--line-strong) 62%,transparent);border-radius:5px;box-shadow:0 14px 42px rgba(0,0,0,.14);padding:58px 72px 72px;font-size:16px;line-height:1.58;color:var(--fg);position:relative}.document-continuous .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-continuous .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-continuous .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}
 .document-pages{--doc-page-ratio:.7071;--doc-page-pad-x:72px;--doc-page-pad-top:64px;--doc-page-pad-bottom:70px;display:flex;flex-direction:column;align-items:center;gap:34px;padding:10px 0 82px}.document-sheet{box-sizing:border-box;width:min(794px,calc(100% - 24px));aspect-ratio:var(--doc-page-ratio);margin:0 auto;background:var(--paper);border:1px solid color-mix(in srgb,var(--line-strong) 76%,transparent);border-radius:5px;box-shadow:0 18px 52px rgba(0,0,0,.18);padding:var(--doc-page-pad-top) var(--doc-page-pad-x) var(--doc-page-pad-bottom);font-size:16px;line-height:1.58;color:var(--fg);overflow:hidden;position:relative}.document-page-content{height:100%;overflow:hidden}.document-page-number{position:absolute;bottom:18px;left:0;right:0;text-align:center;color:var(--muted);font-size:11px;opacity:.68;pointer-events:none}.document-sheet.page-overflow{box-shadow:0 0 0 1px color-mix(in srgb,var(--vscode-errorForeground) 55%,transparent),0 18px 52px rgba(0,0,0,.18)}.document-sheet.page-overflow:after{content:'Approx. page overflow';position:absolute;right:14px;bottom:15px;padding:3px 6px;border-radius:5px;background:var(--vscode-inputValidation-errorBackground,color-mix(in srgb,var(--vscode-errorForeground) 16%,var(--paper)));color:var(--vscode-inputValidation-errorForeground,var(--vscode-errorForeground));font-size:10px;font-weight:650}.doc-page-break-note{position:absolute;left:14px;bottom:16px;color:var(--muted);font-size:10px;opacity:.55;pointer-events:none}
-.doc-title{text-align:center;margin:18px 0 58px}.doc-metadata-edit{outline:none;border-radius:5px;min-height:1.2em}.doc-metadata-edit:empty:before{content:attr(data-placeholder);color:var(--muted);opacity:.48}.doc-metadata-edit:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-title h1{font-size:2.05em;margin:0 0 12px;font-weight:650}.doc-title>div{color:var(--muted);margin-top:5px}.doc-title .doc-title-heading{display:block;width:100%;font-size:2.05em!important;line-height:1.18;margin:0 0 12px!important;font-weight:650!important;color:var(--fg)}.doc-title .doc-title-author{display:block;width:100%;font-size:1em;font-weight:400;color:var(--muted);margin-top:5px}.doc-heading{scroll-margin-top:72px;color:var(--fg);font-weight:650;position:relative}.doc-heading:focus-within,.doc-heading.doc-heading-selected{padding-right:7.2em}.doc-heading-numbering{display:none;position:absolute;right:0;top:50%;transform:translateY(-50%);align-items:center;gap:5px;padding:4px 7px;border:1px solid var(--line);border-radius:6px;background:var(--vscode-editorWidget-background);color:var(--muted);font-size:10px;font-weight:500;line-height:1;white-space:nowrap;user-select:none}.doc-heading:focus-within .doc-heading-numbering,.doc-heading.doc-heading-selected .doc-heading-numbering{display:flex}.doc-heading-numbering input{margin:0}.doc-heading.level-1{font-size:1.85em;margin:46px 0 22px}.doc-heading.level-2{font-size:1.55em;margin:38px 0 18px}.doc-heading.level-3{font-size:1.27em;margin:30px 0 14px}.doc-heading.level-4{font-size:1.1em;margin:24px 0 12px}.doc-paragraph{margin:0 0 18px;white-space:pre-wrap}.doc-list{margin:10px 0 22px;padding-left:2.1em}.doc-list li{margin:6px 0}.doc-math{position:relative;margin:24px 0;text-align:center;overflow-x:auto;padding:0 2.2em}.doc-equation-number{position:absolute;right:.2em;top:50%;transform:translateY(-50%);font-size:.9em;color:var(--muted)}.doc-equation-numbers{position:absolute;right:.2em;top:0;bottom:0;display:flex;flex-direction:column;justify-content:space-around;font-size:.9em;color:var(--muted);pointer-events:none}.doc-equation-row-number{display:block;min-height:1.2em}.doc-code{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;background:color-mix(in srgb,var(--paper) 88%,var(--fg) 12%);padding:.08em .28em;border-radius:4px}.doc-latex-block{margin:22px 0;padding:14px 18px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 92%,var(--accent) 8%)}.doc-block-title{font-weight:650;margin-bottom:8px}.doc-figure-placeholder{margin:24px auto;padding:32px;border:1px dashed var(--line-strong);text-align:center;color:var(--muted);border-radius:8px}.doc-raw{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.doc-raw pre{white-space:pre-wrap;margin:8px 0 0}.doc-include{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--paper) 97%,var(--vscode-editorWidget-background));display:flex;align-items:center;gap:12px}.doc-include-main{min-width:0;flex:1}.doc-include-kind{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}.doc-include-path{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.doc-include-meta{font-size:10px;color:var(--muted);margin-top:3px}.doc-include-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}.doc-include button{border:1px solid var(--line-strong);border-radius:5px;padding:5px 9px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.doc-include button:hover{background:var(--vscode-button-secondaryHoverBackground)}.doc-include.texflow-semantic-block{position:relative}.doc-include.texflow-semantic-block>.semantic-delete{position:absolute!important;right:-9px!important;top:-11px!important;width:24px!important;height:24px!important;padding:0!important;margin:0!important;border:1px solid var(--line-strong)!important;border-radius:999px!important;background:var(--vscode-editor-background)!important;color:var(--vscode-foreground)!important;font:600 17px/1 var(--vscode-font-family)!important;box-shadow:0 2px 7px rgba(0,0,0,.25)!important;z-index:12}.doc-include.texflow-semantic-block>.semantic-delete:hover{background:var(--vscode-inputValidation-errorBackground,var(--hover))!important;border-color:var(--vscode-inputValidation-errorBorder,var(--line-strong))!important}.doc-include.missing{border-color:var(--vscode-inputValidation-warningBorder,var(--vscode-errorForeground));background:var(--vscode-inputValidation-warningBackground,color-mix(in srgb,var(--paper) 94%,var(--vscode-errorForeground) 6%))}.doc-include.missing .doc-include-kind{color:var(--vscode-inputValidation-warningForeground,var(--vscode-errorForeground))}.doc-mode-note{text-align:right;color:var(--muted);font-size:11px;margin-top:54px}.doc-outline{padding:7px 10px;border-radius:6px;cursor:pointer;color:var(--muted);line-height:1.25}.doc-outline:hover{background:var(--hover);color:var(--fg)}.doc-outline.level-1{font-weight:700;color:var(--fg);margin-top:9px}.doc-outline.level-2{font-weight:600;color:var(--fg);margin-top:7px}.doc-outline.level-3{padding-left:20px;font-size:.94em}.doc-outline.level-4{padding-left:30px;font-size:.9em}.doc-outline-object{font-size:.86em;color:var(--muted);padding-top:5px;padding-bottom:5px}.doc-outline-object.depth-1{padding-left:18px}.doc-outline-object.depth-2{padding-left:26px}.doc-outline-object.depth-3{padding-left:34px}.doc-outline-object.depth-4,.doc-outline-object.depth-5{padding-left:42px}.doc-outline-object .outline-kind{font-size:.82em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:5px}.doc-outline-object .outline-label{color:var(--fg)}.doc-outline-empty{padding:12px 10px;color:var(--muted);font-size:.9em}.project-files-title{margin-top:6px}.project-file-link{appearance:none;width:100%;display:flex;align-items:center;gap:7px;border:0;border-radius:6px;background:transparent;color:var(--muted);font:inherit;font-size:11px;text-align:left;padding:6px 9px;cursor:pointer}.project-file-link:hover{background:var(--hover);color:var(--fg)}.project-file-link.active{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--fg);font-weight:650}.project-file-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-file-role{font-size:8px;font-weight:700;letter-spacing:.06em;color:var(--muted)}.doc-outline-matter{margin:14px 8px 5px;padding-top:8px;border-top:1px solid var(--line);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.doc-heading[data-number]:before{content:attr(data-number) ' ';font-variant-numeric:tabular-nums;font-weight:inherit;color:var(--fg)}.doc-heading.starred:before{content:'◇ ';color:var(--muted);font-size:.72em;vertical-align:.15em}.doc-toc{margin:28px 0 44px;padding:24px 26px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--paper) 98%,var(--fg) 2%)}.doc-toc h2{font-size:1.45em;margin:0 0 16px}.doc-toc-row{display:grid;grid-template-columns:4.7em 1fr;width:100%;border:0;background:transparent;color:var(--fg);font:inherit;text-align:left;padding:5px 4px;border-radius:4px;cursor:pointer}.doc-toc-row:hover{background:var(--hover)}.doc-toc-row.level-2{padding-left:14px}.doc-toc-row.level-3{padding-left:28px}.doc-toc-row.level-4{padding-left:42px;font-size:.94em}.doc-toc-number{font-variant-numeric:tabular-nums;color:var(--muted)}.doc-toc-note,.doc-toc-empty{margin-top:13px;font-size:.82em;color:var(--muted)}.document-pane{overflow:auto;padding:0 18px}.document-pane .document-pages{padding-top:10px}.document-pane .document-continuous-wrap{padding-top:10px}.document-pane .document-continuous{padding:44px 48px 54px}.document-pane .document-sheet{--doc-page-pad-x:48px;--doc-page-pad-top:44px;--doc-page-pad-bottom:54px}.workspace>.document-pages{padding-top:18px}.document-sheet .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-sheet .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-sheet .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-item-editable{min-height:1.4em;padding:1px 3px}.doc-math{cursor:default}.doc-math:hover{background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%);border-radius:6px}
+.doc-title{text-align:center;margin:18px 0 58px}.doc-metadata-edit{outline:none;border-radius:5px;min-height:1.2em}.doc-metadata-edit:empty:before{content:attr(data-placeholder);color:var(--muted);opacity:.48}.doc-metadata-edit:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-title h1{font-size:2.05em;margin:0 0 12px;font-weight:650}.doc-title>div{color:var(--muted);margin-top:5px}.doc-title .doc-title-heading{display:block;width:100%;font-size:2.05em!important;line-height:1.18;margin:0 0 12px!important;font-weight:650!important;color:var(--fg)}.doc-title .doc-title-author{display:block;width:100%;font-size:1em;font-weight:400;color:var(--muted);margin-top:5px}.doc-title .doc-title-date{display:inline-block;min-width:3.2em;font-size:.88em;font-weight:400;color:var(--muted);margin-top:7px}.tex-thanks{display:inline-flex;align-items:center;vertical-align:super;margin-left:.18em;padding:.02em .34em;border:1px solid var(--line-strong);border-radius:999px;background:color-mix(in srgb,var(--paper) 91%,var(--accent) 9%);color:var(--muted);font-size:.46em;font-weight:600;line-height:1.35;cursor:pointer;user-select:none}.doc-title-author .tex-thanks{font-size:.62em}.tex-thanks:hover{border-color:var(--accent);color:var(--fg)}.doc-heading{scroll-margin-top:72px;color:var(--fg);font-weight:650;position:relative}.doc-heading:focus-within,.doc-heading.doc-heading-selected{padding-right:16.5em}.doc-heading-controls{display:none;position:absolute;right:0;top:50%;transform:translateY(-50%);align-items:center;gap:6px;padding:4px 7px;border:1px solid var(--line);border-radius:6px;background:var(--vscode-editorWidget-background);color:var(--muted);font-size:10px;font-weight:500;line-height:1;white-space:nowrap;user-select:none;max-width:16em}.doc-heading:focus-within .doc-heading-controls,.doc-heading.doc-heading-selected .doc-heading-controls{display:flex}.doc-heading-numbering{display:flex;align-items:center;gap:4px}.doc-heading-numbering input{margin:0}.doc-heading-label-edit{display:flex;align-items:center;gap:4px;min-width:0}.doc-heading-label-input{width:8.6em;min-width:0;padding:2px 4px;border:1px solid var(--line-strong);border-radius:4px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);font:inherit}.doc-heading-label-input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:0}.doc-heading.level-1{font-size:1.85em;margin:46px 0 22px}.doc-heading.level-2{font-size:1.55em;margin:38px 0 18px}.doc-heading.level-3{font-size:1.27em;margin:30px 0 14px}.doc-heading.level-4{font-size:1.1em;margin:24px 0 12px}.doc-paragraph{margin:0 0 18px;white-space:pre-wrap}.doc-list{margin:10px 0 22px;padding-left:2.1em}.doc-list li{margin:6px 0}.doc-math{position:relative;margin:24px 0;text-align:center;overflow-x:auto;padding:0 2.2em}.doc-equation-number{position:absolute;right:.2em;top:50%;transform:translateY(-50%);font-size:.9em;color:var(--muted)}.doc-equation-numbers{position:absolute;right:.2em;top:0;bottom:0;display:flex;flex-direction:column;justify-content:space-around;font-size:.9em;color:var(--muted);pointer-events:none}.doc-equation-row-number{display:block;min-height:1.2em}.doc-code{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;background:color-mix(in srgb,var(--paper) 88%,var(--fg) 12%);padding:.08em .28em;border-radius:4px}.doc-latex-block{margin:22px 0;padding:14px 18px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 92%,var(--accent) 8%)}.doc-block-title{font-weight:650;margin-bottom:8px}.doc-figure-placeholder{margin:24px auto;padding:32px;border:1px dashed var(--line-strong);text-align:center;color:var(--muted);border-radius:8px}.doc-raw{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.doc-raw pre{white-space:pre-wrap;margin:8px 0 0}.doc-include{margin:20px 0;padding:12px 14px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--paper) 97%,var(--vscode-editorWidget-background));display:flex;align-items:center;gap:12px}.doc-include-main{min-width:0;flex:1}.doc-include-kind{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px}.doc-include-path{font-family:var(--vscode-editor-font-family,monospace);font-size:.92em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.doc-include-meta{font-size:10px;color:var(--muted);margin-top:3px}.doc-include-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}.doc-include button{border:1px solid var(--line-strong);border-radius:5px;padding:5px 9px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}.doc-include button:hover{background:var(--vscode-button-secondaryHoverBackground)}.doc-include.texflow-semantic-block{position:relative}.doc-include.texflow-semantic-block>.semantic-delete{position:absolute!important;right:-9px!important;top:-11px!important;width:24px!important;height:24px!important;padding:0!important;margin:0!important;border:1px solid var(--line-strong)!important;border-radius:999px!important;background:var(--vscode-editor-background)!important;color:var(--vscode-foreground)!important;font:600 17px/1 var(--vscode-font-family)!important;box-shadow:0 2px 7px rgba(0,0,0,.25)!important;z-index:12}.doc-include.texflow-semantic-block>.semantic-delete:hover{background:var(--vscode-inputValidation-errorBackground,var(--hover))!important;border-color:var(--vscode-inputValidation-errorBorder,var(--line-strong))!important}.doc-include.missing{border-color:var(--vscode-inputValidation-warningBorder,var(--vscode-errorForeground));background:var(--vscode-inputValidation-warningBackground,color-mix(in srgb,var(--paper) 94%,var(--vscode-errorForeground) 6%))}.doc-include.missing .doc-include-kind{color:var(--vscode-inputValidation-warningForeground,var(--vscode-errorForeground))}.doc-mode-note{text-align:right;color:var(--muted);font-size:11px;margin-top:54px}.doc-outline{padding:7px 10px;border-radius:6px;cursor:pointer;color:var(--muted);line-height:1.25}.doc-outline:hover{background:var(--hover);color:var(--fg)}.doc-outline.level-1{font-weight:700;color:var(--fg);margin-top:9px}.doc-outline.level-2{font-weight:600;color:var(--fg);margin-top:7px}.doc-outline.level-3{padding-left:20px;font-size:.94em}.doc-outline.level-4{padding-left:30px;font-size:.9em}.doc-outline-object{font-size:.86em;color:var(--muted);padding-top:5px;padding-bottom:5px}.doc-outline-object.depth-1{padding-left:18px}.doc-outline-object.depth-2{padding-left:26px}.doc-outline-object.depth-3{padding-left:34px}.doc-outline-object.depth-4,.doc-outline-object.depth-5{padding-left:42px}.doc-outline-object .outline-kind{font-size:.82em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:5px}.doc-outline-object .outline-label{color:var(--fg)}.doc-outline-empty{padding:12px 10px;color:var(--muted);font-size:.9em}.project-files-title{margin-top:6px}.project-file-link{appearance:none;width:100%;display:flex;align-items:center;gap:7px;border:0;border-radius:6px;background:transparent;color:var(--muted);font:inherit;font-size:11px;text-align:left;padding:6px 9px;cursor:pointer}.project-file-link:hover{background:var(--hover);color:var(--fg)}.project-file-link.active{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--fg);font-weight:650}.project-file-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-file-role{font-size:8px;font-weight:700;letter-spacing:.06em;color:var(--muted)}.doc-outline-matter{margin:14px 8px 5px;padding-top:8px;border-top:1px solid var(--line);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.doc-heading[data-number]:before{content:attr(data-number) ' ';font-variant-numeric:tabular-nums;font-weight:inherit;color:var(--fg)}.doc-heading.starred:before{content:'◇ ';color:var(--muted);font-size:.72em;vertical-align:.15em}.doc-toc{margin:28px 0 44px;padding:24px 26px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--paper) 98%,var(--fg) 2%)}.doc-toc h2{font-size:1.45em;margin:0 0 16px}.doc-toc-row{display:grid;grid-template-columns:4.7em 1fr;width:100%;border:0;background:transparent;color:var(--fg);font:inherit;text-align:left;padding:5px 4px;border-radius:4px;cursor:pointer}.doc-toc-row:hover{background:var(--hover)}.doc-toc-row.level-2{padding-left:14px}.doc-toc-row.level-3{padding-left:28px}.doc-toc-row.level-4{padding-left:42px;font-size:.94em}.doc-toc-number{font-variant-numeric:tabular-nums;color:var(--muted)}.doc-toc-note,.doc-toc-empty{margin-top:13px;font-size:.82em;color:var(--muted)}.document-pane{overflow:auto;padding:0 18px}.document-pane .document-pages{padding-top:10px}.document-pane .document-continuous-wrap{padding-top:10px}.document-pane .document-continuous{padding:44px 48px 54px}.document-pane .document-sheet{--doc-page-pad-x:48px;--doc-page-pad-top:44px;--doc-page-pad-bottom:54px}.workspace>.document-pages{padding-top:18px}.document-sheet .doc-editable{outline:none;border-radius:4px;transition:background .12s,box-shadow .12s}.document-sheet .doc-editable:hover{background:color-mix(in srgb,var(--paper) 96%,var(--fg) 4%)}.document-sheet .doc-editable:focus{background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}.doc-item-editable{min-height:1.4em;padding:1px 3px}.doc-math{cursor:default}.doc-math:hover{background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%);border-radius:6px}
 .texflow-semantic-block{position:relative;outline:none}.texflow-semantic-block.semantic-block-selected{outline:2px solid color-mix(in srgb,var(--accent) 72%,transparent);outline-offset:5px;border-radius:7px}.semantic-delete{position:absolute;z-index:8;right:-9px;top:-11px;width:24px;height:24px;display:none;align-items:center;justify-content:center;border:1px solid var(--line-strong);border-radius:999px;background:var(--vscode-editor-background);color:var(--vscode-foreground);font:600 17px/1 var(--vscode-font-family);cursor:pointer;box-shadow:0 2px 7px rgba(0,0,0,.25)}.texflow-semantic-block.semantic-block-selected>.semantic-delete{display:flex}.semantic-delete:hover{background:var(--vscode-inputValidation-errorBackground,var(--hover));border-color:var(--vscode-inputValidation-errorBorder,var(--line-strong))}.doc-before-first-slot,.doc-after-block-slot{min-height:18px;margin:-4px 0 8px;border-radius:5px;display:flex;align-items:center;justify-content:flex-start;color:transparent;font-size:11px;cursor:text;outline:none;transition:color .12s,background .12s}.doc-before-first-slot:before,.doc-after-block-slot:before{content:'Start typing…';padding:2px 6px}.doc-before-first-slot:hover,.doc-before-first-slot:focus,.doc-after-block-slot:hover,.doc-after-block-slot:focus{color:var(--muted);background:color-mix(in srgb,var(--paper) 96%,var(--accent) 4%)}
 
 @media(max-width:900px){:root{--sidebar:190px;--toolrail:58px}.main{padding:22px}.slide{padding:30px 34px;min-height:480px}.tool-label{display:none}.menu-trigger,.rail-action{height:45px}.topbar-brand span:last-child{display:none}.mode-tab{padding:6px 8px}}
@@ -4292,7 +4517,7 @@ body{display:flex;flex-direction:column}
 
 .bib-citation{display:inline-flex;align-items:center;gap:.22em;padding:.02em .22em;border-radius:4px;background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--fg);white-space:nowrap}.bib-citation.missing{color:var(--vscode-errorForeground,var(--danger));background:color-mix(in srgb,var(--vscode-errorForeground,var(--danger)) 12%,transparent);box-shadow:inset 0 -2px 0 var(--vscode-errorForeground,var(--danger))}.bib-citation-key{font-size:.72em;color:var(--muted);margin-left:.15em}.tex-reference{display:inline-flex;align-items:center;gap:.28em;padding:.02em .26em;border-radius:4px;background:color-mix(in srgb,var(--vscode-symbolIcon-referenceForeground,var(--accent)) 12%,transparent);color:var(--fg);white-space:nowrap}.tex-reference.missing{color:var(--vscode-errorForeground,var(--danger));background:color-mix(in srgb,var(--vscode-errorForeground,var(--danger)) 12%,transparent);box-shadow:inset 0 -2px 0 var(--vscode-errorForeground,var(--danger))}.tex-reference-kind{font-size:.72em;font-weight:650;color:var(--muted)}.tex-reference-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.74em}.texflow-label-badge{display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none}.doc-math-wrap{position:relative}.doc-math-wrap .texflow-label-badge{position:absolute;right:0;top:0}.doc-heading-selected,.doc-math-wrap.selected{outline:1px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:4px;border-radius:3px}.doc-heading[data-label]::after{content:attr(data-label);display:inline-flex;vertical-align:middle;align-items:center;margin-left:.5em;padding:.12em .38em;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:10px;font-weight:500;line-height:1.2;user-select:none;pointer-events:none}.doc-bibliography{margin:34px 0 10px;padding-top:12px;border-top:1px solid var(--line)}.doc-bibliography h2{font-size:1.45em;margin:0 0 16px}.bib-entry{padding:8px 0;border-bottom:1px solid color-mix(in srgb,var(--line) 65%,transparent);line-height:1.42}.bib-entry:last-child{border-bottom:0}.bib-entry-key{font-family:var(--vscode-editor-font-family,monospace);font-size:.75em;color:var(--muted);margin-left:.45em}.bib-print-placeholder{display:block;margin:14px 0;padding:12px 14px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--paper) 95%,var(--accent) 5%);color:var(--muted)}
 .table-editor-body{padding:16px;overflow:auto;display:grid;gap:14px}.table-editor-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.table-field{display:grid;gap:5px}.table-field.wide{grid-column:1/-1}.table-field label{font-size:11px;color:var(--muted);font-weight:650}.table-input,.table-select{width:100%;box-sizing:border-box;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:7px;padding:8px 10px;font:inherit;outline:none}.table-input:focus,.table-select:focus{border-color:var(--vscode-focusBorder)}.table-alignments{display:flex;flex-wrap:wrap;gap:8px}.table-align-control{display:flex;align-items:center;gap:5px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--panel) 90%,transparent)}.table-align-control span{font-size:11px;color:var(--muted)}.table-align-control select{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:5px;padding:4px 6px}.table-preview-shell{border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;background:var(--vscode-editor-background)}.table-preview{border-collapse:collapse;margin:auto;min-width:260px}.table-preview td{border:1px dashed var(--table-guide);height:28px;min-width:62px;padding:3px 7px;color:var(--muted);font-size:11px}.table-preview.table-style-grid td{border:1px solid var(--table-rule)}.table-validation{min-height:16px;font-size:11px;color:var(--vscode-inputValidation-errorForeground,var(--danger))}@media(max-width:640px){.table-editor-grid{grid-template-columns:1fr}.table-field.wide{grid-column:auto}}
-.tex-footnote,.tex-link,.tex-index,.tex-field,.tex-nomenclature{display:inline-flex;align-items:center;gap:.28em;padding:.03em .3em;margin:0 .05em;border:1px solid var(--line);border-radius:4px;background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);color:var(--fg);font-size:.9em;white-space:nowrap;vertical-align:baseline}.tex-footnote:before{content:'fn';font-size:.68em;font-weight:700;color:var(--accent)}.tex-link:before{content:'↗';color:var(--accent)}.tex-index:before{content:'idx';font-size:.65em;color:var(--muted)}.tex-field:before{content:'ƒ';color:var(--muted)}.tex-nomenclature:before{content:'sym';font-size:.65em;color:var(--muted)}.doc-rich-block{position:relative;margin:18px 0;padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:color-mix(in srgb,var(--paper) 97%,var(--accent) 3%)}.doc-rich-block.comment{border-left:4px solid var(--line-strong);background:color-mix(in srgb,var(--paper) 98%,var(--vscode-editorWidget-background) 2%)}.doc-rich-block.comment.author-note{border-left-color:var(--accent)}.doc-rich-block.comment-block{border-left:4px solid color-mix(in srgb,var(--muted) 65%,var(--line-strong));background:color-mix(in srgb,var(--paper) 96%,var(--vscode-editorWidget-background) 4%)}.commented-preview{opacity:.9}.commented-preview-paragraph{margin:0 0 12px;line-height:1.55}.commented-preview-paragraph:last-child{margin-bottom:0}.commented-preview-heading{font-weight:650;color:var(--vscode-foreground);margin:14px 0 9px;line-height:1.25}.commented-preview-heading.level-chapter{font-size:1.45em}.commented-preview-heading.level-section{font-size:1.28em}.commented-preview-heading.level-subsection{font-size:1.12em}.commented-preview-heading.level-subsubsection,.commented-preview-heading.level-paragraph{font-size:1em}.commented-preview-list{margin:8px 0 14px;padding-left:1.8em}.commented-preview-list li{margin:4px 0}.commented-preview-quote{margin:10px 0;padding:8px 12px;border-left:3px solid var(--line-strong);color:var(--muted)}.commented-preview-include{display:flex;align-items:center;gap:8px;margin:10px 0;padding:7px 9px;border:1px dashed var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.commented-preview-include .commented-preview-include-kind{font-size:.78em;text-transform:uppercase;letter-spacing:.05em;font-weight:700}.commented-preview-include code{color:var(--vscode-foreground)}.commented-source-editor{display:none!important;font-family:var(--vscode-editor-font-family,monospace);font-size:.9em;white-space:pre-wrap;min-height:90px;margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--vscode-editor-background)}.doc-rich-block.comment-block.review-editing .commented-preview{display:none}.doc-rich-block.comment-block.review-editing .commented-source-editor{display:block!important}.doc-rich-block.comment-block.review-editing .review-card-head{margin-bottom:8px}.doc-rich-block.quote{border-left:4px solid var(--line-strong);font-style:italic}.doc-rich-block.theorem{border-left:4px solid var(--accent)}.doc-rich-block.custom-note{border-left:4px solid var(--vscode-editorInfo-foreground,var(--accent));background:color-mix(in srgb,var(--paper) 96%,var(--vscode-editorInfo-foreground,var(--accent)) 4%)}.doc-rich-block.custom-plain{border-color:transparent;background:transparent;padding-left:0;padding-right:0}.doc-rich-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}.review-card-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}.review-card-head .doc-rich-label{flex:1;min-width:0;margin-bottom:0}.review-card-actions{display:flex;align-items:center;gap:5px}.review-card-action{appearance:none;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font:inherit;font-size:10px;line-height:1;padding:5px 7px;cursor:pointer;white-space:nowrap}.review-card-action:hover{background:var(--hover);color:var(--vscode-foreground);border-color:var(--line-strong)}.review-card-action.review-hide{font-size:15px;padding:3px 7px}.review-card-action.review-delete-source:hover{color:var(--vscode-errorForeground);border-color:var(--vscode-errorForeground)}.doc-rich-block.review-collapsed .review-card-body{display:none}.doc-rich-block.review-collapsed .review-card-head{margin-bottom:0}
+.tex-footnote,.tex-link,.tex-index,.tex-field,.tex-nomenclature{display:inline-flex;align-items:center;gap:.28em;padding:.03em .3em;margin:0 .05em;border:1px solid var(--line);border-radius:4px;background:color-mix(in srgb,var(--paper) 94%,var(--accent) 6%);color:var(--fg);font-size:.9em;white-space:nowrap;vertical-align:baseline}.tex-footnote:before{content:'fn';font-size:.68em;font-weight:700;color:var(--accent)}.tex-link:before{content:'↗';color:var(--accent)}.tex-index:before{content:'idx';font-size:.65em;color:var(--muted)}.tex-field:before{content:'ƒ';color:var(--muted)}.tex-nomenclature:before{content:'sym';font-size:.65em;color:var(--muted)}.doc-rich-block{position:relative;margin:18px 0;padding:14px 16px;border:1px solid var(--line);border-radius:8px;background:color-mix(in srgb,var(--paper) 97%,var(--accent) 3%)}.doc-rich-block.comment{border-left:4px solid var(--line-strong);background:color-mix(in srgb,var(--paper) 98%,var(--vscode-editorWidget-background) 2%)}.doc-rich-block.comment.author-note{border-left-color:var(--accent)}.doc-rich-block.comment-block{border-left:4px solid color-mix(in srgb,var(--muted) 65%,var(--line-strong));background:color-mix(in srgb,var(--paper) 96%,var(--vscode-editorWidget-background) 4%)}.commented-preview{opacity:.9}.commented-preview-paragraph{margin:0 0 12px;line-height:1.55}.commented-preview-paragraph:last-child{margin-bottom:0}.commented-preview-heading{font-weight:650;color:var(--vscode-foreground);margin:14px 0 9px;line-height:1.25}.commented-preview-heading.level-chapter{font-size:1.45em}.commented-preview-heading.level-section{font-size:1.28em}.commented-preview-heading.level-subsection{font-size:1.12em}.commented-preview-heading.level-subsubsection,.commented-preview-heading.level-paragraph{font-size:1em}.commented-preview-list{margin:8px 0 14px;padding-left:1.8em}.commented-preview-list li{margin:4px 0}.commented-preview-quote{margin:10px 0;padding:8px 12px;border-left:3px solid var(--line-strong);color:var(--muted)}.commented-preview-include{display:flex;align-items:center;gap:8px;margin:10px 0;padding:7px 9px;border:1px dashed var(--line);border-radius:6px;color:var(--muted);font-size:.9em}.commented-preview-include .commented-preview-include-kind{font-size:.78em;text-transform:uppercase;letter-spacing:.05em;font-weight:700}.commented-preview-include code{color:var(--vscode-foreground)}.commented-source-editor{display:none!important;font-family:var(--vscode-editor-font-family,monospace);font-size:.9em;white-space:pre-wrap;min-height:90px;margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--vscode-editor-background)}.doc-rich-block.comment-block.review-editing .commented-preview{display:none}.doc-rich-block.comment-block.review-editing .commented-source-editor{display:block!important}.doc-rich-block.comment-block.review-editing .review-card-head{margin-bottom:8px}.doc-rich-block.quote{border-left:4px solid var(--line-strong);font-style:italic}.doc-rich-block.theorem{border-left:4px solid var(--accent)}.doc-rich-block.custom-note{border-left:4px solid var(--vscode-editorInfo-foreground,var(--accent));background:color-mix(in srgb,var(--paper) 96%,var(--vscode-editorInfo-foreground,var(--accent)) 4%)}.doc-rich-block.custom-plain{border-color:transparent;background:transparent;padding-left:0;padding-right:0}.doc-rich-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}.doc-rich-block.abstract .doc-rich-label{display:flex;align-items:center;gap:8px}.doc-abstract-stretch-control{display:flex;align-items:center;gap:4px;margin-left:auto;text-transform:none;letter-spacing:0;font-weight:500;color:var(--muted)}.doc-abstract-stretch-input{width:4.4em;padding:2px 4px;border:1px solid var(--line-strong);border-radius:4px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);font:inherit;font-variant-numeric:tabular-nums}.doc-abstract-stretch-input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:0}.review-card-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}.review-card-head .doc-rich-label{flex:1;min-width:0;margin-bottom:0}.review-card-actions{display:flex;align-items:center;gap:5px}.review-card-action{appearance:none;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font:inherit;font-size:10px;line-height:1;padding:5px 7px;cursor:pointer;white-space:nowrap}.review-card-action:hover{background:var(--hover);color:var(--vscode-foreground);border-color:var(--line-strong)}.review-card-action.review-hide{font-size:15px;padding:3px 7px}.review-card-action.review-delete-source:hover{color:var(--vscode-errorForeground);border-color:var(--vscode-errorForeground)}.doc-rich-block.review-collapsed .review-card-body{display:none}.doc-rich-block.review-collapsed .review-card-head{margin-bottom:0}
 .comment-anchor{position:relative;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:visible!important;z-index:15;box-shadow:none!important}
 .block.comment-anchor:hover{box-shadow:none!important;background:transparent!important}
 .comment-marker{position:absolute;right:4px;top:-12px;width:24px;height:24px;padding:0;border:1px solid var(--line-strong);border-radius:5px;background:var(--vscode-editorWidget-background);color:var(--vscode-foreground);font:700 11px/1 var(--vscode-font-family);cursor:pointer;display:grid;place-items:center;box-shadow:0 3px 10px rgba(0,0,0,.18);z-index:20}
@@ -4337,7 +4562,7 @@ body.project-issues-open .main{padding-bottom:calc(100px + clamp(210px,34vh,380p
 .project-issue-row:hover{background:var(--hover)}.project-issue-row.no-location{cursor:default}.project-issue-severity{font-size:10px;font-weight:700;text-transform:uppercase}.project-issue-main{min-width:0}.project-issue-message{font-size:12px}.project-issue-context{margin-top:2px;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.project-issue-file{font-size:10px;color:var(--muted);white-space:nowrap}
 @media(max-width:1050px){.project-issues{left:0}body.project-issues-open .main{padding-bottom:calc(70px + clamp(210px,34vh,380px))}.active-file-indicator{display:none}}
 .doc-break{position:relative;height:28px;margin:18px 0;border-top:1px dashed var(--line-strong);color:var(--muted);font-size:10px;text-align:center;padding-top:5px}.labs-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.labs-form-grid label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:11px}.labs-form-grid label.wide{grid-column:1/-1}.labs-form-grid input,.labs-form-grid textarea,.labs-form-grid select{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:7px 8px;font:inherit}.labs-feature-note{font-size:10px;color:var(--muted);margin-top:8px}
-.tex-hspace{display:inline-flex;align-items:center;justify-content:center;min-width:.45em;height:1em;margin:0 .08em;padding:0 .18em;border:1px dashed color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:3px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:.68em;vertical-align:middle;white-space:nowrap}.doc-vspace,.vspace-block{position:relative;min-height:18px;margin:8px 0;border-left:2px dotted color-mix(in srgb,var(--accent) 55%,transparent);background:linear-gradient(to bottom,transparent 45%,color-mix(in srgb,var(--accent) 10%,transparent) 45%,color-mix(in srgb,var(--accent) 10%,transparent) 55%,transparent 55%);border-radius:3px}.doc-vspace .vspace-label,.vspace-block .vspace-label{position:absolute;left:7px;top:50%;transform:translateY(-50%);padding:1px 5px;background:var(--paper,var(--panel));color:var(--muted);font-size:10px;font-family:var(--vscode-editor-font-family,monospace)}.spacing-modal-body{padding:16px;display:grid;gap:13px}.spacing-type-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.spacing-type-row button{padding:10px;border:1px solid var(--line-strong);border-radius:8px;background:var(--input);color:var(--fg);cursor:pointer}.spacing-type-row button.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--input))}.spacing-presets{display:flex;gap:7px;flex-wrap:wrap}.spacing-presets button{padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--fg);cursor:pointer}.spacing-presets button:hover{background:var(--hover)}
+.tex-hspace{display:inline-flex;align-items:center;justify-content:center;min-width:.45em;height:1em;margin:0 .08em;padding:0 .18em;border:1px dashed color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:3px;color:var(--muted);font-family:var(--vscode-editor-font-family,monospace);font-size:.68em;vertical-align:middle;white-space:nowrap}.doc-vspace,.vspace-block{position:relative;min-height:18px;margin:8px 0;border-left:2px dotted color-mix(in srgb,var(--accent) 55%,transparent);background:linear-gradient(to bottom,transparent 45%,color-mix(in srgb,var(--accent) 10%,transparent) 45%,color-mix(in srgb,var(--accent) 10%,transparent) 55%,transparent 55%);border-radius:3px}.doc-vspace .vspace-label,.vspace-block .vspace-label{position:absolute;left:7px;top:50%;transform:translateY(-50%);padding:1px 5px;background:var(--paper,var(--panel));color:var(--muted);font-size:10px;font-family:var(--vscode-editor-font-family,monospace)}.doc-vspace-named{border-left:0;background:transparent;min-height:0;margin:0;cursor:pointer}.doc-vspace-named[title=smallskip]{height:.55em}.doc-vspace-named[title=medskip]{height:1em}.doc-vspace-named[title=bigskip]{height:1.6em}.doc-vspace-named .vspace-label{left:3px;opacity:0;padding:0 3px;font-size:9px;background:color-mix(in srgb,var(--paper,var(--panel)) 90%,transparent);transition:opacity .12s}.doc-vspace-named:hover .vspace-label,.doc-vspace-named.semantic-selected .vspace-label{opacity:.55}.spacing-modal-body{padding:16px;display:grid;gap:13px}.spacing-type-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.spacing-type-row button{padding:10px;border:1px solid var(--line-strong);border-radius:8px;background:var(--input);color:var(--fg);cursor:pointer}.spacing-type-row button.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--input))}.spacing-presets{display:flex;gap:7px;flex-wrap:wrap}.spacing-presets button{padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--fg);cursor:pointer}.spacing-presets button:hover{background:var(--hover)}
 .cite-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.46);display:none;align-items:center;justify-content:center;z-index:260}.cite-modal-backdrop.open{display:flex}.cite-modal{width:min(760px,calc(100vw - 34px));max-height:min(720px,calc(100vh - 34px));display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line-strong);border-radius:14px;box-shadow:0 28px 70px rgba(0,0,0,.42);overflow:hidden}.cite-modal-head,.cite-modal-foot{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}.cite-modal-foot{border-bottom:0;border-top:1px solid var(--line);justify-content:flex-end}.cite-modal-body{padding:14px;overflow:auto}.cite-search-row{display:grid;grid-template-columns:1fr 150px;gap:10px;margin-bottom:12px}.cite-search,.cite-style{width:100%;box-sizing:border-box;background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:7px;padding:8px 10px;font:inherit}.cite-results{display:flex;flex-direction:column;gap:7px}.cite-result{display:grid;grid-template-columns:22px 1fr;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer;background:transparent;color:var(--fg);text-align:left}.cite-result:hover{background:var(--hover)}.cite-result.selected{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}.cite-result-main{min-width:0}.cite-result-title{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cite-result-meta{font-size:.82em;color:var(--muted);margin-top:2px}.cite-empty{padding:20px;color:var(--muted);text-align:center}.cite-check{align-self:center}.cite-close,.cite-cancel,.cite-insert,.cite-secondary{border:1px solid var(--line-strong);background:var(--button);color:var(--button-fg);border-radius:7px;padding:7px 11px;cursor:pointer}.cite-insert{background:var(--accent);color:var(--accent-fg);border-color:transparent}.cite-secondary{background:transparent;color:var(--fg)}.cite-secondary:disabled,.cite-insert:disabled{opacity:.45;cursor:default}.cite-preview{font-size:.78em;color:var(--muted);display:block;margin-top:2px}.cite-menu-subtitle{margin-top:8px;padding-top:9px;border-top:1px solid var(--line)}.doc-outline-bibliography{font-weight:650;color:var(--fg);margin-top:9px}.doc-outline-bibliography.pending{color:var(--muted);font-weight:500;font-style:italic}
 
 .settings-shell{display:grid;grid-template-columns:minmax(280px,420px) minmax(0,1fr);gap:16px;padding:18px;min-height:100%;box-sizing:border-box}.settings-card{border:1px solid var(--line);border-radius:10px;background:var(--paper);padding:16px}.settings-card h3{margin:0 0 12px;font-size:14px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settings-field{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--muted)}.settings-field.wide{grid-column:1/-1}.settings-field input,.settings-field select,.settings-field textarea{background:var(--input);color:var(--fg);border:1px solid var(--line-strong);border-radius:6px;padding:7px 8px;font:inherit}.settings-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}.settings-note{font-size:11px;color:var(--muted);line-height:1.45;margin-top:10px}.doc-columns,.columns-card{display:grid;gap:10px;margin:18px 0}.columns-grid{display:grid;gap:10px}.doc-column,.column-edit{min-height:90px;padding:10px;border:1px solid var(--line);border-radius:7px;background:color-mix(in srgb,var(--paper) 97%,var(--accent) 3%);outline:none}
@@ -4368,6 +4593,7 @@ body.project-issues-open .main{padding-bottom:calc(100px + clamp(210px,34vh,380p
 .slide.texflow-measuring-overflow .table-border-tools,
 .slide.texflow-measuring-overflow .table-actions,
 .slide.texflow-measuring-overflow .table-fields{display:none!important}
+.slide.texflow-measuring-overflow .object-edit-panel{display:none!important}
 .slide.texflow-measuring-overflow .figure-card{padding:0!important;border-color:transparent!important;background:transparent!important;box-shadow:none!important}
 .slide.texflow-measuring-overflow .figure-stage{min-height:0!important;padding:0!important;border-color:transparent!important;background:transparent!important}
 .slide.texflow-measuring-overflow .multi-figure-item{padding:0!important;border-color:transparent!important;background:transparent!important}
@@ -4447,8 +4673,8 @@ body.project-issues-open .main{padding-bottom:calc(100px + clamp(210px,34vh,380p
     <div class="table-editor-body">
       <div class="table-editor-grid">
         <div class="table-field wide"><button class="cite-secondary" id="table-paste-data" type="button">Paste LaTeX / CSV / TSV…</button></div>
-        <div class="table-field"><label for="table-rows">Rows</label><input class="table-input" id="table-rows" type="number" min="1" max="30" value="3"></div>
-        <div class="table-field"><label for="table-cols">Columns</label><input class="table-input" id="table-cols" type="number" min="1" max="12" value="3"></div>
+        <div class="table-field"><label for="table-rows">Rows</label><input class="table-input" id="table-rows" type="number" min="1" max="500" value="3"></div>
+        <div class="table-field"><label for="table-cols">Columns</label><input class="table-input" id="table-cols" type="number" min="1" max="100" value="3"></div>
         <div class="table-field wide"><label for="table-caption">Caption (optional)</label><input class="table-input" id="table-caption" type="text" placeholder="Table caption"></div>
         <div class="table-field"><label for="table-label">Label (optional)</label><input class="table-input" id="table-label" type="text" spellcheck="false" placeholder="tab:results"></div>
         <div class="table-field" id="table-placement-field"><label for="table-placement">Placement</label><select class="table-select" id="table-placement"><option value="htbp">htbp — recommended</option><option value="h">h — here</option><option value="t">t — top</option><option value="b">b — bottom</option><option value="p">p — float page</option><option value="">Default — no option</option></select></div>
@@ -4664,7 +4890,7 @@ let activeEditable=null;const saveTimers=new WeakMap();function scheduleSave(el,
    Structural actions already request refresh explicitly with save(true). */
 function flushSave(el,send){const old=saveTimers.get(el);if(old)clearTimeout(old);send(false);}
 function markdownToLatex(text){
- let x=String(text??'').replace(/\u200B/g,'');
+ let x=String(text??'').replace(/\u200B/g,'').replace(/\u00A0/g,'~');
  x=x.replace(/\*\*([^*\n]+)\*\*/g,'\\textbf{$1}');
  x=x.replace(/(^|[^*])\*([^*\n]+)\*/g,'$1\\textit{$2}');
  x=x.replace(/==([^=\n]+)==/g,'\\alert{$1}');
@@ -4680,10 +4906,17 @@ function citedBibliographyEntries(){const src=String(documentSource||'');if(/\\n
 function bibliographyHtml(nodeId=''){const id=nodeId?' id="'+esc(nodeId)+'"':'';const entries=citedBibliographyEntries();if(!bibliographyEntries.length)return '<section'+id+' class="doc-bibliography"><h2>Bibliography</h2><div class="cite-empty">No bibliography entries loaded. Open the connected .bib file in VS Code to add references.</div></section>';if(!entries.length)return '<section'+id+' class="doc-bibliography"><h2>Bibliography</h2><div class="cite-empty">No cited references yet. The compiled bibliography will update as citations are added.</div></section>';return '<section'+id+' class="doc-bibliography"><h2>Bibliography</h2><div class="cite-empty" style="padding:0 0 8px;text-align:left">'+entries.length+' cited reference'+(entries.length===1?'':'s')+' · preview</div>'+entries.map(bibliographyEntryHtml).join('')+'</section>';}
 function refreshBibliographyPreviews(){document.querySelectorAll('.doc-bibliography:not(.doc-bibliography-pending)').forEach(section=>{const tmp=document.createElement('div');tmp.innerHTML=bibliographyHtml(section.id||'');const fresh=tmp.firstElementChild;if(fresh)section.innerHTML=fresh.innerHTML;});}
 
+function replaceBalancedInlineCommand(source,command,onValue){
+ const text=String(source??''),needle='\\'+String(command||'')+'{';let out='',cursor=0,from=0;
+ while((from=text.indexOf(needle,cursor))>=0){let depth=1,close=-1;for(let i=from+needle.length;i<text.length;i++){const ch=text[i];if(ch==='\\'){i++;continue;}if(ch==='{')depth++;else if(ch==='}'){depth--;if(depth===0){close=i;break;}}}if(close<0)break;out+=text.slice(cursor,from)+onValue(text.slice(from+needle.length,close));cursor=close+1;}
+ return out+text.slice(cursor);
+}
 function latexToHtml(text){
  let source=String(text??'');
- const inlineMath=[],displayMath=[],citations=[],references=[],hspaces=[],footnotes=[],links=[],indexes=[],fields=[],nomenclatures=[];
- source=source.replace(/\\footnote\{([^{}]*)\}/g,(_,text)=>{const i=footnotes.push({text})-1;return '@@TEXFLOW_FOOTNOTE_'+i+'@@';});
+ const inlineMath=[],displayMath=[],citations=[],references=[],hspaces=[],footnotes=[],links=[],indexes=[],fields=[],nomenclatures=[],thanks=[];
+ source=replaceBalancedInlineCommand(source,'thanks',value=>{const i=thanks.push(value)-1;return '@@TEXFLOW_THANKS_'+i+'@@';});
+ source=source.replace(/(^|[^\\])~/g,'$1\u00A0');
+ source=source.replace(/\\footnote(?:\[([^\]]+)\])?\{([^{}]*)\}/g,(_,option,text)=>{const i=footnotes.push({text,option:String(option||'')})-1;return '@@TEXFLOW_FOOTNOTE_'+i+'@@';});
  source=source.replace(/\\href\{([^{}]*)\}\{([^{}]*)\}/g,(_,url,label)=>{const i=links.push({url,label,kind:'href'})-1;return '@@TEXFLOW_LINK_'+i+'@@';});
  source=source.replace(/\\url\{([^{}]*)\}/g,(_,url)=>{const i=links.push({url,label:url,kind:'url'})-1;return '@@TEXFLOW_LINK_'+i+'@@';});
  source=source.replace(/\\index\{([^{}]*)\}/g,(_,text)=>{const i=indexes.push(text)-1;return '@@TEXFLOW_INDEX_'+i+'@@';});
@@ -4710,7 +4943,8 @@ function latexToHtml(text){
      .replace(/\\key\{([^{}]*)\}/g,'<span class="inline-key" data-tex-command="key">$1</span>')
      .replace(/\\alert\{([^{}]*)\}/g,'<span class="inline-alert" data-tex-command="alert">$1</span>');
  }
- x=x.replace(/@@TEXFLOW_FOOTNOTE_(\d+)@@/g,(_,idx)=>{const f=footnotes[Number(idx)]||{text:''};return '<span class="tex-footnote" contenteditable="false" data-footnote="'+encodeURIComponent(f.text)+'" title="'+esc(f.text)+'">'+esc((f.text||'footnote').slice(0,36))+'</span><span class="math-caret-anchor">&#8203;</span>';});
+ x=x.replace(/@@TEXFLOW_THANKS_(\d+)@@/g,(_,idx)=>{const value=thanks[Number(idx)]||'';return '<span class="tex-thanks" contenteditable="false" data-thanks="'+encodeURIComponent(value)+'" title="'+esc('Thanks: '+value.replace(/\\protect\b/g,''))+'">thanks</span><span class="math-caret-anchor">&#8203;</span>';});
+ x=x.replace(/@@TEXFLOW_FOOTNOTE_(\d+)@@/g,(_,idx)=>{const f=footnotes[Number(idx)]||{text:'',option:''};return '<span class="tex-footnote" contenteditable="false" data-footnote="'+encodeURIComponent(f.text)+'" data-footnote-option="'+esc(f.option||'')+'" title="'+esc(f.text)+'">'+esc((f.text||'footnote').slice(0,36))+'</span><span class="math-caret-anchor">&#8203;</span>';});
  x=x.replace(/@@TEXFLOW_LINK_(\d+)@@/g,(_,idx)=>{const l=links[Number(idx)]||{url:'',label:'',kind:'url'};return '<span class="tex-link" contenteditable="false" data-link-kind="'+esc(l.kind)+'" data-link-url="'+encodeURIComponent(l.url)+'" data-link-label="'+encodeURIComponent(l.label)+'">'+esc(l.label||l.url)+'</span><span class="math-caret-anchor">&#8203;</span>';});
  x=x.replace(/@@TEXFLOW_INDEX_(\d+)@@/g,(_,idx)=>'<span class="tex-index" contenteditable="false" data-index="'+encodeURIComponent(indexes[Number(idx)]||'')+'">'+esc(indexes[Number(idx)]||'index')+'</span><span class="math-caret-anchor">&#8203;</span>');
  x=x.replace(/@@TEXFLOW_NOMENCLATURE_(\d+)@@/g,(_,idx)=>{const n=nomenclatures[Number(idx)]||{symbol:'',description:''};return '<span class="tex-nomenclature" contenteditable="false" data-symbol="'+encodeURIComponent(n.symbol)+'" data-description="'+encodeURIComponent(n.description)+'">'+esc(n.symbol)+'</span><span class="math-caret-anchor">&#8203;</span>';});
@@ -4808,7 +5042,8 @@ function nodeToLatex(node){
  if(el.classList&&el.classList.contains('bib-citation'))return '\\'+(el.dataset.citeCommand||'cite')+'{'+(el.dataset.citeKeys||'')+'}';
  if(el.classList&&el.classList.contains('tex-reference'))return '\\'+(el.dataset.refCommand||'ref')+'{'+(el.dataset.refKey||'')+'}';
  if(el.classList&&el.classList.contains('tex-hspace'))return '\\hspace'+(el.dataset.spaceStarred==='true'?'*':'')+'{'+(el.dataset.spaceAmount||'')+'}';
- if(el.classList&&el.classList.contains('tex-footnote'))return '\\footnote{'+decodeURIComponent(el.dataset.footnote||'')+'}';
+ if(el.classList&&el.classList.contains('tex-thanks'))return '\\thanks{'+decodeURIComponent(el.dataset.thanks||'')+'}';
+ if(el.classList&&el.classList.contains('tex-footnote')){const option=String(el.dataset.footnoteOption||'');return '\\footnote'+(option?'['+option+']':'')+'{'+decodeURIComponent(el.dataset.footnote||'')+'}';}
  if(el.classList&&el.classList.contains('tex-link')){const kind=el.dataset.linkKind||'url',url=decodeURIComponent(el.dataset.linkUrl||''),label=decodeURIComponent(el.dataset.linkLabel||'');return kind==='href'?'\\href{'+url+'}{'+label+'}':'\\url{'+url+'}';}
  if(el.classList&&el.classList.contains('tex-index'))return '\\index{'+decodeURIComponent(el.dataset.index||'')+'}';
  if(el.classList&&el.classList.contains('tex-nomenclature'))return '\\nomenclature{'+decodeURIComponent(el.dataset.symbol||'')+'}{'+decodeURIComponent(el.dataset.description||'')+'}';
@@ -5179,6 +5414,12 @@ let documentRefs={},documentFlowById={},documentFlowOrder=[],documentLabels=[];
 function configuredCustomEnvironmentBlock(block){const raw=String(block&&block.raw||'').trim();if(!raw||!Array.isArray(customEnvironments)||!customEnvironments.length)return block;for(const spec of customEnvironments){const name=String(spec&&spec.name||'');if(!name)continue;const open='\\begin{'+name+'}',close='\\end{'+name+'}';if(!raw.startsWith(open)||!raw.endsWith(close))continue;const inner=raw.slice(open.length,raw.length-close.length);return{...block,kind:'customenv',env:name,text:inner.replace(/^\s*\n?/,'').replace(/\n?\s*$/,''),customTitle:String(spec.title||name),customVisualType:String(spec.visualType||'box')};}return block;}
 function parseDocumentChunk(raw,base,out,nextId){
  const source=String(raw||'');
+ function balancedEnd(openAt,openChar,closeChar){let depth=0;for(let i=openAt;i<source.length;i++){const ch=source[i];if(ch==='\\'){i++;continue;}if(ch===openChar)depth++;else if(ch===closeChar){depth--;if(depth===0)return i+1;}}return-1;}
+ function metadataCommandEnd(afterCommand){
+  let cursor=afterCommand;while(/\s/.test(source[cursor]||''))cursor++;
+  if(source[cursor]==='['){const optionalEnd=balancedEnd(cursor,'[',']');if(optionalEnd<0)return afterCommand;cursor=optionalEnd;while(/\s/.test(source[cursor]||''))cursor++;}
+  if(source[cursor]!=='{')return afterCommand;const requiredEnd=balancedEnd(cursor,'{','}');return requiredEnd<0?afterCommand:requiredEnd;
+ }
  function parseSegment(a,b){
   if(b<=a)return;let cur=a;const display=/\\\[([\s\S]*?)\\\]/g;display.lastIndex=a;let m;
   function pushPlain(x,y){
@@ -5192,8 +5433,18 @@ function parseDocumentChunk(raw,base,out,nextId){
   while((m=display.exec(source))&&m.index<b){if(display.lastIndex>b)break;if(documentTokenIsCommented(source,m.index))continue;pushPlain(cur,m.index);const rawEq=m[0];out.push({kind:'block',id:'doc-b'+nextId(),start:base+m.index,end:base+display.lastIndex,raw:rawEq,block:{id:'doc-eq',kind:'equation',raw:rawEq,env:'display',text:String(m[1]||'').trim(),align:'center'}});cur=display.lastIndex;}
   pushPlain(cur,b);
  }
- let cur=0,m;const title=/\\maketitle\b/g;
- while((m=title.exec(source))){parseSegment(cur,m.index);cur=title.lastIndex;}
+ let cur=0,m;const hidden=/\\(title|subtitle|author|institute|date)\b|\\maketitle\b/g;
+ while((m=hidden.exec(source))){
+  if(documentTokenIsCommented(source,m.index))continue;
+  // Metadata declarations are represented by the dedicated Visual metadata
+  // fields, regardless of whether they live before or after \begin{document}
+  // or whether the active project document is the master file. Rendering them
+  // again as ordinary body text creates duplicate title/author/date content.
+  parseSegment(cur,m.index);
+  let end=hidden.lastIndex;
+  if(m[1]){end=metadataCommandEnd(hidden.lastIndex);hidden.lastIndex=Math.max(hidden.lastIndex,end);}
+  cur=end;
+ }
  parseSegment(cur,source.length);
 }
 function documentTokenIsCommented(source,pos){
@@ -5222,7 +5473,16 @@ function parseDocumentFlow(){
  // but are intentionally invisible in the visual body. TOC is rendered from the same
  // heading tree used by the document navigator. input/include are represented as
  // read-only project links rather than generic "LaTeX preserved" blocks.
- const tokenRe=/\\(chapter|section|subsection|subsubsection|paragraph)(\*)?\{([^}]*)\}|\\(tableofcontents|printbibliography|frontmatter|mainmatter|backmatter)\b|\\(bibliographystyle|bibliography)\{([^}]*)\}|\\(input|include)\s*\{([^}]+)\}/g;let m;
+ const tokenRe=/\\(chapter|section|subsection|subsubsection|paragraph)(\*)?\b|\\(tableofcontents|printbibliography|frontmatter|mainmatter|backmatter)\b|\\(bibliographystyle|bibliography)\{([^}]*)\}|\\(input|include)\s*\{([^}]+)\}/g;let m;
+ function balancedClose(openAt){let depth=0;for(let i=openAt;i<body.length;i++){const ch=body[i];if(ch==='\\'){i++;continue;}if(ch==='{')depth++;else if(ch==='}'){depth--;if(depth===0)return i;}}return-1;}
+ function headingToken(match){
+  const command=match[1],starred=!!match[2];let open=tokenRe.lastIndex;while(/\s/.test(body[open]||''))open++;if(body[open]!=='{')return null;
+  const close=balancedClose(open);if(close<0)return null;const inside=body.slice(open+1,close);let title=inside,label='',placement='',separator='';
+  const nested=/\\label\{([^{}]+)\}/.exec(inside);if(nested){label=String(nested[1]||'').trim();title=(inside.slice(0,nested.index)+inside.slice(nested.index+nested[0].length)).trim();placement='inside';}
+  let end=close+1;
+  if(!label){const tail=body.slice(end),after=/^([ \t\r\n]*)\\label\{([^{}]+)\}/.exec(tail);if(after){separator=String(after[1]||'');label=String(after[2]||'').trim();placement='after';end+=after[0].length;}}
+  return{command,starred,title,label,placement,separator,end,raw:body.slice(match.index,end)};
+ }
  function pushChunk(a,b){
   let start=a;
   // A label immediately following a heading belongs to that heading structurally.
@@ -5247,27 +5507,28 @@ function parseDocumentFlow(){
   if(documentTokenIsCommented(body,m.index))continue;
   pushChunk(cur,m.index);
   if(m[1]){
-   const command=m[1],starred=!!m[2],title=m[3]||'';
+   const h=headingToken(m);if(!h){cur=tokenRe.lastIndex;continue;}tokenRe.lastIndex=h.end;
+   const command=h.command,starred=h.starred,title=h.title;
    const level=command==='chapter'?1:command==='section'?(documentClass==='article'?1:2):command==='subsection'?(documentClass==='article'?2:3):command==='subsubsection'?(documentClass==='article'?3:4):5;
-   out.push({kind:'heading',id:'doc-h'+nextId(),level,title,command,starred,start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
-  }else if(m[4]==='tableofcontents'){
+   out.push({kind:'heading',id:'doc-h'+nextId(),level,title,command,starred,label:h.label||'',headingLabelPlacement:h.placement||'',headingLabelSeparator:h.separator||'',start:info.start+m.index,end:info.start+h.end,raw:h.raw});
+  }else if(m[3]==='tableofcontents'){
    out.push({kind:'toc',id:'doc-toc'+nextId(),start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
-  }else if(m[4]==='printbibliography'){
+  }else if(m[3]==='printbibliography'){
    out.push({kind:'bibliography',id:'doc-bib'+nextId(),start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
-  }else if(m[5]==='bibliography'){
+  }else if(m[4]==='bibliography'){
    out.push({kind:'bibliography',id:'doc-bib'+nextId(),start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
-  }else if(m[5]==='bibliographystyle'){
+  }else if(m[4]==='bibliographystyle'){
    /* style command is metadata; preserve in Source, do not render */
-  }else if(m[7]){
+  }else if(m[6]){
    const absStart=info.start+m.index,absEnd=info.start+tokenRe.lastIndex;
    const ref=projectIncludes.find(r=>r.sourceUri===activeUri&&Number(r.start)===absStart);
    out.push({
     kind:'include',id:'doc-include'+nextId(),start:absStart,end:absEnd,raw:m[0],
-    includeCommand:m[7],includeTarget:String(m[8]||'').trim(),
+    includeCommand:m[6],includeTarget:String(m[7]||'').trim(),
     targetUri:ref&&ref.targetUri||'',missing:!!(ref&&ref.missing)
    });
   }else{
-   out.push({kind:'matter',id:'doc-matter'+nextId(),matter:m[4],start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
+   out.push({kind:'matter',id:'doc-matter'+nextId(),matter:m[3],start:info.start+m.index,end:info.start+tokenRe.lastIndex,raw:m[0]});
   }
   cur=tokenRe.lastIndex;
  }
@@ -5279,7 +5540,7 @@ function parseDocumentFlow(){
  while((lm=labelRe.exec(body))){
   if(documentTokenIsCommented(body,lm.index))continue;
   const key=String(lm[1]||'').trim(),abs=info.start+lm.index;if(!key)continue;let target=null;
-  for(const node of out){if(Number(node.start)<=abs&&abs<Number(node.end)){if(node.kind==='block'&&node.block&&['equation','figure','table'].includes(node.block.kind))target=node;break;}}
+  for(const node of out){if(Number(node.start)<=abs&&abs<Number(node.end)){if(node.kind==='heading'||(node.kind==='block'&&node.block&&['equation','figure','table'].includes(node.block.kind)))target=node;break;}}
   if(!target){for(let i=out.length-1;i>=0;i--){const node=out[i],eligible=node.kind==='heading'||(node.kind==='block'&&node.block&&['equation','figure','table'].includes(node.block.kind));if(!eligible||Number(node.end)>abs)continue;const between=documentSource.slice(Number(node.end),abs);if(/^\s*$/.test(between))target=node;break;}}
   const targetKind=target?(target.kind==='heading'?target.command:(target.block&&target.block.kind)||'block'):'unattached';
   const item={key,pos:abs,targetId:target&&target.id||'',targetKind};documentLabels.push(item);
@@ -5347,18 +5608,47 @@ function renderDocumentOutline(nav){
  if(bibliographyResources.length&&!flow.some(x=>x.kind==='bibliography')){const row=document.createElement('div');row.className='doc-outline doc-outline-bibliography pending';row.textContent='Bibliography (not inserted)';nav.appendChild(row);}
  if(!found){const empty=document.createElement('div');empty.className='doc-outline-empty';empty.textContent='No structure found';nav.appendChild(empty);}
 }
+function objectEditPanel(root){
+ if(!root)return null;const head=root.querySelector('.figure-head,.table-head');if(!head)return null;
+ // Avoid :scope here: older/electron webviews can reject it and abort the
+ // entire object binder, leaving every advanced control permanently visible.
+ let button=head.querySelector('.object-edit-toggle'),panel=[...root.children].find(x=>x&&x.classList&&x.classList.contains('object-edit-panel'))||null;
+ if(!button){button=document.createElement('button');button.type='button';button.className='object-edit-toggle';button.textContent='Edit';button.setAttribute('aria-expanded','false');button.setAttribute('data-texflow-ui','true');head.appendChild(button);}
+ if(!panel){panel=document.createElement('div');panel.className='object-edit-panel';panel.setAttribute('data-texflow-ui','true');head.after(panel);}
+ button.onclick=e=>{e.preventDefault();e.stopPropagation();const open=!panel.classList.contains('open');panel.classList.toggle('open',open);button.textContent=open?'Done':'Edit';button.setAttribute('aria-expanded',open?'true':'false');};
+ return panel;
+}
+function moveAdvancedControl(panel,node){if(panel&&node)panel.appendChild(node);}
+function tableSizeControl(panel,currentSize){if(!panel)return null;let select=panel.querySelector('.table-size-input');if(select)return select;const label=document.createElement('label');label.className='table-size-control';label.innerHTML='<span>Size</span><select class="table-size-input"><option value="">Default</option><option value="normalsize">Normal</option><option value="small">Small</option><option value="footnotesize">Footnotesize</option><option value="scriptsize">Scriptsize</option><option value="tiny">Tiny</option></select>';panel.appendChild(label);select=label.querySelector('select');select.value=String(currentSize||'');return select;}
+function placementControl(panel,currentPlacement,kind){if(!panel)return null;let select=panel.querySelector('.'+kind+'-placement-input');if(select)return select;const label=document.createElement('label');label.innerHTML='<span>Place</span><select class="'+kind+'-placement-input"><option value="">default</option><option value="htbp">htbp</option><option value="h">h</option><option value="t">t</option><option value="b">b</option><option value="p">p</option></select>';panel.appendChild(label);select=label.querySelector('select');select.value=String(currentPlacement||'');return select;}
+function configureFigureEditPanel(root,currentPlacement=''){
+ const panel=objectEditPanel(root);if(!panel)return panel;
+ ['.figure-angle-input','.figure-lock','.height-control','.figure-layout-input','.figure-align-input','.figure-caption-position-input','.figure-short-caption-input','.figure-label-input'].forEach(sel=>{const control=root.querySelector(sel);if(!control)return;const node=control.classList&&control.classList.contains('height-control')?control:(control.closest?control.closest('label'):null);moveAdvancedControl(panel,node||control);});
+ let placement=root.querySelector('.figure-placement-input');if(placement){moveAdvancedControl(panel,placement.closest('label'));}else placement=placementControl(panel,currentPlacement,'figure');
+ const fields=root.querySelector('.doc-figure-fields');if(fields)fields.classList.add('primary-only');return panel;
+}
+function configureTableEditPanel(root,currentSize='',currentPlacement=''){
+ const panel=objectEditPanel(root);if(!panel)return panel;
+ const controls=root.querySelector('.table-controls');if(controls)moveAdvancedControl(panel,controls);
+ const columns=root.querySelector('.table-column-tools');if(columns)moveAdvancedControl(panel,columns);
+ const borders=root.querySelector('.table-border-tools');if(borders)moveAdvancedControl(panel,borders);
+ const labelInput=root.querySelector('.table-label-input');if(labelInput)moveAdvancedControl(panel,labelInput.closest('label'));
+ let placement=root.querySelector('.table-placement-input');if(!placement&&currentPlacement!==undefined)placement=placementControl(panel,currentPlacement,'table');
+ const size=tableSizeControl(panel,currentSize);const fields=root.querySelector('.table-fields');if(fields)fields.classList.add('primary-only');return{panel,size,placement};
+}
 function documentFigureHtml(node,b){
  const raw=String(b.raw||''),paths=[...raw.matchAll(/\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/g)].map(m=>String(m[1]||'')),tikzMatch=/\\begin\{tikzpicture\}(?:\[[^\]]*\])?[\s\S]*?\\end\{tikzpicture\}/.exec(raw),isTikz=!!tikzMatch;
  const res=figureResources['*|'+(b.figurePath||'')]||null,width=relativeWidth(b),caption=b.figureCaption||'',shortCaption=b.figureShortCaption||'',angle=Number(b.figureAngle)||0,label=b.label||b.figureLabel||'',placement=b.figurePlacement||'',captionPosition=b.figureCaptionPosition||'below',align=b.figureAlign||b.align||'center';
  function oneMedia(path){const r=figureResources['*|'+path]||null;if(r){if(r.isPdf)return '<object data="'+esc(r.uri)+'#toolbar=0&navpanes=0" type="application/pdf"><div class="figure-placeholder">PDF figure<br>'+esc(path)+'</div></object>';return '<img src="'+esc(r.uri)+'" alt="'+esc(path)+'">';}return '<div class="figure-placeholder">Figure not found<br>'+esc(path)+'</div>';}
  let media='';if(isTikz){const ts=Number(node.start||0)+Number(tikzMatch.index||0),te=ts+tikzMatch[0].length;media=tikzCardHtml(node.id+'-tikz',tikzMatch[0],activeUri,ts,te,'document','',true);}else if(paths.length>1){media='<div class="subfigure-grid">'+paths.map(path=>'<div class="subfigure-item">'+oneMedia(path)+'<div class="subfigure-name">'+esc(path)+'</div></div>').join('')+'</div>';}else if(paths.length===1)media=oneMedia(paths[0]);else if(res){media=res.isPdf?'<object data="'+esc(res.uri)+'#toolbar=0&navpanes=0" type="application/pdf"><div class="figure-placeholder">PDF figure<br>'+esc(b.figurePath||'')+'</div></object>':'<img src="'+esc(res.uri)+'" alt="'+esc(b.figurePath||'')+'">';}else media='<div class="figure-placeholder">Figure not found<br>'+esc(b.figurePath||'')+'</div>';
  const isFloat=String(b.env||'')==='figure',group=paths.length>1,tag=isTikz?'TikZ figure':(group?'Subfigures':'Figure'),name=isTikz?'TikZ drawing':(group?(paths.length+' images'):(b.figurePath||'image'));
- const imageSizing=isTikz?'':'<label>W(%) <input class="figure-width-input" type="number" min="5" max="100" step="1" value="'+Math.round(width)+'"></label><label>Rotate <input class="figure-angle-input" type="number" min="-360" max="360" step="1" value="'+angle+'">°</label>'+(group?'':'<button type="button" class="figure-replace-action document-figure-replace" title="Replace" aria-label="Replace figure">Rep…</button>');
+ const primary=isTikz?'':'<label>W(%) <input class="figure-width-input" type="number" min="5" max="100" step="1" value="'+Math.round(width)+'"></label>'+(group?'':'<button type="button" class="figure-replace-action document-figure-replace" title="Replace" aria-label="Replace figure">Rep…</button>');
+ const advanced=(isTikz?'':'<label>Rotate <input class="figure-angle-input" type="number" min="-360" max="360" step="1" value="'+angle+'">°</label>')+(group?'<label>Layout <select class="figure-layout-input"><option value="side-by-side"'+(String(b.figureLayout||'side-by-side')==='side-by-side'?' selected':'')+'>Side by side</option><option value="stacked"'+(String(b.figureLayout||'')==='stacked'?' selected':'')+'>Stacked</option></select></label>':'')+(isFloat?'<label>Align <select class="figure-align-input"><option value="left"'+(align==='left'?' selected':'')+'>Left</option><option value="center"'+(align==='center'?' selected':'')+'>Center</option><option value="right"'+(align==='right'?' selected':'')+'>Right</option></select></label><label>Caption <select class="figure-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label><label>Place <select class="figure-placement-input"><option value=""'+(!placement?' selected':'')+'>default</option><option value="htbp"'+(placement==='htbp'?' selected':'')+'>htbp</option><option value="h"'+(placement==='h'?' selected':'')+'>h</option><option value="t"'+(placement==='t'?' selected':'')+'>t</option><option value="b"'+(placement==='b'?' selected':'')+'>b</option><option value="p"'+(placement==='p'?' selected':'')+'>p</option></select></label><label>Short caption <input class="figure-short-caption-input" type="text" value="'+esc(shortCaption)+'"></label><label>Label <input class="figure-label-input" type="text" value="'+esc(label)+'" spellcheck="false"></label>':'');
  return '<div class="doc-figure figure figure-card'+(isTikz?' tikz-figure':'')+'" data-node-id="'+node.id+'">'+
-  '<div class="figure-head"><span class="tag">'+tag+'</span><span class="figure-name">'+esc(name)+'</span><div class="figure-controls">'+imageSizing+
-  (isFloat?'<label>Align <select class="figure-align-input"><option value="left"'+(align==='left'?' selected':'')+'>Left</option><option value="center"'+(align==='center'?' selected':'')+'>Center</option><option value="right"'+(align==='right'?' selected':'')+'>Right</option></select></label><label>Caption <select class="figure-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label><label>Place <select class="figure-placement-input"><option value=""'+(!placement?' selected':'')+'>default</option><option value="htbp"'+(placement==='htbp'?' selected':'')+'>htbp</option><option value="h"'+(placement==='h'?' selected':'')+'>h</option><option value="t"'+(placement==='t'?' selected':'')+'>t</option><option value="b"'+(placement==='b'?' selected':'')+'>b</option><option value="p"'+(placement==='p'?' selected':'')+'>p</option></select></label>':'')+'</div></div>'+
+  '<div class="figure-head"><span class="tag">'+tag+'</span><span class="figure-name">'+esc(name)+'</span><div class="figure-controls">'+primary+'</div><button type="button" class="object-edit-toggle" aria-expanded="false" data-texflow-ui="true">Edit</button></div>'+
+  '<div class="object-edit-panel" data-texflow-ui="true">'+advanced+'</div>'+
   '<div class="figure-stage '+alignClass(align,'center')+'"><div class="figure-visual'+(res&&res.isPdf?' pdf':'')+'" style="width:'+(isTikz||group?100:width)+'%"><div class="figure-media">'+media+'</div>'+(isTikz?'':'<span class="figure-size">'+(group?'group':Math.round(width)+'%')+'</span><span class="figure-resize" title="Drag to resize"></span>')+'</div></div>'+
-  (isFloat?'<div class="doc-figure-fields"><label>Caption <input class="figure-caption-input" type="text" value="'+esc(caption)+'"></label><label>Short caption <input class="figure-short-caption-input" type="text" value="'+esc(shortCaption)+'"></label><label>Label <input class="figure-label-input" type="text" value="'+esc(label)+'" spellcheck="false"></label></div>':'')+
+  (isFloat?'<div class="doc-figure-fields primary-only"><label>Caption <input class="figure-caption-input" type="text" value="'+esc(caption)+'"></label></div>':'')+
   (label?'<span class="texflow-label-badge" contenteditable="false">'+esc(label)+'</span>':'')+'</div>';
 }
 function escapeLatexPlainText(value){const text=String(value??'');let out='';for(let i=0;i<text.length;i++){const ch=text[i],prev=i?text[i-1]:'';if('#$%&_'.includes(ch)&&prev!=='\\')out+='\\'+ch;else out+=ch;}return out;}
@@ -5375,6 +5665,7 @@ function serializeDocumentFigure(node,payload){
  return raw;
 }
 function bindDocumentFigure(el,node){
+ configureFigureEditPanel(el,node&&node.block?node.block.figurePlacement||'':'');
  const visual=el.querySelector('.figure-visual'),stage=el.querySelector('.figure-stage'),wi=el.querySelector('.figure-width-input'),angleInput=el.querySelector('.figure-angle-input'),size=el.querySelector('.figure-size'),caption=el.querySelector('.figure-caption-input'),shortCaption=el.querySelector('.figure-short-caption-input'),label=el.querySelector('.figure-label-input'),align=el.querySelector('.figure-align-input'),placement=el.querySelector('.figure-placement-input'),captionPosition=el.querySelector('.figure-caption-position-input'),replaceButton=el.querySelector('.document-figure-replace');
  const payload=()=>({width:wi?Math.max(5,Math.min(100,Number(wi.value)||70))/100:undefined,angle:angleInput?Number(angleInput.value)||0:undefined,caption:caption?caption.value:'',shortCaption:shortCaption?shortCaption.value:'',label:label?label.value:'',align:align?align.value:'center',placement:placement?placement.value:'',captionPosition:captionPosition?captionPosition.value:'below'});
  const save=()=>updateDocumentNode(node,serializeDocumentFigure(node,payload()),true);
@@ -5415,10 +5706,11 @@ function tableStyleOptions(style){return '<option value="plain"'+(style==='plain
 function tableColumnSpecVisual(columns,style,verticalBorders){if(style==='plain'||style==='booktabs')return columns.join('');const borders=style==='grid'?Array.from({length:columns.length+1},()=>true):tableBorderArray(verticalBorders,columns.length+1);let spec='';columns.forEach((col,i)=>{if(borders[i])spec+='|';spec+=col;});if(borders[columns.length])spec+='|';return spec;}
 function appendTableRowsVisual(lines,rows,style,horizontalBorders){if(style==='booktabs')lines.push('\\toprule');const borders=style==='grid'?Array.from({length:rows.length+1},()=>true):tableBorderArray(horizontalBorders,rows.length+1);if((style==='grid'||style==='custom')&&borders[0])lines.push('\\hline');rows.forEach((r,i)=>{lines.push(r.map(x=>String(x??'').replace(/\r?\n/g,' ')).join(' & ')+' \\\\');if(style==='booktabs'&&i===0&&rows.length>1)lines.push('\\midrule');if((style==='grid'||style==='custom')&&borders[i+1])lines.push('\\hline');});if(style==='booktabs')lines.push('\\bottomrule');}
 function documentTableHtml(node,b){
- const cols=b.tableColumns||[],rows=b.tableRows||[],caption=b.tableCaption||'',label=b.label||b.tableLabel||'',placement=b.tablePlacement||'',captionPosition=b.tableCaptionPosition||'below',tableStyle=tableVisualStyle(b.tableStyle||'plain'),verticalBorders=tableBorderArray(b.tableVerticalBorders,cols.length+1),horizontalBorders=tableBorderArray(b.tableHorizontalBorders,rows.length+1);
+ const cols=b.tableColumns||[],rows=b.tableRows||[],caption=b.tableCaption||'',label=b.label||b.tableLabel||'',placement=b.tablePlacement||'',captionPosition=b.tableCaptionPosition||'below',tableStyle=tableVisualStyle(b.tableStyle||'plain'),verticalBorders=tableBorderArray(b.tableVerticalBorders,cols.length+1),horizontalBorders=tableBorderArray(b.tableHorizontalBorders,rows.length+1),tableSize=String(b.tableSize||'');
  const colTools=cols.map((c,i)=>'<label>C'+(i+1)+' <select class="table-col-align" data-col="'+i+'"><option value="l"'+(c==='l'?' selected':'')+'>L</option><option value="c"'+(c==='c'?' selected':'')+'>C</option><option value="r"'+(c==='r'?' selected':'')+'>R</option></select></label>').join('');
  const body=rows.map((r,ri)=>'<tr>'+r.map((cell,ci)=>'<td class="doc-table-cell doc-editable '+tableCellRuleClasses(tableStyle,ri,ci,rows.length,cols.length,verticalBorders,horizontalBorders)+'" data-row="'+ri+'" data-col="'+ci+'" contenteditable="true">'+latexToHtml(cell||'')+'</td>').join('')+'</tr>').join('');
- return '<div class="doc-table table-card" data-node-id="'+node.id+'"><div class="table-head"><span class="tag">Table</span><div class="table-controls"><label>Borders <select class="table-style-input">'+tableStyleOptions(tableStyle)+'</select></label><label>Caption <select class="table-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label><label>Place <select class="table-placement-input"><option value=""'+(!placement?' selected':'')+'>default</option><option value="htbp"'+(placement==='htbp'?' selected':'')+'>htbp</option><option value="h"'+(placement==='h'?' selected':'')+'>h</option><option value="t"'+(placement==='t'?' selected':'')+'>t</option><option value="b"'+(placement==='b'?' selected':'')+'>b</option><option value="p"'+(placement==='p'?' selected':'')+'>p</option></select></label></div></div><div class="table-column-tools">'+colTools+'</div>'+tableBorderToolsHtml(tableStyle)+'<div class="table-scroll"><table class="semantic-table table-style-'+tableStyle+'"><tbody>'+body+'</tbody></table></div><div class="table-actions"><button type="button" class="table-add-row">+ Row</button><button type="button" class="table-del-row">− Row</button><button type="button" class="table-add-col">+ Column</button><button type="button" class="table-del-col">− Column</button></div><div class="table-fields"><label>Caption <input class="table-caption-input" type="text" value="'+esc(caption)+'"></label><label>Label <input class="table-label-input" type="text" value="'+esc(label)+'" spellcheck="false"></label></div>'+(label?'<span class="texflow-label-badge" contenteditable="false">'+esc(label)+'</span>':'')+'</div>';
+ const advanced='<div class="table-controls"><label>Borders <select class="table-style-input">'+tableStyleOptions(tableStyle)+'</select></label><label>Caption <select class="table-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label><label>Place <select class="table-placement-input"><option value=""'+(!placement?' selected':'')+'>default</option><option value="htbp"'+(placement==='htbp'?' selected':'')+'>htbp</option><option value="h"'+(placement==='h'?' selected':'')+'>h</option><option value="t"'+(placement==='t'?' selected':'')+'>t</option><option value="b"'+(placement==='b'?' selected':'')+'>b</option><option value="p"'+(placement==='p'?' selected':'')+'>p</option></select></label><label class="table-size-control"><span>Size</span><select class="table-size-input"><option value=""'+(!tableSize?' selected':'')+'>Default</option><option value="normalsize"'+(tableSize==='normalsize'?' selected':'')+'>Normal</option><option value="small"'+(tableSize==='small'?' selected':'')+'>Small</option><option value="footnotesize"'+(tableSize==='footnotesize'?' selected':'')+'>Footnotesize</option><option value="scriptsize"'+(tableSize==='scriptsize'?' selected':'')+'>Scriptsize</option><option value="tiny"'+(tableSize==='tiny'?' selected':'')+'>Tiny</option></select></label></div><div class="table-column-tools">'+colTools+'</div>'+tableBorderToolsHtml(tableStyle)+'<label>Label <input class="table-label-input" type="text" value="'+esc(label)+'" spellcheck="false"></label>';
+ return '<div class="doc-table table-card" data-node-id="'+node.id+'"><div class="table-head"><span class="tag">Table</span><button type="button" class="object-edit-toggle" aria-expanded="false" data-texflow-ui="true">Edit</button><button type="button" class="large-table-edit" data-texflow-ui="true">Edit LaTeX</button></div><div class="object-edit-panel" data-texflow-ui="true">'+advanced+'</div><div class="table-scroll"><table class="semantic-table table-style-'+tableStyle+'"><tbody>'+body+'</tbody></table></div><div class="table-actions"><button type="button" class="table-add-row">+ Row</button><button type="button" class="table-del-row">− Row</button><button type="button" class="table-add-col">+ Column</button><button type="button" class="table-del-col">− Column</button></div><div class="table-fields primary-only"><label>Caption <input class="table-caption-input" type="text" value="'+esc(caption)+'"></label></div>'+(label?'<span class="texflow-label-badge" contenteditable="false">'+esc(label)+'</span>':'')+tableLatexSourceEditorHtml(String(b.raw||''))+'</div>';
 }
 function serializeDocumentTable(node,payload){
  const b=node.block,columns=(payload.columns||b.tableColumns||[]).map(x=>/^[lcr]$/.test(x)?x:'c'),rows=payload.rows||b.tableRows||[];
@@ -5429,17 +5721,19 @@ function serializeDocumentTable(node,payload){
 }
 
 function bindDocumentTable(el,node){
- const table=el.querySelector('.semantic-table'),caption=el.querySelector('.table-caption-input'),label=el.querySelector('.table-label-input'),placement=el.querySelector('.table-placement-input'),captionPosition=el.querySelector('.table-caption-position-input'),styleInput=el.querySelector('.table-style-input'),borderTools=el.querySelector('.table-border-tools');
+ const advanced=configureTableEditPanel(el,node&&node.block?node.block.tableSize||'':'',node&&node.block?node.block.tablePlacement||'':'');
+ const table=el.querySelector('.semantic-table'),caption=el.querySelector('.table-caption-input'),label=el.querySelector('.table-label-input'),placement=el.querySelector('.table-placement-input'),captionPosition=el.querySelector('.table-caption-position-input'),styleInput=el.querySelector('.table-style-input'),sizeInput=el.querySelector('.table-size-input'),borderTools=el.querySelector('.table-border-tools');
  let tableStyle=tableVisualStyle(node.block.tableStyle||'plain'),verticalBorders=tableBorderArray(node.block.tableVerticalBorders,(node.block.tableColumns||[]).length+1),horizontalBorders=tableBorderArray(node.block.tableHorizontalBorders,(node.block.tableRows||[]).length+1),activeRow=null,activeCol=null;
- function payload(){const rows=[...table.querySelectorAll('tbody tr')].map(tr=>[...tr.querySelectorAll('td')].map(td=>editableLatex(td)));const columns=[...el.querySelectorAll('.table-col-align')].map(x=>x.value);return{rows,columns,caption:caption?caption.value:'',label:label?label.value:'',placement:placement?placement.value:'',captionPosition:captionPosition?captionPosition.value:'below',tableStyle,verticalBorders:tableBorderArray(verticalBorders,columns.length+1),horizontalBorders:tableBorderArray(horizontalBorders,rows.length+1)};}
+ function payload(){const rows=[...table.querySelectorAll('tbody tr')].map(tr=>[...tr.querySelectorAll('td')].map(td=>editableLatex(td)));const columns=[...el.querySelectorAll('.table-col-align')].map(x=>x.value);return{rows,columns,caption:caption?caption.value:'',label:label?label.value:'',placement:placement?placement.value:'',captionPosition:captionPosition?captionPosition.value:'below',tableSize:sizeInput?sizeInput.value:'',tableStyle,verticalBorders:tableBorderArray(verticalBorders,columns.length+1),horizontalBorders:tableBorderArray(horizontalBorders,rows.length+1)};}
  const save=(refresh=true)=>updateDocumentNode(node,serializeDocumentTable(node,payload()),refresh);
+ bindLargeTableCard(el,next=>updateDocumentNode(node,next,true,'table-source'),()=>serializeDocumentTable(node,payload()));
  function refreshBorderTools(){if(!borderTools)return;borderTools.classList.toggle('hidden',tableStyle!=='custom');const valid=tableStyle==='custom'&&Number.isFinite(activeRow)&&Number.isFinite(activeCol);const target=borderTools.querySelector('.table-border-target');if(target)target.textContent=valid?'R'+(activeRow+1)+' C'+(activeCol+1):'Select a cell';borderTools.querySelectorAll('[data-border-edge]').forEach(btn=>{btn.disabled=!valid;let on=false;if(valid){const edge=btn.dataset.borderEdge;if(edge==='top')on=!!horizontalBorders[activeRow];if(edge==='bottom')on=!!horizontalBorders[activeRow+1];if(edge==='left')on=!!verticalBorders[activeCol];if(edge==='right')on=!!verticalBorders[activeCol+1];}btn.classList.toggle('active',on);});}
  function markActive(cell){el.querySelectorAll('.doc-table-cell.table-cell-selected').forEach(x=>x.classList.remove('table-cell-selected'));activeRow=Number(cell&&cell.dataset&&cell.dataset.row);activeCol=Number(cell&&cell.dataset&&cell.dataset.col);if(!Number.isFinite(activeRow))activeRow=null;if(!Number.isFinite(activeCol))activeCol=null;if(cell)cell.classList.add('table-cell-selected');refreshBorderTools();}
  function repaint(){applyTableBorderVisual(table,tableStyle,verticalBorders,horizontalBorders);refreshBorderTools();}
  function focusCell(target,atEnd=false){if(target)markActive(target);if(!target)return;target.focus();const r=document.createRange();r.selectNodeContents(target);r.collapse(!atEnd);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
  function caretAtBoundary(cell,which){const sel=getSelection();if(!sel||!sel.rangeCount)return false;const r=sel.getRangeAt(0);if(!r.collapsed||!cell.contains(r.startContainer))return false;const test=r.cloneRange();if(which==='start'){test.selectNodeContents(cell);test.setEnd(r.startContainer,r.startOffset);return test.toString().length===0;}test.selectNodeContents(cell);test.setStart(r.startContainer,r.startOffset);return test.toString().length===0;}
- el.querySelectorAll('.doc-table-cell').forEach(cell=>{attachEditor(cell);cell.addEventListener('focus',()=>markActive(cell));cell.addEventListener('mousedown',()=>markActive(cell));cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...el.querySelectorAll('.doc-table-cell')],i=cells.indexOf(cell),cols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/cols),col=i%cols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&caretAtBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&caretAtBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&caretAtBoundary(cell,'end')){target=cells[(row+1)*cols+col]||null;if(!target){e.preventDefault();moveVisualEditableCaret(cell,1,el);return;}}else if(e.key==='ArrowUp'&&caretAtBoundary(cell,'start')){target=row>0?cells[(row-1)*cols+col]:null;atEnd=true;if(!target){e.preventDefault();moveVisualEditableCaret(cell,-1,el);return;}}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusCell(target,atEnd);}});});
- el.querySelectorAll('.table-col-align').forEach(x=>x.onchange=()=>save(true));if(caption)caption.onchange=()=>save(true);if(label)label.onchange=()=>save(true);if(placement)placement.onchange=()=>save(true);if(captionPosition)captionPosition.onchange=()=>save(true);
+ el.querySelectorAll('.doc-table-cell').forEach(cell=>{attachEditor(cell);cell.__texflowCommit=(text,feature='')=>{setEditableLatex(cell,text);save(false);};cell.__texflowSaveNow=()=>save(false);cell.addEventListener('focus',()=>markActive(cell));cell.addEventListener('mousedown',()=>markActive(cell));cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...el.querySelectorAll('.doc-table-cell')],i=cells.indexOf(cell),cols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/cols),col=i%cols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&caretAtBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&caretAtBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&caretAtBoundary(cell,'end')){target=cells[(row+1)*cols+col]||null;if(!target){e.preventDefault();moveVisualEditableCaret(cell,1,el);return;}}else if(e.key==='ArrowUp'&&caretAtBoundary(cell,'start')){target=row>0?cells[(row-1)*cols+col]:null;atEnd=true;if(!target){e.preventDefault();moveVisualEditableCaret(cell,-1,el);return;}}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusCell(target,atEnd);}});});
+ el.querySelectorAll('.table-col-align').forEach(x=>x.onchange=()=>save(true));if(caption)caption.onchange=()=>save(true);if(label)label.onchange=()=>save(true);if(placement)placement.onchange=()=>save(true);if(captionPosition)captionPosition.onchange=()=>save(true);if(sizeInput)sizeInput.onchange=()=>{[...el.classList].filter(x=>x.startsWith('table-size-')).forEach(x=>el.classList.remove(x));if(sizeInput.value)el.classList.add('table-size-'+sizeInput.value);save(true);};
  if(styleInput)styleInput.onchange=()=>{const previous=tableStyle;tableStyle=tableVisualStyle(styleInput.value);const rowCount=[...table.querySelectorAll('tbody tr')].length,colCount=Math.max(0,[...table.querySelectorAll('tbody tr:first-child td')].length);if(tableStyle==='grid'){verticalBorders=Array.from({length:colCount+1},()=>true);horizontalBorders=Array.from({length:rowCount+1},()=>true);}else if(tableStyle==='plain'||tableStyle==='booktabs'){verticalBorders=Array.from({length:colCount+1},()=>false);horizontalBorders=Array.from({length:rowCount+1},()=>false);}else if(previous!=='custom'){verticalBorders=tableBorderArray(verticalBorders,colCount+1);horizontalBorders=tableBorderArray(horizontalBorders,rowCount+1);}repaint();if(tableStyle==='custom')return;save(true);if(tableStyle==='booktabs')setTimeout(()=>vscode.postMessage({type:'ensureFeaturePackage',feature:'booktabs'}),25);};
  if(borderTools){borderTools.querySelectorAll('[data-border-edge]').forEach(btn=>btn.onclick=()=>{if(tableStyle!=='custom'||activeRow===null||activeCol===null)return;const edge=btn.dataset.borderEdge;if(edge==='top')horizontalBorders[activeRow]=!horizontalBorders[activeRow];if(edge==='bottom')horizontalBorders[activeRow+1]=!horizontalBorders[activeRow+1];if(edge==='left')verticalBorders[activeCol]=!verticalBorders[activeCol];if(edge==='right')verticalBorders[activeCol+1]=!verticalBorders[activeCol+1];repaint();save(false);});const all=borderTools.querySelector('.table-border-all'),clear=borderTools.querySelector('.table-border-clear');if(all)all.onclick=()=>{verticalBorders=verticalBorders.map(()=>true);horizontalBorders=horizontalBorders.map(()=>true);repaint();save(false);};if(clear)clear.onclick=()=>{verticalBorders=verticalBorders.map(()=>false);horizontalBorders=horizontalBorders.map(()=>false);repaint();save(false);};}
  const addRow=el.querySelector('.table-add-row'),delRow=el.querySelector('.table-del-row'),addCol=el.querySelector('.table-add-col'),delCol=el.querySelector('.table-del-col');
@@ -5558,8 +5852,13 @@ function bindTikzCards(host){
 function updateTikzPreviewStatus(state,message=''){
  document.querySelectorAll('.tikz-card .tikz-status').forEach(el=>{el.textContent=state==='building'?'Compiling preview…':state==='ready'?'Preview opened beside TeXFlow in the VS Code PDF viewer.':state==='saved'?'TikZ source saved.':state==='error'?('TikZ '+(message?message:'operation failed.')):'Preview opens beside TeXFlow as an exact PDF compiled with the project preamble.';});
 }
+function tableLatexSourceEditorHtml(raw){return '<div class="large-table-source-wrap"><textarea class="large-table-source" spellcheck="false">'+esc(String(raw||''))+'</textarea><div class="large-table-source-actions"><button type="button" class="large-table-cancel">Cancel</button><button type="button" class="large-table-save">Save LaTeX</button></div></div>';}
+function largeTableCardHtml(b){const rows=Number(b&&b.tableRowCount)||0,cols=Number(b&&b.tableColumnCount)||0,caption=String(b&&b.tableCaption||'').trim(),label=String(b&&b.tableLabel||'').trim(),oversize=String(b&&b.tableFallbackReason||'')==='oversize'||!!(b&&b.tableOversize),summary=oversize?'Large table · LaTeX':'Complex table · LaTeX',dimensions=rows&&cols?(rows+' rows × '+cols+' columns'):'' ,reason=oversize?'Visual editing disabled because of table size. Limit: 30 rows × 12 columns. The complete LaTeX source is preserved and editable.':'Visual editing unavailable for this table structure. The complete LaTeX source is preserved and editable.';return '<div class="large-table-head"><span class="tag">'+esc(summary)+'</span><button type="button" class="large-table-edit">Edit LaTeX</button></div>'+(dimensions?'<div class="large-table-note">'+esc(dimensions)+'</div>':'')+(caption?'<div class="large-table-note">'+esc(caption)+(label?' · '+esc(label):'')+'</div>':'')+'<div class="large-table-note">'+esc(reason)+'</div>'+tableLatexSourceEditorHtml(String(b&&b.raw||''));}
+function bindLargeTableCard(card,onSave,getCurrentSource){if(!card)return;const edit=card.querySelector('.large-table-edit'),textarea=card.querySelector('.large-table-source'),save=card.querySelector('.large-table-save'),cancel=card.querySelector('.large-table-cancel');if(textarea&&!card.dataset.largeTableSource)card.dataset.largeTableSource=textarea.value;const close=()=>{card.classList.remove('source-open');if(edit)edit.textContent='Edit LaTeX';};const valid=value=>/^\s*\\begin\{table\}(?:\[[^\]]*\])?[\s\S]*\\end\{table\}\s*$/.test(String(value||''));if(edit)edit.onclick=e=>{e.preventDefault();e.stopPropagation();const open=!card.classList.contains('source-open');card.classList.toggle('source-open',open);edit.textContent=open?'Close LaTeX':'Edit LaTeX';if(open&&textarea){const current=typeof getCurrentSource==='function'?String(getCurrentSource()||''):String(card.dataset.largeTableSource||textarea.value||'');card.dataset.largeTableSource=current;textarea.value=current;textarea.focus();textarea.setSelectionRange(textarea.value.length,textarea.value.length);}};if(cancel)cancel.onclick=e=>{e.preventDefault();e.stopPropagation();if(textarea)textarea.value=card.dataset.largeTableSource||'';close();};if(save)save.onclick=e=>{e.preventDefault();e.stopPropagation();const next=String(textarea&&textarea.value||'');if(!next.trim()){vscode.postMessage({type:'showWarning',message:'Table source cannot be empty.'});return;}if(!valid(next)){vscode.postMessage({type:'showWarning',message:'Table source must contain one complete \\begin{table} … \\end{table} environment.'});return;}card.dataset.largeTableSource=next;if(onSave)onSave(next);close();};}
 function documentBlockHtml(node){
  const b=node.block;
+ if(b&&b.hidden)return '';
+ if(b&&b.kind==='raw'&&(b.tableSourceEditable||b.tableOversize))return '<div class="doc-large-table large-table-card semantic-block" data-node-id="'+node.id+'">'+largeTableCardHtml(b)+'</div>';
  if(b.kind==='paragraph')return '<div class="doc-paragraph doc-editable '+alignClass(b.align,'justify')+'" data-node-id="'+node.id+'"'+(node.synthetic?' data-synthetic="true" data-placeholder="Start typing…"':'')+' contenteditable="true">'+latexToHtml(b.text||'')+'</div>';
  if(b.kind==='itemize'){const tag=b.env==='enumerate'?'ol':'ul';const items=(b.items||[]).map(it=>'<li><div class="doc-item-editable doc-editable" contenteditable="true">'+latexToHtml(typeof it==='string'?it:(it&&it.text)||'')+'</div></li>').join('');return '<'+tag+' class="doc-list" data-node-id="'+node.id+'">'+items+'</'+tag+'>';}
  if(b.kind==='equation'){let clean=String(b.text||'').replace(/\\label\{[^}]+\}/g,'').replace(/\\(?:notag|nonumber)\b/g,'').trim();if(/^align/.test(String(b.env||'')))clean='\\begin{aligned}'+clean+'\\end{aligned}';const rows=Array.isArray(b.eqRowNumbers)?b.eqRowNumbers:[],number=rows.length?'<span class="doc-equation-numbers">'+rows.map(x=>'<span class="doc-equation-row-number">'+(x&&x.number?'('+x.number+')':'&#8203;')+'</span>').join('')+'</span>':(b.eqNumber?'<span class="doc-equation-number">('+b.eqNumber+')</span>':''),badge=b.label?'<span class="texflow-label-badge" contenteditable="false">'+esc(b.label)+'</span>':'';return '<div class="doc-math-wrap" data-node-id="'+node.id+'"><div class="doc-math" data-node-id="'+node.id+'" data-tex="'+esc(clean)+'">'+number+'</div>'+badge+'</div>';}
@@ -5567,11 +5866,11 @@ function documentBlockHtml(node){
  if(b.kind==='table')return documentTableHtml(node,b);
  if(b.kind==='tikz')return tikzCardHtml(node.id,b.raw,activeUri,node.start,node.end,'document');
  if(b.kind==='columns'){const texts=b.columnTexts||[b.text||''],count=Math.max(2,Math.min(4,Number(b.columnCount)||texts.length||2));if(b.env==='multicols')return '<div class="doc-columns-flow semantic-block" data-node-id="'+node.id+'"><div class="columns-head"><span class="tag">'+count+' columns · flowing text</span></div><div class="doc-column-flow doc-editable" contenteditable="true" style="column-count:'+count+'">'+latexToHtml(texts[0]||'')+'</div></div>';return '<div class="doc-columns semantic-block" data-node-id="'+node.id+'" style="grid-template-columns:repeat('+count+',minmax(0,1fr))">'+Array.from({length:count},(_,i)=>'<div class="doc-column doc-editable" contenteditable="true" data-col="'+i+'">'+latexToHtml(texts[i]||'')+'</div>').join('')+'</div>'; }
- if(b.kind==='vspace')return '<div class="doc-vspace semantic-block" data-node-id="'+node.id+'"><span class="vspace-label">vertical '+esc((b.spaceStarred?'* ':'')+(b.spaceAmount||''))+'</span></div>';
+ if(b.kind==='vspace'){const named=['smallskip','medskip','bigskip'].includes(String(b.spaceAmount||''));return '<div class="doc-vspace semantic-block'+(named?' doc-vspace-named':'')+'" data-node-id="'+node.id+'"'+(named?' title="'+esc(b.spaceAmount)+'"':'')+'><span class="vspace-label">'+(named?esc(b.spaceAmount):('vertical '+esc((b.spaceStarred?'* ':'')+(b.spaceAmount||''))))+'</span></div>'; }
  if(b.kind==='break')return '<div class="doc-break semantic-block" data-node-id="'+node.id+'">'+esc(b.breakCommand||'newpage')+'</div>';
  if(b.kind==='comment'){const reviewKey=reviewDocumentKey(node);if(!reviewBlockVisible(b)||reviewItemHidden(reviewKey))return '';const kind=b.commentTag==='TODO'?'todo':b.commentTag==='FIXME'?'fixme':(b.commentNote?'authornote':'comment'),title=b.commentTag==='TODO'?'TODO':b.commentTag==='FIXME'?'FIXME':(b.commentNote?'Author note':'Source comment'),anchorNode=documentReviewAnchorNode(node);return commentMarkerHtml(reviewKey,node.id,kind,title,anchorNode&&anchorNode.id||'');}
  if(b.kind==='commentblock'){const reviewKey=reviewDocumentKey(node);if(!reviewBlockVisible(b)||reviewItemHidden(reviewKey))return '';const anchorNode=documentReviewAnchorNode(node);return commentMarkerHtml(reviewKey,node.id,'commentblock','Commented-out block',anchorNode&&anchorNode.id||'');}
- if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem'||b.kind==='customenv'||b.kind==='abstract'){const custom=b.kind==='customenv',visual=custom?String(b.customVisualType||'box'):'',cls=b.kind==='quote'?'quote':b.kind==='theorem'?'theorem':b.kind==='abstract'?'abstract':custom?(visual==='theorem'?'theorem':visual==='note'?'custom-note':visual==='plain'?'custom-plain':'container'):'container',label=b.kind==='abstract'?'Abstract':custom?(b.customTitle||b.env||'Environment'):b.kind==='theorem'?(b.env||'theorem'):(b.kind==='container'?'minipage':(b.env||'quote'));return '<div class="doc-rich-block semantic-block '+cls+'" data-node-id="'+node.id+'"><div class="doc-rich-label">'+esc(label)+'</div><div class="doc-rich-edit doc-editable" contenteditable="true">'+latexToHtml(b.text||'')+'</div></div>';}
+ if(b.kind==='quote'||b.kind==='container'||b.kind==='theorem'||b.kind==='customenv'||b.kind==='abstract'){const custom=b.kind==='customenv',visual=custom?String(b.customVisualType||'box'):'',cls=b.kind==='quote'?'quote':b.kind==='theorem'?'theorem':b.kind==='abstract'?'abstract':custom?(visual==='theorem'?'theorem':visual==='note'?'custom-note':visual==='plain'?'custom-plain':'container'):'container',label=b.kind==='abstract'?'Abstract':custom?(b.customTitle||b.env||'Environment'):b.kind==='theorem'?(b.env||'theorem'):(b.kind==='container'?'minipage':(b.env||'quote')),stretch=String(b.abstractStretch||'').trim(),stretchControl=b.kind==='abstract'&&stretch?'<label class="doc-abstract-stretch-control" data-texflow-ui="true" contenteditable="false"><span>Spacing</span><input class="doc-abstract-stretch-input" type="text" inputmode="decimal" spellcheck="false" value="'+esc(stretch)+'" title="LaTeX \\setstretch value"></label>':'',lineHeight=b.kind==='abstract'&&/^\d+(?:\.\d+)?$/.test(stretch)?' style="line-height:'+esc(stretch)+'"':'';return '<div class="doc-rich-block semantic-block '+cls+'" data-node-id="'+node.id+'"><div class="doc-rich-label"><span>'+esc(label)+'</span>'+stretchControl+'</div><div class="doc-rich-edit doc-editable" contenteditable="true"'+lineHeight+'>'+latexToHtml(b.text||'')+'</div></div>';}
  return '<div class="doc-raw" data-node-id="'+node.id+'"><span>LaTeX preserved</span><pre>'+esc(b.raw||'')+'</pre></div>';
 }
 function documentPageProfile(){
@@ -5606,15 +5905,15 @@ function documentNodeNeedsParagraphSlot(flow,index){
 function documentAfterBlockSlotHtml(node){return '<div class="doc-after-block-slot" data-after-node-id="'+node.id+'" tabindex="0" aria-label="Start a paragraph after this object"></div>'; }
 function documentFlowInnerHtml(){
  const flow=parseDocumentFlow();let html='';
- const hasTitle=activeUri===masterUri&&/\\title\s*\{/.test(documentSource),hasAuthor=activeUri===masterUri&&/\\author\s*\{/.test(documentSource);
- if(activeUri===masterUri&&(hasTitle||hasAuthor||metadata.title||metadata.author)){html+='<header class="doc-title">'+(hasTitle||metadata.title?'<h1 class="doc-metadata-edit doc-title-heading" data-field="title" data-placeholder="Title" contenteditable="true">'+latexToHtml(metadata.title||'')+'</h1>':'')+(hasAuthor||metadata.author?'<div class="doc-metadata-edit doc-title-author" data-field="author" data-placeholder="Author" contenteditable="true">'+latexToHtml(metadata.author||'')+'</div>':'')+(metadata.date?'<div class="doc-date">'+latexToHtml(metadata.date)+'</div>':'')+'</header>';}
+ const hasTitle=activeUri===masterUri&&/\\title\s*\{/.test(documentSource),hasAuthor=activeUri===masterUri&&/\\author\s*\{/.test(documentSource),hasDate=activeUri===masterUri&&/\\date\s*\{/.test(documentSource);
+ if(activeUri===masterUri&&(hasTitle||hasAuthor||hasDate||metadata.title||metadata.author||metadata.date)){html+='<header class="doc-title">'+(hasTitle||metadata.title?'<h1 class="doc-metadata-edit doc-title-heading" data-field="title" data-placeholder="Title" contenteditable="true">'+latexToHtml(metadata.title||'')+'</h1>':'')+(hasAuthor||metadata.author?'<div class="doc-metadata-edit doc-title-author" data-field="author" data-placeholder="Author" contenteditable="true">'+latexToHtml(metadata.author||'')+'</div>':'')+(hasDate||metadata.date?'<div class="doc-metadata-edit doc-title-date" data-field="date" data-placeholder="Date" contenteditable="true">'+latexToHtml(metadata.date||'')+'</div>':'')+'</header>';}
  const firstFlow=flow.find(x=>x&&x.kind!=='matter');if(firstFlow&&!firstFlow.synthetic)html+='<div class="doc-before-first-slot" data-before-node-id="'+firstFlow.id+'" tabindex="0" aria-label="Start a paragraph before the first object"></div>';
  flow.forEach((x,i)=>{
   if(x.kind==='matter')return;
   if(x.kind==='toc'){html+=documentTocHtml(flow);if(documentNodeNeedsParagraphSlot(flow,i))html+=documentAfterBlockSlotHtml(x);return;}
   if(x.kind==='bibliography'){html+=bibliographyHtml(x.id);return;}
   if(x.kind==='include'){html+=documentIncludeHtml(x);if(documentNodeNeedsParagraphSlot(flow,i))html+=documentAfterBlockSlotHtml(x);return;}
-  if(x.kind==='heading'){const tag=x.level<=1?'h1':x.level===2?'h2':x.level===3?'h3':'h4',labelAttr=x.label?' data-label="'+esc(x.label)+'"':'',numberAttr=x.headingNumber?' data-number="'+esc(String(x.headingNumber))+'"':'',canNumber=x.command!=='paragraph',numbering=canNumber?'<label class="doc-heading-numbering" data-texflow-ui="true" contenteditable="false" title="TeXFlow chooses the starred or unstarred LaTeX command automatically"><input class="doc-heading-numbered-toggle" type="checkbox" '+(x.starred?'':'checked')+'> Numbered</label>':'';html+='<'+tag+' id="'+x.id+'" data-node-id="'+x.id+'" data-node-start="'+x.start+'"'+labelAttr+numberAttr+' contenteditable="true" class="doc-heading doc-editable level-'+x.level+(x.starred?' starred':'')+'">'+latexToHtml(x.title||'')+numbering+'</'+tag+'>';return;}
+  if(x.kind==='heading'){const tag=x.level<=1?'h1':x.level===2?'h2':x.level===3?'h3':'h4',labelAttr=x.label?' data-label="'+esc(x.label)+'"':'',numberAttr=x.headingNumber?' data-number="'+esc(String(x.headingNumber))+'"':'',canNumber=x.command!=='paragraph',numbering=canNumber?'<label class="doc-heading-numbering" data-texflow-ui="true" contenteditable="false" title="TeXFlow chooses the starred or unstarred LaTeX command automatically"><input class="doc-heading-numbered-toggle" type="checkbox" '+(x.starred?'':'checked')+'> Numbered</label>':'',labelEdit='<label class="doc-heading-label-edit" data-texflow-ui="true" contenteditable="false"><span>Label</span><input class="doc-heading-label-input" type="text" spellcheck="false" value="'+esc(x.label||'')+'" placeholder="sec:..."></label>',controls='<span class="doc-heading-controls" data-texflow-ui="true" contenteditable="false">'+numbering+labelEdit+'</span>';html+='<'+tag+' id="'+x.id+'" data-node-id="'+x.id+'" data-node-start="'+x.start+'"'+labelAttr+numberAttr+' contenteditable="true" class="doc-heading doc-editable level-'+x.level+(x.starred?' starred':'')+'">'+latexToHtml(x.title||'')+controls+'</'+tag+'>';return;}
   html+=documentBlockHtml(x);
   if(documentNodeNeedsParagraphSlot(flow,i))html+=documentAfterBlockSlotHtml(x);
  });
@@ -5870,7 +6169,7 @@ function serializeRichDocumentBlock(node,text){
  const b=node.block,body=String(text||'').trim();
  if(b.kind==='break')return '\\'+(b.breakCommand||'newpage');
  if(b.kind==='quote'){const env=b.env==='quotation'?'quotation':'quote';return '\\begin{'+env+'}\n'+body+'\n\\end{'+env+'}';}
- if(b.kind==='abstract')return '\\begin{abstract}\n'+body+'\n\\end{abstract}';
+ if(b.kind==='abstract'){const stretch=String(b.abstractStretch||'').trim().replace(/[{}\\\s]/g,'');return '\\begin{abstract}\n'+(stretch?'\\setstretch{'+stretch+'}\n\n':'')+body+'\n\\end{abstract}';}
  if(b.kind==='container')return '\\begin{minipage}{0.9\\linewidth}\n'+body+'\n\\end{minipage}';
  if(b.kind==='theorem'){const env=b.env||'theorem';return '\\begin{'+env+'}\n'+body+'\n\\end{'+env+'}';}
  if(b.kind==='customenv'){const env=String(b.env||'').trim();return env?'\\begin{'+env+'}\n'+body+'\n\\end{'+env+'}':(node.raw||'');}
@@ -5878,9 +6177,9 @@ function serializeRichDocumentBlock(node,text){
  if(b.kind==='commentblock')return '\\begin{comment}\n'+String(text||'').replace(/\r\n?/g,'\n')+'\n\\end{comment}';
  return node.raw||'';
 }
-function bindDocumentRichBlock(el,node){const edit=el.querySelector('.doc-rich-edit');let saveEdit=null;if(edit){attachEditor(edit);const save=refresh=>updateDocumentNode(node,serializeRichDocumentBlock(node,editableLatex(edit)),refresh);saveEdit=save;edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));}if(node&&node.block&&(node.block.kind==='comment'||node.block.kind==='commentblock')){const key=reviewDocumentKey(node);if(node.block.kind==='commentblock'){const toggle=el.querySelector('.review-edit-source');if(toggle&&edit)toggle.onclick=e=>{e.preventDefault();e.stopPropagation();const editing=el.classList.contains('review-editing');if(editing){if(saveEdit)flushSave(edit,saveEdit);el.classList.remove('review-editing');toggle.textContent='Edit source';toggle.title='Edit the preserved LaTeX inside this commented-out block';}else{reviewCollapsedItems.delete(key);el.classList.remove('review-collapsed');const collapse=el.querySelector('.review-card-collapse');if(collapse){collapse.textContent='−';collapse.title='Collapse';}el.classList.add('review-editing');toggle.textContent='Done';toggle.title='Return to visual preview';edit.focus();}};}bindReviewCardControls(el,key,()=>vscode.postMessage({type:'deleteReviewDocumentNode',start:Number(node.start),end:Number(node.end),expected:String(node.raw||'')}));return;}bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));}
+function bindDocumentRichBlock(el,node){const edit=el.querySelector('.doc-rich-edit'),stretchInput=el.querySelector('.doc-abstract-stretch-input');let saveEdit=null;if(edit){attachEditor(edit);const syncStretch=()=>{if(!stretchInput||!node||!node.block||node.block.kind!=='abstract')return;const value=String(stretchInput.value||'').trim().replace(/[{}\\\s]/g,'');stretchInput.value=value;node.block.abstractStretch=value;if(/^\d+(?:\.\d+)?$/.test(value))edit.style.lineHeight=value;else edit.style.removeProperty('line-height');};const save=refresh=>{syncStretch();updateDocumentNode(node,serializeRichDocumentBlock(node,editableLatex(edit)),refresh);};saveEdit=save;edit.__texflowSaveNow=()=>save(false);edit.addEventListener('input',()=>scheduleSave(edit,save));edit.addEventListener('blur',()=>flushSave(edit,save));if(stretchInput){['mousedown','click'].forEach(type=>stretchInput.addEventListener(type,e=>e.stopPropagation()));const commitStretch=()=>save(true);stretchInput.addEventListener('change',commitStretch);stretchInput.addEventListener('blur',commitStretch);stretchInput.addEventListener('keydown',e=>{e.stopPropagation();if(e.key==='Enter'){e.preventDefault();commitStretch();edit.focus();}});}}if(node&&node.block&&(node.block.kind==='comment'||node.block.kind==='commentblock')){const key=reviewDocumentKey(node);if(node.block.kind==='commentblock'){const toggle=el.querySelector('.review-edit-source');if(toggle&&edit)toggle.onclick=e=>{e.preventDefault();e.stopPropagation();const editing=el.classList.contains('review-editing');if(editing){if(saveEdit)flushSave(edit,saveEdit);el.classList.remove('review-editing');toggle.textContent='Edit source';toggle.title='Edit the preserved LaTeX inside this commented-out block';}else{reviewCollapsedItems.delete(key);el.classList.remove('review-collapsed');const collapse=el.querySelector('.review-card-collapse');if(collapse){collapse.textContent='−';collapse.title='Collapse';}el.classList.add('review-editing');toggle.textContent='Done';toggle.title='Return to visual preview';edit.focus();}};}bindReviewCardControls(el,key,()=>vscode.postMessage({type:'deleteReviewDocumentNode',start:Number(node.start),end:Number(node.end),expected:String(node.raw||'')}));return;}bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));}
 
-function headingLatex(command,starred,title){return '\\'+String(command||'section')+(starred?'*':'')+'{'+String(title||'')+'}';}
+function headingLatex(command,starred,title,label='',placement='',separator=''){const base='\\'+String(command||'section')+(starred?'*':'');const cleanTitle=String(title||''),cleanLabel=String(label||'').trim().replace(/[{}\\\s]/g,'');if(!cleanLabel)return base+'{'+cleanTitle+'}';if(placement==='after')return base+'{'+cleanTitle+'}'+(separator||'\n')+'\\label{'+cleanLabel+'}';return base+'{'+cleanTitle+'\\label{'+cleanLabel+'}}';}
 function findBeamerMetadataCommandArgument(source,field){
  const re=new RegExp('\\\\'+field+'\\b','g');let commandMatch;
  while((commandMatch=re.exec(source))){
@@ -5912,30 +6211,22 @@ function findBeamerMetadataCommandArgument(source,field){
  return null;
 }
 function mirrorMetadataSource(field,value){
-  const isBeamerMetadata=!!isBeamer&&['title','subtitle','author','institute','date'].includes(String(field||''));
-  const clean=isBeamerMetadata?String(value||'').replace(/\r\n?/g,'\n').trim():String(value||'').replace(/[{}]/g,'');
-  const masterSource=sources.find(x=>String(x.uri||'')===String(masterUri));
-  let source=masterSource?String(masterSource.text||''):(activeUri===masterUri?String(documentSource||''):'');
-  if(!source)return;
-  let start,end,replacement;
-  if(isBeamerMetadata){
-   const match=findBeamerMetadataCommandArgument(source,field);
-   if(match){start=match.start;end=match.end;replacement=match.prefix+clean+'}';}
-   else{const begin=source.indexOf('\\begin{document}');start=end=begin>=0?begin:0;replacement='\\'+field+'{'+clean+'}\n';}
-  }else{
-   const re=new RegExp('(\\\\'+field+'(?:\\s*\\[[^\\]]*\\])?\\s*)\\{[^}]*\\}'),match=re.exec(source);
-   if(match){start=match.index;end=start+match[0].length;replacement=match[1]+'{'+clean+'}';}
-   else{const begin=source.indexOf('\\begin{document}');start=end=begin>=0?begin:0;replacement='\\'+field+'{'+clean+'}\n';}
-  }
-  const delta=replacement.length-(end-start),next=source.slice(0,start)+replacement+source.slice(end);
-  if(masterSource)masterSource.text=next;if(activeUri===masterUri)documentSource=next;if(metadata)metadata[field]=clean;
-  if(delta){
-   Object.values(documentFlowById||{}).forEach(node=>{if(!node||!Number.isFinite(node.start)||node.start<end)return;node.start+=delta;node.end+=delta;});
-   frames.forEach(frame=>{if(String(frame.sourceUri||'')!==String(masterUri))return;if(Number(frame.start)>=end){frame.start+=delta;frame.end+=delta;}else if(Number(frame.end)>=end)frame.end+=delta;});
-   (projectIncludes||[]).forEach(ref=>{if(String(ref.sourceUri||'')!==String(masterUri))return;if(Number(ref.start)>=end){ref.start+=delta;ref.end+=delta;}else if(Number(ref.end)>=end)ref.end+=delta;});
-  }
+ const clean=String(value||'').replace(/\r\n?/g,'\n').trim();
+ const masterSource=sources.find(x=>String(x.uri||'')===String(masterUri));
+ let source=masterSource?String(masterSource.text||''):(activeUri===masterUri?String(documentSource||''):'');
+ if(!source)return;
+ let start,end,replacement;
+ const match=findBeamerMetadataCommandArgument(source,field);
+ if(match){start=match.start;end=match.end;replacement=match.prefix+clean+'}';}
+ else{const begin=source.indexOf('\\begin{document}');start=end=begin>=0?begin:0;replacement='\\'+field+'{'+clean+'}\n';}
+ const delta=replacement.length-(end-start),next=source.slice(0,start)+replacement+source.slice(end);
+ if(masterSource)masterSource.text=next;if(activeUri===masterUri)documentSource=next;if(metadata)metadata[field]=clean;
+ if(delta){
+  Object.values(documentFlowById||{}).forEach(node=>{if(!node||!Number.isFinite(node.start)||node.start<end)return;node.start+=delta;node.end+=delta;});
+  frames.forEach(frame=>{if(String(frame.sourceUri||'')!==String(masterUri))return;if(Number(frame.start)>=end){frame.start+=delta;frame.end+=delta;}else if(Number(frame.end)>=end)frame.end+=delta;});
+  (projectIncludes||[]).forEach(ref=>{if(String(ref.sourceUri||'')!==String(masterUri))return;if(Number(ref.start)>=end){ref.start+=delta;ref.end+=delta;}else if(Number(ref.end)>=end)ref.end+=delta;});
  }
-
+}
 function commitBeamerMetadataValues(values,host){
  const clean={};['institute','author'].forEach(field=>{if(Object.prototype.hasOwnProperty.call(values||{},field))clean[field]=String(values[field]??'').trim();});
  if(!Object.keys(clean).length)return;
@@ -5977,8 +6268,14 @@ function bindBeamerAffiliationControls(host){
 function bindVisualDocument(host){
  bindVisualNavigationSpine(host);
  const flow=parseDocumentFlow();const byId={};flow.forEach(x=>byId[x.id]=x);
- host.querySelectorAll('.doc-metadata-edit[contenteditable=true]').forEach(el=>{attachEditor(el);const field=String(el.dataset.field||'title');let lastSent=editableLatex(el);const save=()=>{const value=editableLatex(el);if(value===lastSent)return;lastSent=value;mirrorMetadataSource(field,value);vscode.postMessage({type:'setMetadataValue',field,value});};el.addEventListener('input',()=>scheduleSave(el,save));el.addEventListener('blur',()=>flushSave(el,save));});
- host.querySelectorAll('.doc-heading[contenteditable=true]').forEach(el=>{const node=byId[el.dataset.nodeId];attachEditor(el);bindDocumentTextNavigation(el);let exiting=false;const save=(refresh,feature='')=>{const text=editableLatex(el).replace(/\n+/g,' ').trim();updateDocumentNode(node,headingLatex(node.command,node.starred,text),refresh,feature);};el.__texflowSaveNow=()=>save(false);const toggle=el.querySelector('.doc-heading-numbered-toggle');if(toggle){toggle.addEventListener('mousedown',e=>{e.stopPropagation();});toggle.addEventListener('click',e=>{e.stopPropagation();});toggle.addEventListener('change',e=>{e.stopPropagation();const wantsNumber=!!toggle.checked;if(!wantsNumber&&node.label){toggle.checked=true;vscode.postMessage({type:'showWarning',message:'This heading has label '+node.label+'. Remove the label before making the heading unnumbered.'});return;}node.starred=!wantsNumber;save(true,'heading-numbering');});}el.addEventListener('input',e=>{if(e.target&&e.target.closest&&e.target.closest('[data-texflow-ui="true"]'))return;scheduleSave(el,save);});el.addEventListener('blur',()=>{if(exiting){exiting=false;return;}flushSave(el,save);});el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const old=saveTimers.get(el);if(old)clearTimeout(old);exiting=true;save(false);const next=el.nextElementSibling;if(next&&next.classList&&next.classList.contains('doc-paragraph'))focusParagraphStart(next);else createSyntheticParagraphAfter(el,node,'');}});});
+ host.querySelectorAll('.doc-metadata-edit[contenteditable=true]').forEach(el=>{
+  attachEditor(el);const field=String(el.dataset.field||'title');let lastSent=editableLatex(el);
+  const save=()=>{const value=editableLatex(el);if(value===lastSent)return;lastSent=value;mirrorMetadataSource(field,value);vscode.postMessage({type:'setMetadataValue',field,value});};
+  el.__texflowCommit=()=>{const value=editableLatex(el);lastSent=value;mirrorMetadataSource(field,value);vscode.postMessage({type:'setMetadataValue',field,value});return true;};
+  el.__texflowSaveNow=save;
+  el.addEventListener('input',()=>scheduleSave(el,save));el.addEventListener('blur',()=>flushSave(el,save));
+ });
+ host.querySelectorAll('.doc-heading[contenteditable=true]').forEach(el=>{const node=byId[el.dataset.nodeId];attachEditor(el);bindDocumentTextNavigation(el);let exiting=false;const currentLabel=()=>String(node.label||'').trim();const save=(refresh,feature='')=>{const text=editableLatex(el).replace(/\n+/g,' ').trim();updateDocumentNode(node,headingLatex(node.command,node.starred,text,currentLabel(),node.headingLabelPlacement||'',node.headingLabelSeparator||''),refresh,feature);};el.__texflowSaveNow=()=>save(false);const toggle=el.querySelector('.doc-heading-numbered-toggle');if(toggle){toggle.addEventListener('mousedown',e=>{e.stopPropagation();});toggle.addEventListener('click',e=>{e.stopPropagation();});toggle.addEventListener('change',e=>{e.stopPropagation();const wantsNumber=!!toggle.checked;if(!wantsNumber&&node.label){toggle.checked=true;vscode.postMessage({type:'showWarning',message:'This heading has label '+node.label+'. Remove the label before making the heading unnumbered.'});return;}node.starred=!wantsNumber;save(true,'heading-numbering');});}const labelInput=el.querySelector('.doc-heading-label-input');if(labelInput){const commitLabel=()=>{const next=String(labelInput.value||'').trim().replace(/[{}\\\s]/g,'');if(next===String(node.label||''))return;node.label=next;if(next&&!node.headingLabelPlacement)node.headingLabelPlacement='after';save(true,'heading-label');};['mousedown','click'].forEach(type=>labelInput.addEventListener(type,e=>e.stopPropagation()));labelInput.addEventListener('keydown',e=>{e.stopPropagation();if(e.key==='Enter'){e.preventDefault();commitLabel();el.focus();}});labelInput.addEventListener('change',commitLabel);labelInput.addEventListener('blur',commitLabel);}el.addEventListener('input',e=>{if(e.target&&e.target.closest&&e.target.closest('[data-texflow-ui="true"]'))return;scheduleSave(el,save);});el.addEventListener('blur',e=>{if(e.relatedTarget&&e.relatedTarget.closest&&e.relatedTarget.closest('.doc-heading-controls'))return;if(exiting){exiting=false;return;}flushSave(el,save);});el.addEventListener('keydown',e=>{if(e.target&&e.target.closest&&e.target.closest('[data-texflow-ui="true"]'))return;if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();const old=saveTimers.get(el);if(old)clearTimeout(old);exiting=true;save(false);const next=el.nextElementSibling;if(next&&next.classList&&next.classList.contains('doc-paragraph'))focusParagraphStart(next);else createSyntheticParagraphAfter(el,node,'');}});});
  host.querySelectorAll('.doc-paragraph[contenteditable=true]').forEach(el=>bindDocumentParagraph(el,byId[el.dataset.nodeId]));bindMultiParagraphMouseSelection(host);host.querySelectorAll('.doc-toc-row[data-target]').forEach(el=>el.addEventListener('click',()=>{const target=host.querySelector('#'+el.dataset.target)||document.getElementById(el.dataset.target);if(target)target.scrollIntoView({behavior:'smooth',block:'start'});}));
  host.querySelectorAll('.doc-include-open[data-uri]').forEach(el=>el.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();vscode.postMessage({type:'openIncludedSource',uri:el.dataset.uri||'',target:el.dataset.target||''});}));
  host.querySelectorAll('.doc-include-source[data-uri]').forEach(el=>el.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();vscode.postMessage({type:'openIncludedSourceText',uri:el.dataset.uri||'',target:el.dataset.target||''});}));
@@ -5989,9 +6286,10 @@ function bindVisualDocument(host){
  host.querySelectorAll('.doc-math-wrap[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];el.addEventListener('click',()=>setStructuralTarget(node,el));bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));});
  host.querySelectorAll('.doc-figure[data-node-id]').forEach(el=>bindDocumentFigure(el,byId[el.dataset.nodeId]));
  host.querySelectorAll('.doc-table[data-node-id]').forEach(el=>bindDocumentTable(el,byId[el.dataset.nodeId]));
+ host.querySelectorAll('.doc-large-table[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];if(!node)return;bindLargeTableCard(el,next=>updateDocumentNode(node,next,true,'large-table-source'));bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));});
  bindTikzCards(host);host.querySelectorAll('.tikz-card[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];if(node)bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));});
  host.querySelectorAll('.doc-columns[data-node-id],.doc-columns-flow[data-node-id]').forEach(el=>bindDocumentColumns(el,byId[el.dataset.nodeId]));
- host.querySelectorAll('.doc-vspace[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));});
+ host.querySelectorAll('.doc-vspace[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));const amount=String(node&&node.block&&node.block.spaceAmount||'');if(['smallskip','medskip','bigskip'].includes(amount)){el.title=amount+' — double-click to change';el.addEventListener('dblclick',e=>{e.preventDefault();e.stopPropagation();openLabsDialog('Edit vertical spacing',[{id:'preset',label:'Spacing',type:'select',value:String(node.block.spaceAmount||'medskip'),options:[['smallskip','Small'],['medskip','Medium'],['bigskip','Large']]}],v=>{const preset=String(v.preset||'medskip');node.block.spaceAmount=preset;updateDocumentNode(node,'\\'+preset+'{}',true,'vertical-spacing');return true;},'Named LaTeX spacing is preserved in Source and shown as whitespace in Visual.','Save');});}});
  host.querySelectorAll('.doc-break[data-node-id]').forEach(el=>{const node=byId[el.dataset.nodeId];bindSemanticBlockSelection(el,()=>updateDocumentNode(node,'',true));});
  host.querySelectorAll('.doc-rich-block[data-node-id]').forEach(el=>bindDocumentRichBlock(el,byId[el.dataset.nodeId]));host.querySelectorAll('.comment-marker[data-node-id]').forEach(marker=>{const node=byId[marker.dataset.nodeId];if(node)marker.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();openDocumentCommentInspector(node,marker);});});
  host.querySelectorAll('.doc-before-first-slot[data-before-node-id]').forEach(slot=>{
@@ -6078,6 +6376,7 @@ function bindVisualFrame(host,i){const f=frames[i];if(!f)return;if(f.disabled){c
 function renderWorkspace(){mode='frames';current=Math.max(0,Math.min(current,frames.length-1));renderNav();updateFrameTextSizeMenu();updateBeamerFrameActions();document.querySelectorAll('.mode-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===viewMode));const c=document.getElementById('content');c.className='workspace';if(viewMode==='source'){c.innerHTML=sourceEditorHtml();bindSourceEditor(c);return;}if(viewMode==='pdf'){const hasPdf=!!pdfUri;const status=pdfBuildState==='building'?'Compiling…':pdfBuildState==='error'?pdfBuildMessage:(hasPdf?(pdfBuildMessage||'PDF ready.'):'No compiled PDF found.');c.innerHTML='<section class="pdf-shell"><div class="pdf-head"><span>Compiled PDF</span><button class="top-action" id="pdf-refresh">Refresh</button>'+(hasPdf?'<button class="top-action" id="pdf-open">Open PDF</button>':'')+'<button class="top-action primary" id="pdf-compile">Compile</button></div><div class="pdf-empty"><div><div style="font-size:28px;margin-bottom:12px">'+(pdfBuildState==='building'?'⏳':pdfBuildState==='error'?'⚠':'✓')+'</div><div>'+esc(status)+'</div>'+(hasPdf?'<div style="margin-top:8px;font-size:12px">TeXFlow uses the native VS Code PDF viewer to avoid the blank grey embedded-PDF bug.</div>':'')+'</div></div></section>';document.getElementById('pdf-refresh').onclick=()=>vscode.postMessage({type:'refreshPdf'});const open=document.getElementById('pdf-open');if(open)open.onclick=()=>vscode.postMessage({type:'openPdf'});document.getElementById('pdf-compile').onclick=()=>vscode.postMessage({type:'compile'});return;}if(!isBeamer){if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane document-pane">'+visualDocumentHtml()+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualDocument(c.querySelector('.visual-pane'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualDocumentHtml();bindVisualDocument(c);return;}if(viewMode==='split'){c.innerHTML='<div class="split-workspace"><div class="split-pane visual-pane">'+visualFrameHtml(frames[current])+'</div><div class="split-pane source-pane">'+sourceEditorHtml(true)+'</div></div>';bindVisualFrame(c.querySelector('.visual-pane'),current);scheduleSlideFit(c.querySelector('.visual-pane .slide'));bindSourceEditor(c.querySelector('.source-pane'));return;}c.innerHTML=visualFrameHtml(frames[current]);bindVisualFrame(c,current);scheduleSlideFit(c.querySelector('.slide'));}
 function renderFrame(i){current=i;renderWorkspace();if(window.innerWidth<900&&typeof setNav==='function')setNav(false);}
 function renderBlock(b,fi){const wrap=document.createElement('div');wrap.className='block '+alignClass(b.align,b.kind==='itemize'?'left':'justify');wrap.dataset.blockId=String(b.id||'');if(b.hidden){wrap.style.display='none';return wrap;}
+ if(b.kind==='raw'&&(b.tableSourceEditable||b.tableOversize)){wrap.className+=' large-table-card semantic-block';wrap.innerHTML=largeTableCardHtml(b);bindLargeTableCard(wrap,next=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{rawSource:next},refresh:true}));bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));return wrap;}
  if(b.kind==='vspace'){wrap.className+=' vspace-block semantic-block';wrap.innerHTML='<span class="vspace-label">vertical '+esc((b.spaceStarred?'* ':'')+(b.spaceAmount||''))+'</span>';bindSemanticBlockSelection(wrap,()=>vscode.postMessage({type:'deleteBlock',frameIndex:fi,blockId:b.id}));return wrap;}
  if(b.kind==='paragraph'){wrap.classList.add('paragraph');wrap.innerHTML='<div class="editable '+alignClass(b.align,'justify')+'" contenteditable="true">'+latexToHtml(b.text)+'</div>';const e=wrap.firstChild;attachEditor(e);const saveParagraph=refresh=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text:editableLatex(e)},refresh};vscode.postMessage(msg);};e.__texflowCommit=(text,feature='')=>{const msg={type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{text},refresh:true,feature};vscode.postMessage(msg);};e.__texflowCommentOutSupported=true;e.__texflowSaveNow=()=>saveParagraph(false);bindBeamerProseEnter(e,fi,b.id);e.addEventListener('input',()=>scheduleSave(e,saveParagraph));e.addEventListener('blur',()=>flushSave(e,saveParagraph));}
  else if(b.kind==='itemize'){const list=createVisualList(b.env,b.items||[]);list.classList.add(alignClass(b.align,'left'));const saveList=refresh=>vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh});list.querySelectorAll('.item-text').forEach(edit=>{edit.__texflowCommit=(text)=>{setEditableLatex(edit,text);vscode.postMessage({type:'updateBlock',frameIndex:fi,blockId:b.id,payload:{items:listItemsPayload(list)},refresh:true});};});bindListEditing(list,saveList);wrap.appendChild(list)}
@@ -6104,18 +6403,21 @@ function renderTable(block,frameIndex,wrap){
  const tableSize=String(block.tableSize||'');wrap.className+=' table-card'+(tableSize?' table-size-'+tableSize:'');const cols=block.tableColumns||[],rows=block.tableRows||[],caption=block.tableCaption||'',label=block.tableLabel||'',captionPosition=block.tableCaptionPosition||'below',initialStyle=tableVisualStyle(block.tableStyle||'plain'),initialVertical=tableBorderArray(block.tableVerticalBorders,cols.length+1),initialHorizontal=tableBorderArray(block.tableHorizontalBorders,rows.length+1);
  const colTools=cols.map((c,i)=>'<label>C'+(i+1)+' <select class="table-col-align" data-col="'+i+'"><option value="l"'+(c==='l'?' selected':'')+'>L</option><option value="c"'+(c==='c'?' selected':'')+'>C</option><option value="r"'+(c==='r'?' selected':'')+'>R</option></select></label>').join('');
  const body=rows.map((r,ri)=>'<tr>'+r.map((cell,ci)=>'<td class="table-cell editable '+tableCellRuleClasses(initialStyle,ri,ci,rows.length,cols.length,initialVertical,initialHorizontal)+'" data-row="'+ri+'" data-col="'+ci+'" contenteditable="true">'+latexToHtml(cell||'')+'</td>').join('')+'</tr>').join('');
- wrap.innerHTML='<div class="table-head"><span class="tag">Table</span><div class="table-controls"><label>Borders <select class="table-style-input">'+tableStyleOptions(initialStyle)+'</select></label><label>Caption <select class="table-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label></div></div><div class="table-column-tools">'+colTools+'</div>'+tableBorderToolsHtml(initialStyle)+'<div class="table-scroll"><table class="semantic-table table-style-'+initialStyle+'"><tbody>'+body+'</tbody></table></div><div class="table-actions"><button type="button" class="table-add-row">+ Row</button><button type="button" class="table-del-row">− Row</button><button type="button" class="table-add-col">+ Column</button><button type="button" class="table-del-col">− Column</button></div><div class="table-fields"><label>Caption <input class="table-caption-input" type="text" value="'+esc(caption)+'"></label><label>Label <input class="table-label-input" type="text" value="'+esc(label)+'"></label></div>';
- const table=wrap.querySelector('.semantic-table'),captionInput=wrap.querySelector('.table-caption-input'),labelInput=wrap.querySelector('.table-label-input'),captionPositionInput=wrap.querySelector('.table-caption-position-input'),styleInput=wrap.querySelector('.table-style-input'),borderTools=wrap.querySelector('.table-border-tools');
+ const advancedTableControls='<div class="table-controls"><label>Borders <select class="table-style-input">'+tableStyleOptions(initialStyle)+'</select></label><label>Caption <select class="table-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label></div><div class="table-column-tools">'+colTools+'</div>'+tableBorderToolsHtml(initialStyle)+'<label>Label <input class="table-label-input" type="text" value="'+esc(label)+'"></label>';
+ wrap.innerHTML='<div class="table-head"><span class="tag">Table</span><button type="button" class="object-edit-toggle" aria-expanded="false" data-texflow-ui="true">Edit</button><button type="button" class="large-table-edit" data-texflow-ui="true">Edit LaTeX</button></div><div class="object-edit-panel" data-texflow-ui="true">'+advancedTableControls+'</div><div class="table-scroll"><table class="semantic-table table-style-'+initialStyle+'"><tbody>'+body+'</tbody></table></div><div class="table-actions"><button type="button" class="table-add-row">+ Row</button><button type="button" class="table-del-row">− Row</button><button type="button" class="table-add-col">+ Column</button><button type="button" class="table-del-col">− Column</button></div><div class="table-fields primary-only"><label>Caption <input class="table-caption-input" type="text" value="'+esc(caption)+'"></label></div>'+tableLatexSourceEditorHtml(String(block.raw||''));
+ const advanced=configureTableEditPanel(wrap,tableSize,block.tablePlacement||'');
+ const table=wrap.querySelector('.semantic-table'),captionInput=wrap.querySelector('.table-caption-input'),labelInput=wrap.querySelector('.table-label-input'),captionPositionInput=wrap.querySelector('.table-caption-position-input'),placementInput=wrap.querySelector('.table-placement-input'),sizeInput=wrap.querySelector('.table-size-input'),styleInput=wrap.querySelector('.table-style-input'),borderTools=wrap.querySelector('.table-border-tools');
  let tableStyle=initialStyle,verticalBorders=[...initialVertical],horizontalBorders=[...initialHorizontal],activeRow=null,activeCol=null;
- function payload(){const currentRows=[...table.querySelectorAll('tbody tr')].map(tr=>[...tr.querySelectorAll('td')].map(td=>editableLatex(td))),currentCols=[...wrap.querySelectorAll('.table-col-align')].map(x=>x.value);return{rows:currentRows,columns:currentCols,caption:captionInput?captionInput.value:'',label:labelInput?labelInput.value:'',captionPosition:captionPositionInput?captionPositionInput.value:'below',tableStyle,verticalBorders:tableBorderArray(verticalBorders,currentCols.length+1),horizontalBorders:tableBorderArray(horizontalBorders,currentRows.length+1)};}
+ function payload(){const currentRows=[...table.querySelectorAll('tbody tr')].map(tr=>[...tr.querySelectorAll('td')].map(td=>editableLatex(td))),currentCols=[...wrap.querySelectorAll('.table-col-align')].map(x=>x.value);return{rows:currentRows,columns:currentCols,caption:captionInput?captionInput.value:'',label:labelInput?labelInput.value:'',placement:placementInput?placementInput.value:String(block.tablePlacement||''),captionPosition:captionPositionInput?captionPositionInput.value:'below',tableSize:sizeInput?sizeInput.value:tableSize,tableStyle,verticalBorders:tableBorderArray(verticalBorders,currentCols.length+1),horizontalBorders:tableBorderArray(horizontalBorders,currentRows.length+1)};}
  const save=(refresh=true)=>vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload:payload(),refresh});
+ bindLargeTableCard(wrap,next=>vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload:{rawSource:next},refresh:true}),()=>serializeDocumentTable({block},payload()));
  function refreshBorderTools(){if(!borderTools)return;borderTools.classList.toggle('hidden',tableStyle!=='custom');const valid=tableStyle==='custom'&&Number.isFinite(activeRow)&&Number.isFinite(activeCol);const target=borderTools.querySelector('.table-border-target');if(target)target.textContent=valid?'R'+(activeRow+1)+' C'+(activeCol+1):'Select a cell';borderTools.querySelectorAll('[data-border-edge]').forEach(btn=>{btn.disabled=!valid;let on=false;if(valid){const edge=btn.dataset.borderEdge;if(edge==='top')on=!!horizontalBorders[activeRow];if(edge==='bottom')on=!!horizontalBorders[activeRow+1];if(edge==='left')on=!!verticalBorders[activeCol];if(edge==='right')on=!!verticalBorders[activeCol+1];}btn.classList.toggle('active',on);});}
  function markActive(cell){wrap.querySelectorAll('.table-cell.table-cell-selected').forEach(x=>x.classList.remove('table-cell-selected'));activeRow=Number(cell&&cell.dataset&&cell.dataset.row);activeCol=Number(cell&&cell.dataset&&cell.dataset.col);if(!Number.isFinite(activeRow))activeRow=null;if(!Number.isFinite(activeCol))activeCol=null;if(cell)cell.classList.add('table-cell-selected');refreshBorderTools();}
  function repaint(){applyTableBorderVisual(table,tableStyle,verticalBorders,horizontalBorders);refreshBorderTools();}
  function focusBeamerCell(target,atEnd=false){if(target)markActive(target);if(!target)return;target.focus();const r=document.createRange();r.selectNodeContents(target);r.collapse(!atEnd);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);}
  function beamerCaretBoundary(cell,which){const sel=getSelection();if(!sel||!sel.rangeCount)return false;const r=sel.getRangeAt(0);if(!r.collapsed||!cell.contains(r.startContainer))return false;const test=r.cloneRange();if(which==='start'){test.selectNodeContents(cell);test.setEnd(r.startContainer,r.startOffset);return test.toString().length===0;}test.selectNodeContents(cell);test.setStart(r.startContainer,r.startOffset);return test.toString().length===0;}
- wrap.querySelectorAll('.table-cell').forEach(cell=>{attachEditor(cell);cell.addEventListener('focus',()=>markActive(cell));cell.addEventListener('mousedown',()=>markActive(cell));cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...wrap.querySelectorAll('.table-cell')],i=cells.indexOf(cell),ncols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/ncols),col=i%ncols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&beamerCaretBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&beamerCaretBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&beamerCaretBoundary(cell,'end')){target=cells[(row+1)*ncols+col]||null;if(!target){e.preventDefault();moveVisualEditableCaret(cell,1,wrap);return;}}else if(e.key==='ArrowUp'&&beamerCaretBoundary(cell,'start')){target=row>0?cells[(row-1)*ncols+col]:null;atEnd=true;if(!target){e.preventDefault();moveVisualEditableCaret(cell,-1,wrap);return;}}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusBeamerCell(target,atEnd);}});});
- wrap.querySelectorAll('.table-col-align').forEach(x=>x.onchange=()=>save(true));if(captionInput)captionInput.onchange=()=>save(true);if(labelInput)labelInput.onchange=()=>save(true);if(captionPositionInput)captionPositionInput.onchange=()=>save(true);
+ wrap.querySelectorAll('.table-cell').forEach(cell=>{attachEditor(cell);cell.__texflowCommit=(text,feature='')=>{setEditableLatex(cell,text);save(false);};cell.__texflowSaveNow=()=>save(false);cell.addEventListener('focus',()=>markActive(cell));cell.addEventListener('mousedown',()=>markActive(cell));cell.addEventListener('blur',()=>save(false));cell.addEventListener('keydown',e=>{const cells=[...wrap.querySelectorAll('.table-cell')],i=cells.indexOf(cell),ncols=Math.max(1,[...table.querySelectorAll('tbody tr:first-child td')].length),row=Math.floor(i/ncols),col=i%ncols;let target=null,atEnd=false;if(e.key==='Tab'){target=cells[(i+(e.shiftKey?-1:1)+cells.length)%cells.length];atEnd=!!e.shiftKey;}else if(e.key==='ArrowRight'&&beamerCaretBoundary(cell,'end'))target=cells[i+1]||null;else if(e.key==='ArrowLeft'&&beamerCaretBoundary(cell,'start')){target=cells[i-1]||null;atEnd=true;}else if(e.key==='ArrowDown'&&beamerCaretBoundary(cell,'end')){target=cells[(row+1)*ncols+col]||null;if(!target){e.preventDefault();moveVisualEditableCaret(cell,1,wrap);return;}}else if(e.key==='ArrowUp'&&beamerCaretBoundary(cell,'start')){target=row>0?cells[(row-1)*ncols+col]:null;atEnd=true;if(!target){e.preventDefault();moveVisualEditableCaret(cell,-1,wrap);return;}}else if(e.key==='Enter'){e.preventDefault();insertSoftBreak();return;}if(target){e.preventDefault();focusBeamerCell(target,atEnd);}});});
+ wrap.querySelectorAll('.table-col-align').forEach(x=>x.onchange=()=>save(true));if(captionInput)captionInput.onchange=()=>save(true);if(labelInput)labelInput.onchange=()=>save(true);if(captionPositionInput)captionPositionInput.onchange=()=>save(true);if(placementInput)placementInput.onchange=()=>save(true);if(sizeInput)sizeInput.onchange=()=>{[...wrap.classList].filter(x=>x.startsWith('table-size-')).forEach(x=>wrap.classList.remove(x));if(sizeInput.value)wrap.classList.add('table-size-'+sizeInput.value);save(true);};
  if(styleInput)styleInput.onchange=()=>{const previous=tableStyle;tableStyle=tableVisualStyle(styleInput.value);const rowCount=[...table.querySelectorAll('tbody tr')].length,colCount=Math.max(0,[...table.querySelectorAll('tbody tr:first-child td')].length);if(tableStyle==='grid'){verticalBorders=Array.from({length:colCount+1},()=>true);horizontalBorders=Array.from({length:rowCount+1},()=>true);}else if(tableStyle==='plain'||tableStyle==='booktabs'){verticalBorders=Array.from({length:colCount+1},()=>false);horizontalBorders=Array.from({length:rowCount+1},()=>false);}else if(previous!=='custom'){verticalBorders=tableBorderArray(verticalBorders,colCount+1);horizontalBorders=tableBorderArray(horizontalBorders,rowCount+1);}repaint();if(tableStyle==='custom')return;save(true);if(tableStyle==='booktabs')setTimeout(()=>vscode.postMessage({type:'ensureFeaturePackage',feature:'booktabs'}),25);};
  if(borderTools){borderTools.querySelectorAll('[data-border-edge]').forEach(btn=>btn.onclick=()=>{if(tableStyle!=='custom'||activeRow===null||activeCol===null)return;const edge=btn.dataset.borderEdge;if(edge==='top')horizontalBorders[activeRow]=!horizontalBorders[activeRow];if(edge==='bottom')horizontalBorders[activeRow+1]=!horizontalBorders[activeRow+1];if(edge==='left')verticalBorders[activeCol]=!verticalBorders[activeCol];if(edge==='right')verticalBorders[activeCol+1]=!verticalBorders[activeCol+1];repaint();save(false);});const all=borderTools.querySelector('.table-border-all'),clear=borderTools.querySelector('.table-border-clear');if(all)all.onclick=()=>{verticalBorders=verticalBorders.map(()=>true);horizontalBorders=horizontalBorders.map(()=>true);repaint();save(false);};if(clear)clear.onclick=()=>{verticalBorders=verticalBorders.map(()=>false);horizontalBorders=horizontalBorders.map(()=>false);repaint();save(false);};}
  const mutate=(fn)=>{const p=payload();if(fn(p)!==false)vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload:p,refresh:true});};
@@ -6136,7 +6438,8 @@ function renderFigure(block,frameIndex,wrap){
  const raw=String(block.raw||''),tikzMatch=/\\begin\{tikzpicture\}(?:\[[^\]]*\])?[\s\S]*?\\end\{tikzpicture\}/.exec(raw),isTikz=!!tikzMatch;
  const parsedItems=Array.isArray(block.figureItems)?block.figureItems.filter(x=>x&&x.path):[],multi=!isTikz&&parsedItems.length>1,layout=String(block.figureLayout||'side-by-side')==='stacked'?'stacked':'side-by-side';
  wrap.className+=' figure figure-card'+(isTikz?' tikz-figure':'')+(multi?' multi-figure-card':'');const res=figureResource(block,frameIndex),width=relativeWidth(block),height=relativeHeight(block),caption=block.figureCaption||'',figLabel=block.figureLabel||'',placement=block.figurePlacement||'',captionPosition=block.figureCaptionPosition||'below',align=block.figureAlign||block.align||'center',isFloat=String(block.env||'')==='figure';
- const imageTools=isTikz||multi?'':'<label><input class="figure-lock" type="checkbox" checked> lock</label><label>W(%) <input class="figure-width-input" type="number" min="5" max="100" step="1" value="'+Math.round(width)+'"></label><label class="height-control" style="display:none">H <input class="figure-height-input" type="number" min="5" max="100" step="1" value="'+Math.round(height||40)+'">%</label><button type="button" class="figure-replace-action single-figure-replace" title="Replace" aria-label="Replace figure">Rep…</button>';
+ const primaryImageTools=isTikz||multi?'':'<label>W(%) <input class="figure-width-input" type="number" min="5" max="100" step="1" value="'+Math.round(width)+'"></label><button type="button" class="figure-replace-action single-figure-replace" title="Replace" aria-label="Replace figure">Rep…</button>';
+ const advancedImageTools=isTikz||multi?'':'<label><input class="figure-lock" type="checkbox" checked> lock ratio</label><label class="height-control" style="display:none">H(%) <input class="figure-height-input" type="number" min="5" max="100" step="1" value="'+Math.round(height||40)+'"></label>';
  const layoutTool=multi?'<label>Layout <select class="figure-layout-input"><option value="side-by-side"'+(layout==='side-by-side'?' selected':'')+'>Side by side</option><option value="stacked"'+(layout==='stacked'?' selected':'')+'>Stacked</option></select></label>':'';
  const tag=isTikz?'TikZ figure':multi?'Figure · '+parsedItems.length+' images':'Figure';
  const name=isTikz?'TikZ drawing':multi?'Multiple images':(block.figurePath||'image');
@@ -6145,15 +6448,17 @@ function renderFigure(block,frameIndex,wrap){
   const itemHtml=parsedItems.map((item,i)=>{const path=String(item.path||''),displayName=(path.split(/[\\/]/).pop()||path),subcaption=String(item.caption||''),r=figureResourceForPath(path,frameIndex),iw=figureItemWidthPercent(item),cw=figureItemContainerPercent(item,parsedItems.length);let media='';if(r){if(r.isPdf)media='<object data="'+esc(r.uri)+'#toolbar=0&navpanes=0" type="application/pdf"><div class="figure-placeholder">PDF figure<br>'+esc(path)+'</div></object>';else if(['png','jpg','jpeg','svg','webp','gif'].includes(r.extension))media='<img src="'+esc(r.uri)+'" alt="'+esc(path)+'">';else media='<div class="figure-placeholder">Preview unavailable<br>'+esc(path)+'</div>';}else media='<div class="figure-placeholder">Figure not found<br>'+esc(path)+'</div>';return '<div class="multi-figure-item" data-index="'+i+'" data-container-width="'+cw+'" style="--item-container:'+cw+'%;--item-image:'+iw+'%"><div class="multi-figure-preview"><div class="multi-figure-media" style="width:'+iw+'%">'+media+'<span class="figure-resize multi-figure-resize" data-index="'+i+'" title="Drag to resize"></span></div></div><div class="multi-figure-tools" data-texflow-ui="true"><span class="multi-figure-path" title="'+esc(path)+'">'+esc(displayName)+'</span><label>W(%) <input class="multi-figure-width" data-index="'+i+'" type="number" min="5" max="100" step="1" value="'+Math.round(iw)+'"></label><button type="button" class="figure-replace-action multi-figure-replace" data-index="'+i+'" title="Replace" aria-label="Replace figure">Rep…</button></div><label class="multi-figure-subcaption" data-texflow-ui="true"><span>Caption</span><input class="multi-figure-caption" data-index="'+i+'" type="text" placeholder="Optional" value="'+esc(subcaption)+'"></label></div>';}).join('');
   stageInner='<div class="multi-figure-grid layout-'+layout+'">'+itemHtml+'</div>';
  }else stageInner='<div class="figure-visual'+(res&&res.isPdf?' pdf':'')+'" style="width:'+(isTikz?100:width)+'%"><div class="figure-media"></div>'+(isTikz?'':'<span class="figure-size">'+Math.round(width)+'%</span><span class="figure-resize" title="Drag to resize"></span>')+'</div>';
- wrap.innerHTML='<div class="figure-head"><span class="tag">'+tag+'</span><span class="figure-name">'+esc(name)+'</span><div class="figure-controls">'+layoutTool+imageTools+(isFloat?'<label>Align <select class="figure-align-input"><option value="left"'+(align==='left'?' selected':'')+'>Left</option><option value="center"'+(align==='center'?' selected':'')+'>Center</option><option value="right"'+(align==='right'?' selected':'')+'>Right</option></select></label><label>Caption <select class="figure-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label>':'')+'</div></div><div class="figure-stage '+alignClass(align,'center')+'">'+stageInner+'</div>'+(isFloat?'<div class="doc-figure-fields"><label>Caption <input class="figure-caption-input" type="text" value="'+esc(caption)+'"></label><label>Label <input class="figure-label-input" type="text" value="'+esc(figLabel)+'" spellcheck="false"></label></div>':'')+(caption?'<div class="figure-caption">'+latexToHtml(caption)+'</div>':'');
- const visual=wrap.querySelector('.figure-visual'),media=wrap.querySelector('.figure-media'),stage=wrap.querySelector('.figure-stage'),lock=wrap.querySelector('.figure-lock'),wi=wrap.querySelector('.figure-width-input'),hi=wrap.querySelector('.figure-height-input'),hc=wrap.querySelector('.height-control'),sizeLabel=wrap.querySelector('.figure-size'),captionInput=wrap.querySelector('.figure-caption-input'),labelInput=wrap.querySelector('.figure-label-input'),alignInput=wrap.querySelector('.figure-align-input'),captionPositionInput=wrap.querySelector('.figure-caption-position-input'),layoutInput=wrap.querySelector('.figure-layout-input'),singleReplace=wrap.querySelector('.single-figure-replace');
+ const advancedFigureControls=layoutTool+advancedImageTools+(isFloat?'<label>Align <select class="figure-align-input"><option value="left"'+(align==='left'?' selected':'')+'>Left</option><option value="center"'+(align==='center'?' selected':'')+'>Center</option><option value="right"'+(align==='right'?' selected':'')+'>Right</option></select></label><label>Caption <select class="figure-caption-position-input"><option value="below"'+(captionPosition==='below'?' selected':'')+'>Below</option><option value="above"'+(captionPosition==='above'?' selected':'')+'>Above</option></select></label><label>Label <input class="figure-label-input" type="text" value="'+esc(figLabel)+'" spellcheck="false"></label>':'');
+ wrap.innerHTML='<div class="figure-head"><span class="tag">'+tag+'</span><span class="figure-name">'+esc(name)+'</span><div class="figure-controls">'+primaryImageTools+'</div><button type="button" class="object-edit-toggle" aria-expanded="false" data-texflow-ui="true">Edit</button></div><div class="object-edit-panel" data-texflow-ui="true">'+advancedFigureControls+'</div><div class="figure-stage '+alignClass(align,'center')+'">'+stageInner+'</div>'+(isFloat?'<div class="doc-figure-fields primary-only"><label>Caption <input class="figure-caption-input" type="text" value="'+esc(caption)+'"></label></div>':'')+(caption?'<div class="figure-caption">'+latexToHtml(caption)+'</div>':'');
+ configureFigureEditPanel(wrap,placement);
+ const visual=wrap.querySelector('.figure-visual'),media=wrap.querySelector('.figure-media'),stage=wrap.querySelector('.figure-stage'),lock=wrap.querySelector('.figure-lock'),wi=wrap.querySelector('.figure-width-input'),hi=wrap.querySelector('.figure-height-input'),hc=wrap.querySelector('.height-control'),sizeLabel=wrap.querySelector('.figure-size'),captionInput=wrap.querySelector('.figure-caption-input'),labelInput=wrap.querySelector('.figure-label-input'),alignInput=wrap.querySelector('.figure-align-input'),placementInput=wrap.querySelector('.figure-placement-input'),captionPositionInput=wrap.querySelector('.figure-caption-position-input'),layoutInput=wrap.querySelector('.figure-layout-input'),singleReplace=wrap.querySelector('.single-figure-replace');
  if(isTikz&&tikzMatch){const f=frames[frameIndex]||{},frameRaw=String(f.raw||''),body=String(f.body||''),bodyAt=body?frameRaw.indexOf(body):-1,base=Number(f.start||0)+(bodyAt>=0?bodyAt:0),start=base+Number(block.start||0)+Number(tikzMatch.index||0),end=start+tikzMatch[0].length;media.innerHTML=tikzCardHtml(block.id+'-tikz',tikzMatch[0],f.sourceUri||activeUri,start,end,'frame',frameIndex,true);}else if(!multi){const slide=wrap.closest('.slide');function heightPixels(percent){return Math.max(55,(slide?slide.clientHeight:620)*percent/100)}if(height&&visual)visual.style.height=heightPixels(height)+'px';if(res){if(res.isPdf)media.innerHTML='<object data="'+esc(res.uri)+'#toolbar=0&navpanes=0" type="application/pdf" aria-label="'+esc(block.figurePath)+'"><div class="figure-placeholder">PDF figure<br>'+esc(block.figurePath)+'</div></object>';else if(['png','jpg','jpeg','svg','webp','gif'].includes(res.extension))media.innerHTML='<img src="'+esc(res.uri)+'" alt="'+esc(block.figurePath)+'">';else media.innerHTML='<div class="figure-placeholder">Preview unavailable<br>'+esc(block.figurePath)+'</div>';}else media.innerHTML='<div class="figure-placeholder">Figure not found<br>'+esc(block.figurePath||'')+'</div>';const loadedImage=media&&media.querySelector?media.querySelector('img'):null;if(loadedImage)loadedImage.addEventListener('load',()=>{const slide=wrap.closest('.slide');if(slide)scheduleSlideFit(slide);},{once:true});}
  function multiPayload(){return parsedItems.map((item,i)=>{const input=wrap.querySelector('.multi-figure-width[data-index="'+i+'"]'),captionInput=wrap.querySelector('.multi-figure-caption[data-index="'+i+'"]');return{path:String(item.path||''),width:input?Math.max(5,Math.min(100,Number(input.value)||100))/100:Number(item.width)||1,widthUnit:String(item.widthUnit||'\linewidth'),height:Number(item.height)||0,heightUnit:String(item.heightUnit||'\textheight'),angle:Number(item.angle)||0,containerWidth:Number(item.containerWidth)||0,containerWidthUnit:String(item.containerWidthUnit||'\textwidth'),caption:captionInput?captionInput.value:String(item.caption||'')};});}
- function save(){const payload={caption:captionInput?captionInput.value:caption,label:labelInput?labelInput.value:figLabel,align:alignInput?alignInput.value:align,placement,captionPosition:captionPositionInput?captionPositionInput.value:'below'};if(multi){payload.items=multiPayload();payload.layout=layoutInput?layoutInput.value:layout;}else if(wi&&lock){payload.width=Math.max(5,Math.min(100,Number(wi.value)||70))/100;payload.widthUnit=block.figureWidthUnit||'\\linewidth';payload.height=lock.checked?0:Math.max(5,Math.min(100,Number(hi&&hi.value)||40))/100;payload.heightUnit=block.figureHeightUnit||'\\textheight';payload.keepAspect=lock.checked;}vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload});}
+ function save(){const payload={caption:captionInput?captionInput.value:caption,label:labelInput?labelInput.value:figLabel,align:alignInput?alignInput.value:align,placement:placementInput?placementInput.value:placement,captionPosition:captionPositionInput?captionPositionInput.value:'below'};if(multi){payload.items=multiPayload();payload.layout=layoutInput?layoutInput.value:layout;}else if(wi&&lock){payload.width=Math.max(5,Math.min(100,Number(wi.value)||70))/100;payload.widthUnit=block.figureWidthUnit||'\\linewidth';payload.height=lock.checked?0:Math.max(5,Math.min(100,Number(hi&&hi.value)||40))/100;payload.heightUnit=block.figureHeightUnit||'\\textheight';payload.keepAspect=lock.checked;}vscode.postMessage({type:'updateBlock',frameIndex,blockId:block.id,payload});}
  if(multi){wrap.querySelectorAll('.multi-figure-width').forEach(input=>input.onchange=()=>{const i=Number(input.dataset.index)||0,w=Math.max(5,Math.min(100,Number(input.value)||100));input.value=String(Math.round(w));const item=wrap.querySelector('.multi-figure-item[data-index="'+i+'"]'),preview=item&&item.querySelector('.multi-figure-media');if(preview)preview.style.width=w+'%';save();});wrap.querySelectorAll('.multi-figure-caption').forEach(input=>input.onchange=save);wrap.querySelectorAll('.multi-figure-resize').forEach(handle=>handle.addEventListener('pointerdown',e=>{e.preventDefault();e.stopPropagation();const i=Number(handle.dataset.index)||0,item=wrap.querySelector('.multi-figure-item[data-index="'+i+'"]'),preview=item&&item.querySelector('.multi-figure-preview'),media=item&&item.querySelector('.multi-figure-media'),input=wrap.querySelector('.multi-figure-width[data-index="'+i+'"]');if(!preview||!media||!input)return;handle.setPointerCapture(e.pointerId);document.body.classList.add('figure-resizing');const pr=preview.getBoundingClientRect(),mr=media.getBoundingClientRect(),sx=e.clientX,sw=mr.width;function move(ev){const nw=Math.max(pr.width*.05,Math.min(pr.width,sw+(ev.clientX-sx))),wp=nw/Math.max(1,pr.width)*100;input.value=String(Math.round(wp));media.style.width=wp+'%';}function up(ev){handle.releasePointerCapture(ev.pointerId);handle.removeEventListener('pointermove',move);handle.removeEventListener('pointerup',up);handle.removeEventListener('pointercancel',up);document.body.classList.remove('figure-resizing');save();}handle.addEventListener('pointermove',move);handle.addEventListener('pointerup',up);handle.addEventListener('pointercancel',up);}));wrap.querySelectorAll('.multi-figure-replace').forEach(btn=>btn.onclick=()=>vscode.postMessage({type:'replaceFigureItem',frameIndex,blockId:block.id,itemIndex:Number(btn.dataset.index)||0}));if(layoutInput)layoutInput.onchange=()=>{const grid=wrap.querySelector('.multi-figure-grid');if(grid){grid.classList.toggle('layout-side-by-side',layoutInput.value==='side-by-side');grid.classList.toggle('layout-stacked',layoutInput.value==='stacked');}save();};wrap.querySelectorAll('.multi-figure-media img').forEach(img=>img.addEventListener('load',()=>{const slide=wrap.closest('.slide');if(slide)scheduleSlideFit(slide);},{once:true}));}
  if(!isTikz&&!multi&&lock&&wi&&hi&&hc&&visual&&stage&&sizeLabel){const slide=wrap.closest('.slide');function heightPixels(percent){return Math.max(55,(slide?slide.clientHeight:620)*percent/100)}function applyInputs(){const w=Math.max(5,Math.min(100,Number(wi.value)||70));visual.style.width=w+'%';sizeLabel.textContent=Math.round(w)+'%';if(!lock.checked){const h=Math.max(5,Math.min(100,Number(hi.value)||40));visual.style.height=heightPixels(h)+'px'}else visual.style.height='';}lock.onchange=()=>{hc.style.display=lock.checked?'none':'flex';applyInputs();save()};wi.onchange=()=>{applyInputs();save()};hi.onchange=()=>{applyInputs();save()};const handle=wrap.querySelector('.figure-resize');if(handle)handle.addEventListener('pointerdown',e=>{e.preventDefault();e.stopPropagation();handle.setPointerCapture(e.pointerId);document.body.classList.add('figure-resizing');const sr=stage.getBoundingClientRect(),vr=visual.getBoundingClientRect(),sx=e.clientX,sy=e.clientY,sw=vr.width,sh=vr.height;function move(ev){const nw=Math.max(sr.width*.08,Math.min(sr.width,sw+(ev.clientX-sx))),wp=nw/sr.width*100;wi.value=String(Math.round(wp));visual.style.width=wp+'%';sizeLabel.textContent=Math.round(wp)+'%';if(!lock.checked){const nh=Math.max(55,sh+(ev.clientY-sy)),hp=Math.min(100,nh/Math.max(1,(slide?slide.clientHeight:620))*100);hi.value=String(Math.round(hp));visual.style.height=hp+'%'}}function up(ev){handle.releasePointerCapture(ev.pointerId);handle.removeEventListener('pointermove',move);handle.removeEventListener('pointerup',up);handle.removeEventListener('pointercancel',up);document.body.classList.remove('figure-resizing');save()}handle.addEventListener('pointermove',move);handle.addEventListener('pointerup',up);handle.addEventListener('pointercancel',up)});}
  if(singleReplace)singleReplace.onclick=()=>vscode.postMessage({type:'replaceFigureItem',frameIndex,blockId:block.id,itemIndex:0});
- if(captionInput)captionInput.onchange=save;if(labelInput)labelInput.onchange=save;if(alignInput)alignInput.onchange=()=>{if(stage){stage.classList.remove('align-left','align-center','align-right','align-justify');stage.classList.add(alignClass(alignInput.value,'center'));}save()};if(captionPositionInput)captionPositionInput.onchange=save;
+ if(captionInput)captionInput.onchange=save;if(labelInput)labelInput.onchange=save;if(alignInput)alignInput.onchange=()=>{if(stage){stage.classList.remove('align-left','align-center','align-right','align-justify');stage.classList.add(alignClass(alignInput.value,'center'));}save()};if(placementInput)placementInput.onchange=save;if(captionPositionInput)captionPositionInput.onchange=save;
 }
 const mathSymbols={
  Greek:[['α','\\alpha'],['β','\\beta'],['γ','\\gamma'],['δ','\\delta'],['ε','\\epsilon'],['ζ','\\zeta'],['η','\\eta'],['θ','\\theta'],['ι','\\iota'],['κ','\\kappa'],['λ','\\lambda'],['μ','\\mu'],['ν','\\nu'],['ξ','\\xi'],['π','\\pi'],['ρ','\\rho'],['σ','\\sigma'],['τ','\\tau'],['φ','\\phi'],['χ','\\chi'],['ψ','\\psi'],['ω','\\omega'],['Γ','\\Gamma'],['Δ','\\Delta'],['Θ','\\Theta'],['Λ','\\Lambda'],['Ξ','\\Xi'],['Π','\\Pi'],['Σ','\\Sigma'],['Φ','\\Phi'],['Ψ','\\Psi'],['Ω','\\Omega']],
@@ -6165,7 +6470,7 @@ const mathSymbols={
  Arrows:[['→','\\rightarrow'],['←','\\leftarrow'],['↔','\\leftrightarrow'],['⇒','\\Rightarrow'],['⇐','\\Leftarrow'],['⇔','\\Leftrightarrow'],['↦','\\mapsto'],['↑','\\uparrow'],['↓','\\downarrow'],['↗','\\nearrow'],['↘','\\searrow']],
  Sets:[['∅','\\emptyset'],['ℝ','\\mathbb{R}'],['ℕ','\\mathbb{N}'],['ℤ','\\mathbb{Z}'],['ℚ','\\mathbb{Q}'],['ℂ','\\mathbb{C}'],['∪','\\cup'],['∩','\\cap'],['\\','\\setminus'],['∀','\\forall'],['∃','\\exists'],['¬','\\neg'],['∧','\\land'],['∨','\\lor']]
 };
-let mathEditing=null,mathCategory='Structures',lastVisualCursor=null,lastVisualSelection=null,lastMathStructuredField=null;
+let mathEditing=null,mathCategory='Structures',lastVisualCursor=null,lastVisualSelection=null,lastTableCellCursor=null,lastMathStructuredField=null;
 let mathMatrixRows=2,mathMatrixCols=2;
 function mathStructure(){return document.getElementById('math-structure').value||'display';}
 function mathCleanLabel(value){return String(value||'').trim().replace(/[{}\\\s]/g,'');}
@@ -6225,14 +6530,21 @@ function structureFromMathUi(){const object=document.getElementById('math-object
 function reconfigureMathFromUi(){const ta=document.getElementById('math-code'),text=String(ta.value||''),numbered=document.getElementById('math-numbered').checked,label=document.getElementById('math-label').value,structure=structureFromMathUi();configureMathStructure(structure,text,numbered,label);}
 function configureMathStructure(structure,text='',numbered=true,label=''){const sel=document.getElementById('math-structure');sel.value=structure;document.getElementById('math-numbered').checked=!!numbered;document.getElementById('math-label').value=label||'';syncMathUiFromStructure(structure,numbered);document.getElementById('math-align-builder').classList.toggle('open',structure==='align');document.getElementById('math-cases-builder').classList.toggle('open',structure==='cases');document.getElementById('math-multline-builder').classList.toggle('open',structure==='multline');document.getElementById('math-matrix-builder').classList.toggle('open',structure==='matrix');const ta=document.getElementById('math-code');ta.classList.toggle('structured-source',['align','cases','multline','matrix'].includes(structure));if(structure==='align')loadAlignBuilder(text,numbered);else if(structure==='cases')loadCasesBuilder(text);else if(structure==='multline')loadMultlineBuilder(text);else if(structure==='matrix')loadMatrixBuilder(text);ta.value=text||'';if(['align','cases','multline','matrix'].includes(structure))syncMathStructuredSource();else updateMathPreview();}
 function inferMathStructure(block){const env=String(block&&block.env||'');const text=String(block&&block.text||'');if(/^align/.test(env))return'align';if(/^gather/.test(env))return'gather';if(/^multline/.test(env))return'multline';if(/\\begin\{cases\}/.test(text))return'cases';if(/\\begin\{(?:matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}/.test(text))return'matrix';if(/^equation/.test(env))return'equation';return'display';}
+function tableCellCursorState(editable,range){
+ if(!editable||!range||!(editable.matches('.doc-table-cell,.table-cell')))return null;
+ const documentCell=editable.classList.contains('doc-table-cell'),root=documentCell?editable.closest('.doc-table[data-node-id]'):editable.closest('[data-block-id]');if(!root)return null;
+ let start=0,end=0;try{const before=rangePartLatex(editable,range,'before'),selected=rangePartLatex(editable,range,'selected');start=before.length;end=start+selected.length;}catch{}
+ const cellSelector=documentCell?'.doc-table-cell':'.table-cell',rows=[...root.querySelectorAll('tbody tr')].map(tr=>[...tr.querySelectorAll(cellSelector)].map(td=>editableLatex(td))),columns=[...root.querySelectorAll('.table-col-align')].map(x=>x.value||'c');
+ return{mode:documentCell?'document':'beamer',nodeId:documentCell?String(root.dataset.nodeId||''):'',blockId:documentCell?'':String(root.dataset.blockId||''),frameIndex:current,row:Number(editable.dataset.row)||0,col:Number(editable.dataset.col)||0,start,end,rows,columns,caption:String(root.querySelector('.table-caption-input')?.value||''),label:String(root.querySelector('.table-label-input')?.value||''),placement:String(root.querySelector('.table-placement-input')?.value||''),captionPosition:String(root.querySelector('.table-caption-position-input')?.value||'below'),tableSize:String(root.querySelector('.table-size-input')?.value||''),tableStyle:String(root.querySelector('.table-style-input')?.value||'')};
+}
 function rememberVisualCursor(){
  const sel=window.getSelection();if(!sel||!sel.rangeCount)return;
  const range=sel.getRangeAt(0);let node=range.startContainer.nodeType===Node.ELEMENT_NODE?range.startContainer:range.startContainer.parentElement;
  const editable=node&&node.closest?node.closest('.slide .editable[contenteditable=true], .slide .empty-frame-body[contenteditable=true], .document-sheet .doc-editable[contenteditable=true], .document-continuous .doc-editable[contenteditable=true]'):null;
  if(!editable||!editable.__texflowCommit)return;
  try{
-  const saved={editable,range:range.cloneRange(),frameIndex:current};
-  lastVisualCursor=saved;
+  const tableCell=tableCellCursorState(editable,range),saved={editable,range:range.cloneRange(),frameIndex:current,tableCell};
+  lastVisualCursor=saved;if(tableCell)lastTableCellCursor=tableCell;else lastTableCellCursor=null;
   // Keep a dedicated non-collapsed selection snapshot. Opening a top menu can
   // move focus away from the editor, but Comment out selection must still act
   // on the text the user selected immediately before opening the menu.
@@ -6349,8 +6661,9 @@ function snapshotVisualCursor(){
  rememberVisualCursor();
  const ctx=lastVisualCursor;
  if(ctx&&ctx.editable&&ctx.editable.isConnected&&ctx.editable.__texflowCommit&&ctx.range&&ctx.range.cloneRange){
-  const r=ctx.range.cloneRange();if(ctx.editable.contains(r.startContainer))return{editable:ctx.editable,range:r,frameIndex:ctx.frameIndex};
+  const r=ctx.range.cloneRange();if(ctx.editable.contains(r.startContainer))return{editable:ctx.editable,range:r,frameIndex:ctx.frameIndex,tableCell:ctx.tableCell||null};
  }
+ if(lastTableCellCursor)return{editable:null,range:null,frameIndex:lastTableCellCursor.frameIndex,tableCell:{...lastTableCellCursor}};
  if(activeEditable&&activeEditable.isConnected&&activeEditable.__texflowCommit){
   const r=document.createRange();r.selectNodeContents(activeEditable);r.collapse(false);return{editable:activeEditable,range:r,frameIndex:current};
  }
@@ -6359,6 +6672,21 @@ function snapshotVisualCursor(){
 function openCitationPicker(){citationAnchor=snapshotVisualCursor();citationSelection=new Set();const modal=document.getElementById('cite-modal');document.getElementById('cite-search').value='';document.getElementById('cite-open-bib').disabled=!bibliographyResources.length;document.getElementById('cite-insert').disabled=true;configureCitationStyle();modal.classList.add('open');modal.setAttribute('aria-hidden','false');renderCitationResults();setTimeout(()=>document.getElementById('cite-search').focus(),0);}
 function closeCitationPicker(){const modal=document.getElementById('cite-modal');modal.classList.remove('open');modal.setAttribute('aria-hidden','true');citationSelection.clear();citationAnchor=null;}
 function rememberedStructuralCursorPos(explicitCtx=null){const ctx=explicitCtx||citationAnchor||lastVisualCursor;if(!ctx||!ctx.editable||!ctx.editable.isConnected)return null;const host=ctx.editable.closest('[data-node-id]')||ctx.editable;const id=host&&host.dataset?host.dataset.nodeId:null;const node=id?documentFlowById[id]:null;return node&&Number.isFinite(node.end)?Number(node.end):null;}
+function captureBlockInsertionAnchor(explicitCtx=null){
+ const ctx=explicitCtx||snapshotVisualCursor()||lastVisualCursor,base={cursorPos:rememberedStructuralCursorPos(ctx)};
+ if(isBeamer||!ctx||!ctx.editable||!ctx.editable.isConnected||!ctx.range||!ctx.range.cloneRange)return base;
+ const editable=ctx.editable;if(!editable.classList.contains('doc-paragraph'))return base;
+ const range=ctx.range.cloneRange();if(!range.collapsed||!editable.contains(range.startContainer))return base;
+ if(typeof editable.__texflowSaveNow==='function')editable.__texflowSaveNow();
+ const id=editable.dataset&&editable.dataset.nodeId,node=id?documentFlowById[id]:null;
+ if(!node||node.synthetic||!Number.isFinite(node.start)||!Number.isFinite(node.end))return base;
+ const beforeText=rangePartLatex(editable,range,'before').trimEnd(),afterText=rangePartLatex(editable,range,'after').trimStart();
+ // Match the source that __texflowSaveNow() just queued, not the stale parser
+ // snapshot. This keeps the anchor valid when the user edits a paragraph and
+ // immediately opens Insert before the autosave debounce has completed.
+ const expected=paragraphSource(node,editableLatex(editable));if(!expected)return base;
+ return{cursorPos:Number(node.end),split:{start:Number(node.start),end:Number(node.end),expected,before:beforeText?paragraphSource(node,beforeText):'',after:afterText?paragraphSource(node,afterText):''}};
+}
 function rangePartLatex(editable,range,part){const r=document.createRange();r.selectNodeContents(editable);if(part==='before')r.setEnd(range.startContainer,range.startOffset);else if(part==='selected'){r.setStart(range.startContainer,range.startOffset);r.setEnd(range.endContainer,range.endOffset);}else r.setStart(range.endContainer,range.endOffset);const box=document.createElement('div');box.appendChild(r.cloneContents());return editorToLatex(box);}
 function commentOutSelectedText(){
  // Prefer the last real text selection over the generic cursor snapshot.
@@ -6397,7 +6725,7 @@ function normalizeAtomicInsertionRange(editable,range){
 function citationCodeParts(code){const m=/^\\(parencite|textcite|autocite|citep|citet|cite)\{([^}]*)\}$/.exec(String(code||''));return m?{cmd:m[1],keys:m[2]}:null;}
 function referenceCodeParts(code){const m=/^\\(eqref|ref|autoref|cref|Cref|pageref|vref|Vref)\{([^}]*)\}$/.exec(String(code||''));return m?{cmd:m[1],key:m[2]}:null;}
 function restoreCaretAfterInsertedLatex(editable,code,occurrence){
- const parts=citationCodeParts(code),refParts=referenceCodeParts(code),spaceParts=/^\\hspace(\*)?\{([^}]+)\}$/.exec(String(code||''));let boundary=null;
+ const parts=citationCodeParts(code),refParts=referenceCodeParts(code),spaceParts=/^\\hspace(\*)?\{([^}]+)\}$/.exec(String(code||'')),footnoteParts=/^\\footnote(?:\[[^\]]+\])?\{([\s\S]*)\}$/.exec(String(code||''));let boundary=null;
  if(parts){
   const matches=[...editable.querySelectorAll('.bib-citation')].filter(el=>(el.dataset.citeCommand||'cite')===parts.cmd&&(el.dataset.citeKeys||'')===parts.keys);
   boundary=matches[Math.min(Math.max(0,occurrence),Math.max(0,matches.length-1))]||null;
@@ -6407,13 +6735,28 @@ function restoreCaretAfterInsertedLatex(editable,code,occurrence){
  }else if(spaceParts){
   const amount=spaceParts[2],star=!!spaceParts[1];const matches=[...editable.querySelectorAll('.tex-hspace')].filter(el=>(el.dataset.spaceAmount||'')===amount&&(el.dataset.spaceStarred==='true')===star);
   boundary=matches[Math.min(Math.max(0,occurrence),Math.max(0,matches.length-1))]||null;
+ }else if(footnoteParts){
+  const text=footnoteParts[1];const matches=[...editable.querySelectorAll('.tex-footnote')].filter(el=>decodeURIComponent(el.dataset.footnote||'')===text);
+  boundary=matches[Math.min(Math.max(0,occurrence),Math.max(0,matches.length-1))]||null;
  }
  if(boundary&&boundary.nextSibling&&boundary.nextSibling.nodeType===Node.ELEMENT_NODE&&boundary.nextSibling.classList.contains('math-caret-anchor'))boundary=boundary.nextSibling;
  if(!boundary){editable.focus();placeCaretEnd(editable);rememberVisualCursor();return;}
  editable.focus();const r=document.createRange();r.setStartAfter(boundary);r.collapse(true);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);rememberVisualCursor();
 }
+function insertLatexAtTableCellCursor(code,tableCtx){
+ if(!tableCtx)return false;const row=Math.max(0,Number(tableCtx.row)||0),col=Math.max(0,Number(tableCtx.col)||0);let insert=String(code||'');if(tableCtx.mode==='beamer'&&/^\\footnote\{/.test(insert))insert=insert.replace(/^\\footnote/,'\\footnote[frame]');let rows=Array.isArray(tableCtx.rows)?tableCtx.rows.map(r=>Array.isArray(r)?[...r]:[]):[];
+ if(!rows[row]||col>=rows[row].length)return false;const current=String(rows[row][col]||''),start=Math.max(0,Math.min(current.length,Number(tableCtx.start)||0)),end=Math.max(start,Math.min(current.length,Number(tableCtx.end)||start));rows[row][col]=current.slice(0,start)+insert+current.slice(end);
+ if(tableCtx.mode==='document'){
+  const node=documentFlowById[String(tableCtx.nodeId||'')];if(!node||!node.block)return false;const b=node.block,parsed=(parseBlocks(String(node.raw||''))||[]).find(x=>x.kind==='table')||b,columns=(Array.isArray(tableCtx.columns)&&tableCtx.columns.length?tableCtx.columns:parsed.tableColumns||b.tableColumns||[]).map(x=>String(x||'c'));
+  const payload={rows,columns,caption:String(tableCtx.caption??parsed.tableCaption??b.tableCaption??''),label:String(tableCtx.label??parsed.tableLabel??b.tableLabel??''),placement:String(tableCtx.placement??parsed.tablePlacement??b.tablePlacement??''),captionPosition:String(tableCtx.captionPosition??parsed.tableCaptionPosition??b.tableCaptionPosition??'below'),tableSize:String(tableCtx.tableSize??parsed.tableSize??b.tableSize??''),tableStyle:String(tableCtx.tableStyle||parsed.tableStyle||b.tableStyle||'plain'),verticalBorders:parsed.tableVerticalBorders||b.tableVerticalBorders||[],horizontalBorders:parsed.tableHorizontalBorders||b.tableHorizontalBorders||[]};
+  updateDocumentNode(node,serializeDocumentTable(node,payload),true,'table-inline');return true;
+ }
+ const frame=frames[Number(tableCtx.frameIndex)||0];if(!frame)return false;const block=(parseBlocks(String(frame.body||''))||[]).find(x=>x.id===String(tableCtx.blockId||''));if(!block||block.kind!=='table')return false;const columns=(Array.isArray(tableCtx.columns)&&tableCtx.columns.length?tableCtx.columns:block.tableColumns||[]).map(x=>String(x||'c'));
+ vscode.postMessage({type:'updateBlock',frameIndex:Number(tableCtx.frameIndex)||0,blockId:block.id,payload:{rows,columns,caption:String(tableCtx.caption??block.tableCaption??''),label:String(tableCtx.label??block.tableLabel??''),placement:String(tableCtx.placement??block.tablePlacement??''),captionPosition:String(tableCtx.captionPosition??block.tableCaptionPosition??'below'),tableSize:String(tableCtx.tableSize??block.tableSize??''),tableStyle:String(tableCtx.tableStyle||block.tableStyle||'plain'),verticalBorders:block.tableVerticalBorders||[],horizontalBorders:block.tableHorizontalBorders||[]},refresh:true});return true;
+}
 function insertLatexAtRememberedCursor(code,anchor){
- const ctx=anchor||lastVisualCursor;if(!ctx||!ctx.editable||!ctx.editable.isConnected||!ctx.editable.__texflowCommit)return false;
+ const ctx=anchor||lastVisualCursor,tableCtx=(ctx&&ctx.tableCell)||lastTableCellCursor;if(tableCtx&&insertLatexAtTableCellCursor(code,tableCtx))return true;
+ if(!ctx||!ctx.editable||!ctx.editable.isConnected||!ctx.editable.__texflowCommit)return false;
  const editable=ctx.editable,base=ctx.range&&ctx.range.cloneRange?ctx.range.cloneRange():null,range=normalizeAtomicInsertionRange(editable,base);if(!range)return false;
  const marker='@@TEXFLOW_CURSOR_INSERT_'+Date.now()+'_'+Math.random().toString(36).slice(2)+'@@',markerNode=document.createTextNode(marker);
  try{range.deleteContents();range.insertNode(markerNode);}catch{return false;}
@@ -6426,7 +6769,7 @@ function insertLatexAtRememberedCursor(code,anchor){
 }
 function saveCitationPicker(){const keys=[...citationSelection];if(!keys.length)return;const cmd=document.getElementById('cite-style').value||'parencite',code='\\'+cmd+'{'+keys.join(',')+'}';if(!insertLatexAtRememberedCursor(code,citationAnchor)){vscode.postMessage({type:'showWarning',message:'Place the cursor in editable text before inserting a citation.'});return;}closeCitationPicker();}
 
-let tableInsertAnchor=null;
+let tableInsertAnchor=null,tableInsertBlockAnchor=null;
 let figureInsertState=null;
 function validateFigureEditor(){
  const label=String(document.getElementById('figure-label-new').value||'').trim();let error='';
@@ -6441,11 +6784,11 @@ function openFigureEditor(data){
  document.getElementById('figure-file').textContent=figureInsertState.latexPath;document.getElementById('figure-caption-new').value='';document.getElementById('figure-short-caption-new').value='';document.getElementById('figure-angle-new').value='0';document.getElementById('figure-label-new').value=String(data.defaultLabel||'');document.getElementById('figure-placement-new').value='htbp';document.getElementById('figure-placement-field').style.display=isBeamer?'none':'';document.getElementById('figure-caption-position-new').value='below';document.getElementById('figure-align-new').value='center';document.getElementById('figure-width-new').value='70';validateFigureEditor();const modal=document.getElementById('figure-modal');modal.classList.add('open');modal.setAttribute('aria-hidden','false');setTimeout(()=>document.getElementById('figure-caption-new').focus(),0);
 }
 function closeFigureEditor(){const modal=document.getElementById('figure-modal');modal.classList.remove('open');modal.setAttribute('aria-hidden','true');figureInsertState=null;}
-function saveFigureEditor(){if(!figureInsertState||!validateFigureEditor())return;const state=figureInsertState;const payload={type:'insertFigureConfigured',latexPath:state.latexPath,frameIndex:state.frameIndex,cursorPos:state.cursorPos,caption:String(document.getElementById('figure-caption-new').value||''),shortCaption:String(document.getElementById('figure-short-caption-new').value||''),angle:Number(document.getElementById('figure-angle-new').value)||0,label:String(document.getElementById('figure-label-new').value||''),placement:isBeamer?'':String(document.getElementById('figure-placement-new').value||''),captionPosition:String(document.getElementById('figure-caption-position-new').value||'below'),align:String(document.getElementById('figure-align-new').value||'center'),widthPercent:Number(document.getElementById('figure-width-new').value)||70};closeFigureEditor();closeTopMenus();closeMenus();vscode.postMessage(payload);}
+function saveFigureEditor(){if(!figureInsertState||!validateFigureEditor())return;const state=figureInsertState;const payload={type:'insertFigureConfigured',latexPath:state.latexPath,frameIndex:state.frameIndex,cursorPos:state.cursorPos,insertAnchor:state.insertAnchor,caption:String(document.getElementById('figure-caption-new').value||''),shortCaption:String(document.getElementById('figure-short-caption-new').value||''),angle:Number(document.getElementById('figure-angle-new').value)||0,label:String(document.getElementById('figure-label-new').value||''),placement:isBeamer?'':String(document.getElementById('figure-placement-new').value||''),captionPosition:String(document.getElementById('figure-caption-position-new').value||'below'),align:String(document.getElementById('figure-align-new').value||'center'),widthPercent:Number(document.getElementById('figure-width-new').value)||70};closeFigureEditor();closeTopMenus();closeMenus();vscode.postMessage(payload);}
 ['figure-label-new','figure-width-new'].forEach(id=>document.getElementById(id).addEventListener('input',validateFigureEditor));document.getElementById('figure-close').onclick=closeFigureEditor;document.getElementById('figure-cancel').onclick=closeFigureEditor;document.getElementById('figure-insert').onclick=saveFigureEditor;document.getElementById('figure-modal').addEventListener('mousedown',e=>{if(e.target.id==='figure-modal')closeFigureEditor()});
 function tableEditorValues(){
- const rows=Math.max(1,Math.min(30,Number(document.getElementById('table-rows').value)||0));
- const cols=Math.max(1,Math.min(12,Number(document.getElementById('table-cols').value)||0));
+ const rows=Math.max(1,Math.min(500,Math.trunc(Number(document.getElementById('table-rows').value)||0)));
+ const cols=Math.max(1,Math.min(100,Math.trunc(Number(document.getElementById('table-cols').value)||0)));
  const caption=String(document.getElementById('table-caption').value||'');
  const label=String(document.getElementById('table-label').value||'').trim();
  const placement=isBeamer?'':String(document.getElementById('table-placement').value||'');
@@ -6457,26 +6800,26 @@ function renderTableEditor(){
  const rowsInput=document.getElementById('table-rows'),colsInput=document.getElementById('table-cols');
  let rows=Number(rowsInput.value)||0,cols=Number(colsInput.value)||0;
  const validation=document.getElementById('table-validation');
- let error='';if(!Number.isInteger(rows)||rows<1||rows>30)error='Rows must be between 1 and 30.';else if(!Number.isInteger(cols)||cols<1||cols>12)error='Columns must be between 1 and 12.';
+ let error='';if(!Number.isInteger(rows)||rows<1||rows>500)error='Rows must be between 1 and 500.';else if(!Number.isInteger(cols)||cols<1||cols>100)error='Columns must be between 1 and 100.';
  const label=String(document.getElementById('table-label').value||'').trim();if(!error&&label&&!/^[^{}\\\s]+$/.test(label))error='Labels cannot contain spaces, braces, or backslashes.';if(!error&&label&&documentLabels.some(x=>x.key===label))error='That label already exists.';
- validation.textContent=error;document.getElementById('table-insert').disabled=!!error;
- if(error){rows=Math.max(1,Math.min(30,rows||1));cols=Math.max(1,Math.min(12,cols||1));}
+ const large=!error&&(rows>30||cols>12);validation.textContent=error||(large?'Large table: it will be inserted completely and shown as editable LaTeX source rather than as a huge Visual grid.':'');document.getElementById('table-insert').disabled=!!error;
+ if(error){rows=Math.max(1,Math.min(500,rows||1));cols=Math.max(1,Math.min(100,cols||1));}
  const aligns=document.getElementById('table-alignments');const previous=[...aligns.querySelectorAll('select')].map(x=>x.value||'c');aligns.innerHTML='';
- for(let i=0;i<cols;i++){const box=document.createElement('label');box.className='table-align-control';box.innerHTML='<span>Col '+(i+1)+'</span><select aria-label="Column '+(i+1)+' alignment"><option value="l">Left</option><option value="c">Center</option><option value="r">Right</option></select>';const select=box.querySelector('select');select.value=previous[i]||'c';select.addEventListener('change',renderTablePreview);aligns.appendChild(box);}
+ const editableCols=Math.min(cols,12);for(let i=0;i<editableCols;i++){const box=document.createElement('label');box.className='table-align-control';box.innerHTML='<span>Col '+(i+1)+'</span><select aria-label="Column '+(i+1)+' alignment"><option value="l">Left</option><option value="c">Center</option><option value="r">Right</option></select>';const select=box.querySelector('select');select.value=previous[i]||'c';select.addEventListener('change',renderTablePreview);aligns.appendChild(box);}if(cols>12){const note=document.createElement('span');note.className='table-align-limit-note';note.textContent='Columns 13–'+cols+' default to centered alignment; edit the preserved LaTeX source after insertion if needed.';aligns.appendChild(note);}
  renderTablePreview();
 }
 function renderTablePreview(){
- const rows=Math.max(1,Math.min(30,Number(document.getElementById('table-rows').value)||1)),cols=Math.max(1,Math.min(12,Number(document.getElementById('table-cols').value)||1));const alignments=[...document.querySelectorAll('#table-alignments select')].map(x=>x.value||'c'),table=document.getElementById('table-preview'),style=tableVisualStyle(document.getElementById('table-style-new').value||'plain');let html='';const shownRows=Math.min(rows,6);for(let r=0;r<shownRows;r++){html+='<tr>';for(let c=0;c<cols;c++){const a=alignments[c]==='l'?'left':alignments[c]==='r'?'right':'center',classes=tableCellRuleClasses(style,r,c,shownRows,cols,[],[]);html+='<td class="'+classes+'" style="text-align:'+a+'">'+(r===0?'Column '+(c+1):'')+'</td>';}html+='</tr>';}if(rows>6)html+='<tr><td colspan="'+cols+'" style="text-align:center">… '+rows+' rows total</td></tr>';table.innerHTML=html;applyTableBorderVisual(table,style,[],[]);
+ const rows=Math.max(1,Math.min(500,Math.trunc(Number(document.getElementById('table-rows').value)||1))),cols=Math.max(1,Math.min(100,Math.trunc(Number(document.getElementById('table-cols').value)||1))),shownCols=Math.min(cols,12);const alignments=[...document.querySelectorAll('#table-alignments select')].map(x=>x.value||'c'),table=document.getElementById('table-preview'),style=tableVisualStyle(document.getElementById('table-style-new').value||'plain');let html='';const shownRows=Math.min(rows,6);for(let r=0;r<shownRows;r++){html+='<tr>';for(let c=0;c<shownCols;c++){const a=alignments[c]==='l'?'left':alignments[c]==='r'?'right':'center',classes=tableCellRuleClasses(style,r,c,shownRows,shownCols,[],[]);html+='<td class="'+classes+'" style="text-align:'+a+'">'+(r===0?'Column '+(c+1):'')+'</td>';}html+='</tr>';}if(cols>shownCols)html+='<tr><td colspan="'+shownCols+'" style="text-align:center">… '+cols+' columns total</td></tr>';if(rows>6)html+='<tr><td colspan="'+shownCols+'" style="text-align:center">… '+rows+' rows total</td></tr>';table.innerHTML=html;applyTableBorderVisual(table,style,[],[]);
 }
 function openTableEditor(){
  closeTopMenus();closeMenus();
- tableInsertAnchor=snapshotVisualCursor();const modal=document.getElementById('table-modal');document.getElementById('table-rows').value='3';document.getElementById('table-cols').value='3';document.getElementById('table-caption').value='';document.getElementById('table-label').value='tab:table';document.getElementById('table-placement').value='htbp';document.getElementById('table-style-new').value='plain';document.getElementById('table-placement-field').style.display=isBeamer?'none':'';modal.classList.add('open');modal.setAttribute('aria-hidden','false');renderTableEditor();setTimeout(()=>document.getElementById('table-rows').focus(),0);
+ tableInsertAnchor=snapshotVisualCursor();tableInsertBlockAnchor=captureBlockInsertionAnchor(tableInsertAnchor);const modal=document.getElementById('table-modal');document.getElementById('table-rows').value='3';document.getElementById('table-cols').value='3';document.getElementById('table-caption').value='';document.getElementById('table-label').value='tab:table';document.getElementById('table-placement').value='htbp';document.getElementById('table-style-new').value='plain';document.getElementById('table-placement-field').style.display=isBeamer?'none':'';modal.classList.add('open');modal.setAttribute('aria-hidden','false');renderTableEditor();setTimeout(()=>document.getElementById('table-rows').focus(),0);
 }
-function closeTableEditor(){const modal=document.getElementById('table-modal');modal.classList.remove('open');modal.setAttribute('aria-hidden','true');tableInsertAnchor=null;}
+function closeTableEditor(){const modal=document.getElementById('table-modal');modal.classList.remove('open');modal.setAttribute('aria-hidden','true');tableInsertAnchor=null;tableInsertBlockAnchor=null;}
 function saveTableEditor(){
- renderTableEditor();if(document.getElementById('table-insert').disabled)return;const v=tableEditorValues(),anchor=tableInsertAnchor||lastVisualCursor,pos=rememberedStructuralCursorPos(anchor);closeTableEditor();closeTopMenus();closeMenus();lastVisualCursor=anchor||lastVisualCursor;vscode.postMessage({type:'insertTable',frameIndex:current,cursorPos:pos,rows:v.rows,cols:v.cols,caption:v.caption,label:v.label,placement:v.placement,tableStyle:v.tableStyle,alignments:v.alignments});if(v.tableStyle==='booktabs')vscode.postMessage({type:'ensureFeaturePackage',feature:'booktabs'});
+ renderTableEditor();if(document.getElementById('table-insert').disabled)return;const v=tableEditorValues(),anchor=tableInsertAnchor||lastVisualCursor,pos=rememberedStructuralCursorPos(anchor),insertAnchor=tableInsertBlockAnchor||captureBlockInsertionAnchor(anchor);closeTableEditor();closeTopMenus();closeMenus();lastVisualCursor=anchor||lastVisualCursor;vscode.postMessage({type:'insertTable',frameIndex:current,cursorPos:pos,insertAnchor,rows:v.rows,cols:v.cols,caption:v.caption,label:v.label,placement:v.placement,tableStyle:v.tableStyle,alignments:v.alignments});if(v.tableStyle==='booktabs')vscode.postMessage({type:'ensureFeaturePackage',feature:'booktabs'});
 }
-['table-rows','table-cols','table-label'].forEach(id=>document.getElementById(id).addEventListener('input',renderTableEditor));document.getElementById('table-caption').addEventListener('input',renderTablePreview);document.getElementById('table-style-new').addEventListener('change',renderTablePreview);document.getElementById('table-paste-data').onclick=()=>{const anchor=tableInsertAnchor;closeTableEditor();lastVisualCursor=anchor||lastVisualCursor;openLabsTableData();};document.getElementById('table-close').onclick=closeTableEditor;document.getElementById('table-cancel').onclick=closeTableEditor;document.getElementById('table-insert').onclick=saveTableEditor;document.getElementById('table-modal').addEventListener('mousedown',e=>{if(e.target.id==='table-modal')closeTableEditor()});
+['table-rows','table-cols','table-label'].forEach(id=>document.getElementById(id).addEventListener('input',renderTableEditor));document.getElementById('table-caption').addEventListener('input',renderTablePreview);document.getElementById('table-style-new').addEventListener('change',renderTablePreview);document.getElementById('table-paste-data').onclick=()=>{const anchor=tableInsertAnchor,insertAnchor=tableInsertBlockAnchor;closeTableEditor();lastVisualCursor=anchor||lastVisualCursor;openLabsTableData(anchor,insertAnchor);};document.getElementById('table-close').onclick=closeTableEditor;document.getElementById('table-cancel').onclick=closeTableEditor;document.getElementById('table-insert').onclick=saveTableEditor;document.getElementById('table-modal').addEventListener('mousedown',e=>{if(e.target.id==='table-modal')closeTableEditor()});
 document.getElementById('cite-search').addEventListener('input',renderCitationResults);document.getElementById('cite-close').onclick=closeCitationPicker;document.getElementById('cite-cancel').onclick=closeCitationPicker;document.getElementById('cite-insert').onclick=saveCitationPicker;document.getElementById('cite-add-bib').onclick=()=>{const anchor=citationAnchor;const pos=rememberedStructuralCursorPos();closeCitationPicker();lastVisualCursor=anchor||lastVisualCursor;vscode.postMessage({type:'addBibliography',resumeCitation:true,cursorPos:pos});};document.getElementById('cite-open-bib').onclick=()=>vscode.postMessage({type:'openBibliography'});document.getElementById('cite-modal').addEventListener('mousedown',e=>{if(e.target.id==='cite-modal')closeCitationPicker()});
 document.getElementById('reference-search').addEventListener('input',renderReferenceResults);document.getElementById('reference-close').onclick=closeReferencePicker;document.getElementById('reference-cancel').onclick=closeReferencePicker;document.getElementById('reference-insert').onclick=saveReferencePicker;document.getElementById('reference-modal').addEventListener('mousedown',e=>{if(e.target.id==='reference-modal')closeReferencePicker()});document.getElementById('label-close').onclick=closeLabelPicker;document.getElementById('label-cancel').onclick=closeLabelPicker;document.getElementById('label-insert').onclick=saveLabelPicker;document.getElementById('label-key').addEventListener('input',e=>document.getElementById('label-validation').textContent=validateLabelKey(e.target.value));document.getElementById('label-key').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();saveLabelPicker();}});document.getElementById('label-modal').addEventListener('mousedown',e=>{if(e.target.id==='label-modal')closeLabelPicker()});
 document.getElementById('symbol-search').addEventListener('input',e=>{const q=String(e.target.value||'').toLowerCase().trim();document.querySelectorAll('#symbol-grid button').forEach(b=>{const hay=(b.textContent+' '+(b.title||'')+' '+(b.dataset.latex||'')).toLowerCase();b.style.display=!q||hay.includes(q)?'':'none';});});
@@ -6496,8 +6839,8 @@ function updateIncludedFileDialog(){const modal=document.getElementById('labs-dy
 function openIncludedFileDialog(){closeLabsDialog();rememberVisualCursor();const anchor=snapshotVisualCursor()||lastVisualCursor;includedFilePickedUri='';includedFilePickedDisplay='';const back=document.createElement('div');back.id='labs-dynamic-modal';back.dataset.dialogType='included-file';back.className='cite-modal-backdrop open';back.setAttribute('aria-hidden','false');const section=document.createElement('section');section.className='cite-modal';section.style.width='min(620px,calc(100vw - 34px))';section.innerHTML='<header class="cite-modal-head"><strong>Included file</strong><span class="spacer"></span><button class="cite-close labs-close" type="button">✕</button></header><div class="cite-modal-body"><div class="labs-form-grid"><label class="wide"><span>Source</span><select data-labs-field="mode"><option value="create">Create new .tex file</option><option value="existing">Use existing .tex file</option></select></label><div class="included-create-fields wide" style="display:grid;gap:10px"><label><span>Folder (optional)</span><input data-included-folder value="sections" placeholder="sections"></label><label><span>File name</span><input data-included-name value="model" placeholder="model"></label></div><div class="included-existing-fields wide" style="display:none;gap:8px"><button type="button" class="cite-secondary included-choose">Choose .tex file…</button><div class="included-picked-file" style="color:var(--muted);font-size:11px">No file selected</div></div><label class="wide"><span>LaTeX command</span><select data-labs-field="command"><option value="input">\\input — recommended</option><option value="include">\\include — chapters / page breaks</option></select></label></div><div class="labs-feature-note">The file stays separate on disk. Remove from document later does not delete the file.</div></div><footer class="cite-modal-foot"><span class="spacer"></span><button class="cite-cancel labs-cancel" type="button">Cancel</button><button class="cite-insert labs-save" type="button">Insert</button></footer>';back.appendChild(section);document.body.appendChild(back);const close=()=>closeLabsDialog();section.querySelector('.labs-close').onclick=close;section.querySelector('.labs-cancel').onclick=close;back.addEventListener('mousedown',e=>{if(e.target===back)close();});const mode=section.querySelector('[data-labs-field="mode"]');mode.onchange=updateIncludedFileDialog;section.querySelector('.included-choose').onclick=()=>vscode.postMessage({type:'chooseIncludedFile'});section.querySelector('.labs-save').onclick=()=>{const existing=mode.value==='existing',command=section.querySelector('[data-labs-field="command"]').value,pos=rememberedStructuralCursorPos(anchor);if(existing){if(!includedFilePickedUri)return;vscode.postMessage({type:'insertIncludedFile',mode:'existing',targetUri:includedFilePickedUri,command,cursorPos:pos});}else{const folder=section.querySelector('[data-included-folder]').value||'',fileName=section.querySelector('[data-included-name]').value||'';if(!String(fileName).trim()){vscode.postMessage({type:'showWarning',message:'Enter a file name.'});return;}vscode.postMessage({type:'insertIncludedFile',mode:'create',folder,fileName,command,cursorPos:pos});}close();};updateIncludedFileDialog();setTimeout(()=>section.querySelector('[data-included-name]').focus(),0);}
 
 function closeLabsDialog(){const old=document.getElementById('labs-dynamic-modal');if(old)old.remove();}
-function openLabsDialog(title,fields,onSave,note='Experimental Labs feature',saveLabel='Insert'){
- closeLabsDialog();rememberVisualCursor();const anchor=snapshotVisualCursor()||lastVisualCursor;
+function openLabsDialog(title,fields,onSave,note='Experimental Labs feature',saveLabel='Insert',anchorOverride=null,blockAnchorOverride=null){
+ closeLabsDialog();if(!anchorOverride)rememberVisualCursor();const anchor=anchorOverride||snapshotVisualCursor()||lastVisualCursor,blockInsertAnchor=blockAnchorOverride||captureBlockInsertionAnchor(anchor);if(anchor)anchor.blockInsertAnchor=blockInsertAnchor;
  const back=document.createElement('div');back.id='labs-dynamic-modal';back.className='cite-modal-backdrop open';back.setAttribute('aria-hidden','false');
  const section=document.createElement('section');section.className='cite-modal';section.style.width='min(680px,calc(100vw - 34px))';
  section.innerHTML='<header class="cite-modal-head"><strong>'+esc(title)+'</strong><span class="spacer"></span><button class="cite-close labs-close" type="button">✕</button></header><div class="cite-modal-body"><div class="labs-form-grid"></div><div class="labs-feature-note">'+esc(note)+'</div></div><footer class="cite-modal-foot"><span class="spacer"></span><button class="cite-cancel labs-cancel" type="button">Cancel</button><button class="cite-insert labs-save" type="button">'+esc(saveLabel)+'</button></footer>';
@@ -6506,7 +6849,7 @@ function openLabsDialog(title,fields,onSave,note='Experimental Labs feature',sav
  back.appendChild(section);document.body.appendChild(back);const close=()=>closeLabsDialog();section.querySelector('.labs-close').onclick=close;section.querySelector('.labs-cancel').onclick=close;back.addEventListener('mousedown',e=>{if(e.target===back)close();});section.querySelector('.labs-save').onclick=()=>{const values={};Object.keys(controls).forEach(k=>values[k]=controls[k].value);if(onSave(values,anchor)!==false)close();};setTimeout(()=>{const first=Object.values(controls)[0];if(first)first.focus();},0);
 }
 function labsInsertInline(code,anchor,feature=''){if(!insertLatexAtRememberedCursor(code,anchor)){vscode.postMessage({type:'showWarning',message:'Place the cursor in editable text first.'});return false;}if(feature)vscode.postMessage({type:'ensureFeaturePackage',feature});return true;}
-function labsInsertBlock(code,feature='',anchor=null){vscode.postMessage({type:'insertRawLatex',frameIndex:current,cursorPos:rememberedStructuralCursorPos(anchor),latex:code,feature});return true;}
+function labsInsertBlock(code,feature='',anchor=null){vscode.postMessage({type:'insertRawLatex',frameIndex:current,cursorPos:rememberedStructuralCursorPos(anchor),insertAnchor:anchor&&anchor.blockInsertAnchor||captureBlockInsertionAnchor(anchor),latex:code,feature});return true;}
 function openLabsFootnote(){openLabsDialog('Insert footnote',[{id:'text',label:'Footnote text',type:'textarea',rows:5}],(v,a)=>v.text.trim()?labsInsertInline('\\footnote{'+v.text.replace(/[{}]/g,'')+'}',a):false,'Inserted as an atomic inline footnote.');}
 function openLabsLink(){openLabsDialog('Insert link',[{id:'label',label:'Display text',placeholder:'OpenAI'},{id:'url',label:'URL',placeholder:'https://example.com'}],(v,a)=>{const url=v.url.trim();if(!url)return false;return labsInsertInline(v.label.trim()?'\\href{'+url.replace(/[{}]/g,'')+'}{'+v.label.replace(/[{}]/g,'')+'}':'\\url{'+url.replace(/[{}]/g,'')+'}',a,'link');},'TeXFlow adds hyperref when needed.');}
 function openLabsSubfigures(data){
@@ -6515,7 +6858,7 @@ function openLabsSubfigures(data){
   const captions=String(v.subcaptions||'').split(/\r?\n/),n=paths.length,width=Math.max(.15,Math.min(.9,.96/Math.min(n,3)));
   const parts=paths.map((p,i)=>'\\begin{subfigure}[t]{'+width.toFixed(2)+'\\textwidth}\n\\centering\n\\includegraphics[width=\\linewidth]{'+p+'}\n'+(captions[i]?'\\caption{'+escapeLatexPlainText(captions[i].replace(/[{}]/g,''))+'}\n':'')+'\\end{subfigure}');
   const code='\\begin{figure}[htbp]\n\\centering\n'+parts.join('\\hfill\n')+'\n'+(v.caption.trim()?'\\caption{'+escapeLatexPlainText(v.caption.replace(/[{}]/g,''))+'}\n':'')+(v.label.trim()?'\\label{'+v.label.replace(/[{}\\\s]/g,'')+'}\n':'')+'\\end{figure}';
-  vscode.postMessage({type:'insertRawLatex',frameIndex:Number(data.frameIndex)||current,cursorPos:Number(data.cursorPos),latex:code,feature:'subfigure'});return true;
+  vscode.postMessage({type:'insertRawLatex',frameIndex:Number(data.frameIndex)||current,cursorPos:Number(data.cursorPos),insertAnchor:data.insertAnchor,latex:code,feature:'subfigure'});return true;
  },'Experimental: uses the subcaption package. Up to six selected images are preserved as standard LaTeX subfigures.');
 }
 function openLabsSpecial(){openLabsDialog('Insert special character',[{id:'char',label:'Character',type:'select',options:[['%','% — percent'],['&','& — ampersand'],['#','# — hash'],['_','_ — underscore'],['$','$ — dollar'],['{','{ — left brace'],['}','} — right brace'],['~','~ — tilde'],['^','^ — caret']]}],(v,a)=>{const map={'%':'\\%','&':'\\&','#':'\\#','_':'\\_','$':'\\$','{':'\\{','}':'\\}','~':'\\textasciitilde{}','^':'\\textasciicircum{}'};return labsInsertInline(map[v.char]||v.char,a);});}
@@ -6530,13 +6873,13 @@ function openLabsTheorem(){openLabsDialog('Insert theorem / proof',[{id:'env',la
 function openLabsIndex(){openLabsDialog('Insert index entry',[{id:'entry',label:'Index entry'}],(v,a)=>v.entry.trim()?labsInsertInline('\\index{'+v.entry.replace(/[{}]/g,'')+'}',a,'index'):false,'Use Insert → Print index to render it.');}
 function openLabsNomenclature(){openLabsDialog('Insert nomenclature entry',[{id:'symbol',label:'Symbol',placeholder:'$\\alpha$'},{id:'description',label:'Description'}],(v,a)=>v.symbol.trim()&&v.description.trim()?labsInsertInline('\\nomenclature{'+v.symbol.replace(/[{}]/g,'')+'}{'+v.description.replace(/[{}]/g,'')+'}',a,'nomenclature'):false,'Use Insert → Print nomenclature to render it.');}
 function openLabsField(){openLabsDialog('Insert field',[{id:'field',label:'Field',type:'select',options:[['today','Current date (\\today)'],['jobname','Document file name (\\jobname)']]}],(v,a)=>labsInsertInline('\\'+v.field,a));}
-function openLabsTableData(){
+function openLabsTableData(anchorOverride=null,blockAnchorOverride=null){
  openLabsDialog('Table from LaTeX / CSV / TSV',[{id:'data',label:'Paste a LaTeX table, spreadsheet rows, or choose a file below',type:'textarea',rows:12,placeholder:'\\begin{table}\n  ...\n\\end{table}\n\nor\n\nName\tValue\nA\t1\nB\t2'},{id:'delimiter',label:'CSV / TSV delimiter',type:'select',options:[['auto','Auto detect'],['tab','Tab'],['comma','Comma'],['semicolon','Semicolon']]},{id:'caption',label:'Caption (CSV / TSV only)'},{id:'label',label:'Label (CSV / TSV only)',value:'tab:data'}],(v,a)=>{
   const raw=String(v.data||'').trim();if(!raw)return false;
-  const parsedLatex=pastedTableData(raw);if(parsedLatex){vscode.postMessage({type:'insertLatexTable',frameIndex:current,cursorPos:rememberedStructuralCursorPos(a),latex:raw});return true;}
-  if(/\\begin\{(?:table|tabular)\}/.test(raw)){vscode.postMessage({type:'showWarning',message:'This LaTeX table uses features that TeXFlow cannot yet edit safely.'});return false;}
-  const lines=raw.split(/\r?\n/).filter(Boolean);let delim=v.delimiter==='tab'?'\t':v.delimiter==='comma'?',':v.delimiter==='semicolon'?';':(lines[0].includes('\t')?'\t':lines[0].includes(';')?';':',');const rows=lines.map(line=>line.split(delim).map(x=>x.trim()));const cols=Math.max(...rows.map(r=>r.length));if(!cols||cols>12||rows.length>30){vscode.postMessage({type:'showWarning',message:'Tables support up to 30 rows and 12 columns.'});return false;}rows.forEach(r=>{while(r.length<cols)r.push('');});const safe=x=>escapeLatexPlainText(String(x||'').replace(/[{}]/g,''));const body=rows.map(r=>r.map(safe).join(' & ')+' \\\\').join('\n');const cap=escapeLatexPlainText(String(v.caption||'').trim().replace(/[{}]/g,''));const code='\\begin{table}[htbp]\n\\centering\n\\begin{tabular}{'+Array(cols).fill('c').join('')+'}\n'+body+'\n\\end{tabular}\n'+(cap?'\\caption{'+cap+'}\n':'')+(v.label.trim()?'\\label{'+v.label.replace(/[{}\\\s]/g,'')+'}\n':'')+'\\end{table}';labsInsertBlock(code,'csvtable',a);return true;
- },'LaTeX table/table+tabular blocks use the same Visual table parser as direct paste. CSV and TSV remain supported.');const modal=document.getElementById('labs-dynamic-modal');if(modal){const grid=modal.querySelector('.labs-form-grid'),btn=document.createElement('button');btn.type='button';btn.className='cite-secondary';btn.textContent='Choose CSV / TSV file…';btn.onclick=()=>vscode.postMessage({type:'chooseTableDataFile'});grid.appendChild(btn);}
+  const parsedLatex=pastedTableData(raw);if(parsedLatex){vscode.postMessage({type:'insertLatexTable',frameIndex:current,cursorPos:rememberedStructuralCursorPos(a),insertAnchor:a&&a.blockInsertAnchor||captureBlockInsertionAnchor(a),latex:raw});return true;}
+  if(/\\begin\{(?:table|tabular)\}/.test(raw)){vscode.postMessage({type:'insertLatexTable',frameIndex:current,cursorPos:rememberedStructuralCursorPos(a),insertAnchor:a&&a.blockInsertAnchor||captureBlockInsertionAnchor(a),latex:raw});return true;}
+  const lines=raw.split(/\r?\n/).filter(Boolean);let delim=v.delimiter==='tab'?'\t':v.delimiter==='comma'?',':v.delimiter==='semicolon'?';':(lines[0].includes('\t')?'\t':lines[0].includes(';')?';':',');const rows=lines.map(line=>line.split(delim).map(x=>x.trim()));const cols=Math.max(...rows.map(r=>r.length));if(!cols){vscode.postMessage({type:'showWarning',message:'No table columns were found.'});return false;}rows.forEach(r=>{while(r.length<cols)r.push('');});const safe=x=>escapeLatexPlainText(String(x||'').replace(/[{}]/g,''));const body=rows.map(r=>r.map(safe).join(' & ')+' \\\\').join('\n');const cap=escapeLatexPlainText(String(v.caption||'').trim().replace(/[{}]/g,''));const code='\\begin{table}[htbp]\n\\centering\n\\begin{tabular}{'+Array(cols).fill('c').join('')+'}\n'+body+'\n\\end{tabular}\n'+(cap?'\\caption{'+cap+'}\n':'')+(v.label.trim()?'\\label{'+v.label.replace(/[{}\\\s]/g,'')+'}\n':'')+'\\end{table}';labsInsertBlock(code,'csvtable',a);return true;
+ },'LaTeX table/table+tabular blocks use the same Visual table parser as direct paste. CSV and TSV remain supported.','Insert',anchorOverride,blockAnchorOverride);const modal=document.getElementById('labs-dynamic-modal');if(modal){const grid=modal.querySelector('.labs-form-grid'),btn=document.createElement('button');btn.type='button';btn.className='cite-secondary';btn.textContent='Choose CSV / TSV file…';btn.onclick=()=>vscode.postMessage({type:'chooseTableDataFile'});grid.appendChild(btn);}
 }
 function commitLabsInlineEdit(el){
  const editable=el&&el.closest?el.closest('[contenteditable=true]'):null;if(!editable||!editable.__texflowCommit)return false;
@@ -6544,6 +6887,9 @@ function commitLabsInlineEdit(el){
 }
 function editLabsInlineObject(el){
  if(!el||!el.classList)return;
+ if(el.classList.contains('tex-thanks')){
+  const value=decodeURIComponent(el.dataset.thanks||'');openLabsDialog('Edit thanks note',[{id:'text',label:'Thanks text',type:'textarea',rows:7,value}],v=>{const next=String(v.text||'').trim();if(!next)return false;el.dataset.thanks=encodeURIComponent(next);el.title='Thanks: '+next.replace(/\\protect\b/g,'');el.textContent='thanks';return commitLabsInlineEdit(el);},'LaTeX \\thanks note attached to the title or author.','Save');return;
+ }
  if(el.classList.contains('tex-footnote')){
   const value=decodeURIComponent(el.dataset.footnote||'');openLabsDialog('Edit footnote',[{id:'text',label:'Footnote text',type:'textarea',rows:5,value}],v=>{if(!v.text.trim())return false;el.dataset.footnote=encodeURIComponent(v.text.replace(/[{}]/g,''));el.title=v.text;el.textContent=(v.text||'footnote').slice(0,36);return commitLabsInlineEdit(el);},'Atomic inline footnote.','Save');return;
  }
@@ -6560,7 +6906,7 @@ function editLabsInlineObject(el){
   const field=el.dataset.field||'today';openLabsDialog('Edit field',[{id:'field',label:'Field',type:'select',value:field,options:[['today','Current date (\\today)'],['jobname','Document file name (\\jobname)']]}],v=>{el.dataset.field=v.field;el.textContent=v.field==='today'?new Intl.DateTimeFormat(undefined,{day:'numeric',month:'long',year:'numeric'}).format(new Date()):v.field;return commitLabsInlineEdit(el);},'Dynamic LaTeX field.','Save');return;
  }
 }
-document.addEventListener('dblclick',e=>{const el=e.target&&e.target.closest?e.target.closest('.tex-footnote,.tex-link,.tex-index,.tex-nomenclature,.tex-field'):null;if(el){e.preventDefault();e.stopPropagation();editLabsInlineObject(el);}});
+document.addEventListener('dblclick',e=>{const el=e.target&&e.target.closest?e.target.closest('.tex-thanks,.tex-footnote,.tex-link,.tex-index,.tex-nomenclature,.tex-field'):null;if(el){e.preventDefault();e.stopPropagation();editLabsInlineObject(el);}});
 function openLabsFindReplace(){openLabsDialog('Find / Replace',[{id:'find',label:'Find literal text'},{id:'replace',label:'Replace with'}],v=>{if(!v.find)return false;vscode.postMessage({type:'findReplaceText',find:v.find,replace:v.replace});return true;},'Labs: literal text only; LaTeX command searches are refused.');}
 function selectedDocumentNode(){if(isBeamer||!selectedSemanticBlock)return null;const id=selectedSemanticBlock.el&&selectedSemanticBlock.el.dataset&&selectedSemanticBlock.el.dataset.nodeId;return id&&documentFlowById[id]||null;}
 function labsCopyObject(){const n=selectedDocumentNode();if(!n){vscode.postMessage({type:'showWarning',message:'Select a document object first.'});return;}labsClipboard=String(n.raw||'');labsClipboardArmed=!!labsClipboard;if(labsClipboard)vscode.postMessage({type:'writeClipboardText',text:labsClipboard});}
@@ -6638,13 +6984,19 @@ function visualLatexTablePasteTarget(target){
  if(editable.matches('.title,.head,.beamer-metadata-edit,.doc-metadata-edit'))return null;
  return editable;
 }
+function normalizeVisualTablePaste(raw){
+ let text=String(raw||'').replace(/^\uFEFF/,'').trim();const fenced=/^\x60\x60\x60(?:latex|tex)?\s*\n([\s\S]*?)\n\x60\x60\x60$/i.exec(text);if(fenced)text=String(fenced[1]||'').trim();return text;
+}
+function looksLikeCompleteLatexTable(raw){
+ const text=normalizeVisualTablePaste(raw);return /^\\begin\s*\{\s*table\s*\}\s*(?:\[[^\]]*\])?[\s\S]*\\end\s*\{\s*table\s*\}\s*$/.test(text)||/^\\begin\s*\{\s*tabular\s*\}\s*\{[^}]*\}[\s\S]*\\end\s*\{\s*tabular\s*\}\s*$/.test(text);
+}
 function tryPasteLatexTable(e){
  const editable=visualLatexTablePasteTarget(e.target);if(!editable)return false;
- const raw=String(e.clipboardData&&e.clipboardData.getData?e.clipboardData.getData('text/plain'):'').trim();if(!raw)return false;
- const parsed=pastedTableData(raw);if(!parsed)return false;
+ const raw=normalizeVisualTablePaste(String(e.clipboardData&&e.clipboardData.getData?e.clipboardData.getData('text/plain'):'').trim());if(!raw)return false;
+ const parsed=pastedTableData(raw),looksLikeTable=looksLikeCompleteLatexTable(raw);if(!parsed&&!looksLikeTable)return false;
  const anchor=snapshotVisualCursor()||lastVisualCursor;if(anchor)lastVisualCursor=anchor;
  e.preventDefault();e.stopPropagation();
- vscode.postMessage({type:'insertLatexTable',frameIndex:current,cursorPos:rememberedStructuralCursorPos(anchor),latex:raw});
+ vscode.postMessage({type:'insertLatexTable',frameIndex:current,cursorPos:rememberedStructuralCursorPos(anchor),insertAnchor:captureBlockInsertionAnchor(anchor),latex:raw});
  return true;
 }
 document.addEventListener('paste',e=>{
@@ -6679,7 +7031,7 @@ function updateDocumentViewMenu(){
  continuous.textContent=(documentLayoutMode==='continuous'?'✓ ':'')+'Continuous';pages.textContent=(documentLayoutMode==='pages'?'✓ ':'')+'Pages';
 }
 const cursorMenuButtons=['structure-menu-button','insert-menu-button','format-menu-button','references-menu-button'].map(id=>document.getElementById(id)).filter(Boolean);cursorMenuButtons.forEach(btn=>btn.addEventListener('mousedown',e=>{rememberVisualCursor();e.preventDefault();}));const topMenus=[...document.querySelectorAll('.top-menu')];function closeTopMenus(except){topMenus.forEach(m=>{if(m!==except)m.classList.remove('open')})}topMenus.forEach(menu=>{const trigger=menu.querySelector(':scope > .top-action');trigger.onclick=e=>{e.stopPropagation();const wasOpen=menu.classList.contains('open');closeTopMenus();if(menu.id==='beamer-menu-top'){updateFrameTextSizeMenu();updateBeamerFrameActions();}menu.classList.toggle('open',!wasOpen);};});
-document.addEventListener('click',e=>{const action=e.target&&e.target.closest?e.target.closest('.top-menu-panel button'):null;if(action)closeTopMenus();});document.querySelectorAll('.frame-size-option').forEach(btn=>{btn.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};btn.onclick=()=>{const size=String(btn.dataset.frameSize||'normal');closeTopMenus();vscode.postMessage({type:'updateFrameFontSize',frameIndex:current,size});};});const beamerDuplicate=document.getElementById('beamer-duplicate-frame'),beamerUp=document.getElementById('beamer-move-frame-up'),beamerDown=document.getElementById('beamer-move-frame-down'),beamerToggle=document.getElementById('beamer-toggle-frame');if(beamerDuplicate)beamerDuplicate.onclick=()=>{closeTopMenus();vscode.postMessage({type:'duplicateFrame',frameIndex:current});};if(beamerUp)beamerUp.onclick=()=>{closeTopMenus();vscode.postMessage({type:'moveFrame',frameIndex:current,direction:-1});};if(beamerDown)beamerDown.onclick=()=>{closeTopMenus();vscode.postMessage({type:'moveFrame',frameIndex:current,direction:1});};if(beamerToggle)beamerToggle.onclick=()=>{closeTopMenus();vscode.postMessage({type:'toggleFrameDisabled',frameIndex:current});};function runTopMenuAction(action){closeTopMenus();const blockedWhenDisabled=new Set(['paragraph','bullets','numbered','mathEquation','mathMatrix','mathSystem','citation','label','reference','footnote','link','special','index','nomenclature','field','newpage','clearpage','quote','minipage','theorem','note','commentblock','commentoutselection','figure','tikz','table','columns','beamerblock','beameralert','beamerexample','frameoptions']);if(isBeamer&&frames[current]&&frames[current].disabled&&blockedWhenDisabled.has(action)){vscode.postMessage({type:'showWarning',message:'Restore this frame before editing its contents.'});return;}if(action==='title'||action==='author'){const el=document.querySelector('.doc-metadata-edit[data-field="'+action+'"]');if(el){el.focus();placeCaretEnd(el);}else vscode.postMessage({type:'ensureMetadataField',field:action});}else if(action==='abstract'){const el=document.querySelector('.doc-rich-block.abstract .doc-rich-edit');if(el){el.focus();placeCaretEnd(el);}else vscode.postMessage({type:'insertAbstract',cursorPos:rememberedStructuralCursorPos()});}else if(action==='toc')vscode.postMessage({type:'insertTableOfContents',cursorPos:rememberedStructuralCursorPos()});else if(action==='includedfile')openIncludedFileDialog();else if(action==='frame')vscode.postMessage({type:'insertFrame',frameIndex:current});else if(action==='chapter')vscode.postMessage({type:'insertChapter',frameIndex:current});else if(action==='section')vscode.postMessage({type:'insertSection',frameIndex:current});else if(action==='subsection')vscode.postMessage({type:'insertSubsection',frameIndex:current});else if(action==='subsubsection')vscode.postMessage({type:'insertSubsubsection',frameIndex:current});else if(action==='paragraphHeading')vscode.postMessage({type:'insertParagraphHeading',frameIndex:current});else if(action==='paragraph')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'paragraph'});else if(action==='bullets')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'itemize'});else if(action==='numbered')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'enumerate'});else if(action==='mathEquation')openMathInsert('mathEquationDisplay',current);else if(action==='mathMatrix')openMathInsert('mathMatrix',current);else if(action==='mathSystem')openMathInsert('mathSystem',current);else if(action==='citation')openCitationPicker();else if(action==='addbibliography')vscode.postMessage({type:'addBibliography',resumeCitation:false,cursorPos:rememberedStructuralCursorPos()});else if(action==='referencessection')vscode.postMessage({type:'addReferencesSection',cursorPos:rememberedStructuralCursorPos()});else if(action==='openbibliography')vscode.postMessage({type:'openBibliography'});else if(action==='label')openLabelPicker();else if(action==='reference')openReferencePicker();else if(action==='footnote')openLabsFootnote();else if(action==='link')openLabsLink();else if(action==='special')openLabsSpecial();else if(action==='index')openLabsIndex();else if(action==='nomenclature')openLabsNomenclature();else if(action==='field')openLabsField();else if(action==='newpage')labsInsertBlock('\\newpage','break');else if(action==='clearpage')labsInsertBlock('\\clearpage','break');else if(action==='quote')openLabsQuote();else if(action==='minipage')openLabsMinipage();else if(action==='theorem')openLabsTheorem();else if(action==='note')openLabsNote();else if(action==='commentblock')openLabsCommentBlock();else if(action==='commentoutselection')commentOutSelectedText();else if(action==='toggleSourceComments')toggleReviewVisibility('sourceComments');else if(action==='toggleAuthorNotes')toggleReviewVisibility('authorNotes');else if(action==='toggleCommentBlocks')toggleReviewVisibility('commentBlocks');else if(action==='showHiddenReviewItems')restoreHiddenReviewItems();else if(action==='printindex')labsInsertBlock('\\printindex','index');else if(action==='printnomenclature')labsInsertBlock('\\printnomenclature','nomenclature');else if(action==='figure')vscode.postMessage({type:'insertFigure',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='tikz')vscode.postMessage({type:'insertTikzFigure',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='subfigures')vscode.postMessage({type:'chooseSubfigures',frameIndex:current,cursorPos:rememberedStructuralCursorPos()});else if(action==='table')openTableEditor();else if(action==='spacing')openSpacingEditor();else if(action==='documentsettings')renderPreamble(currentPreamble);else if(action==='columns')openLabsColumns();else if(action==='customenvironment')openLabsCustomEnvironment();}
+document.addEventListener('click',e=>{const action=e.target&&e.target.closest?e.target.closest('.top-menu-panel button'):null;if(action)closeTopMenus();});document.querySelectorAll('.frame-size-option').forEach(btn=>{btn.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};btn.onclick=()=>{const size=String(btn.dataset.frameSize||'normal');closeTopMenus();vscode.postMessage({type:'updateFrameFontSize',frameIndex:current,size});};});const beamerDuplicate=document.getElementById('beamer-duplicate-frame'),beamerUp=document.getElementById('beamer-move-frame-up'),beamerDown=document.getElementById('beamer-move-frame-down'),beamerToggle=document.getElementById('beamer-toggle-frame');if(beamerDuplicate)beamerDuplicate.onclick=()=>{closeTopMenus();vscode.postMessage({type:'duplicateFrame',frameIndex:current});};if(beamerUp)beamerUp.onclick=()=>{closeTopMenus();vscode.postMessage({type:'moveFrame',frameIndex:current,direction:-1});};if(beamerDown)beamerDown.onclick=()=>{closeTopMenus();vscode.postMessage({type:'moveFrame',frameIndex:current,direction:1});};if(beamerToggle)beamerToggle.onclick=()=>{closeTopMenus();vscode.postMessage({type:'toggleFrameDisabled',frameIndex:current});};function runTopMenuAction(action){closeTopMenus();const blockedWhenDisabled=new Set(['paragraph','bullets','numbered','mathEquation','mathMatrix','mathSystem','citation','label','reference','footnote','link','special','index','nomenclature','field','newpage','clearpage','quote','minipage','theorem','note','commentblock','commentoutselection','figure','tikz','table','columns','beamerblock','beameralert','beamerexample','frameoptions']);if(isBeamer&&frames[current]&&frames[current].disabled&&blockedWhenDisabled.has(action)){vscode.postMessage({type:'showWarning',message:'Restore this frame before editing its contents.'});return;}if(action==='title'||action==='author'){const el=document.querySelector('.doc-metadata-edit[data-field="'+action+'"]');if(el){el.focus();placeCaretEnd(el);}else vscode.postMessage({type:'ensureMetadataField',field:action});}else if(action==='abstract'){const el=document.querySelector('.doc-rich-block.abstract .doc-rich-edit');if(el){el.focus();placeCaretEnd(el);}else vscode.postMessage({type:'insertAbstract',cursorPos:rememberedStructuralCursorPos()});}else if(action==='toc')vscode.postMessage({type:'insertTableOfContents',cursorPos:rememberedStructuralCursorPos()});else if(action==='includedfile')openIncludedFileDialog();else if(action==='frame')vscode.postMessage({type:'insertFrame',frameIndex:current});else if(action==='chapter')vscode.postMessage({type:'insertChapter',frameIndex:current});else if(action==='section')vscode.postMessage({type:'insertSection',frameIndex:current});else if(action==='subsection')vscode.postMessage({type:'insertSubsection',frameIndex:current});else if(action==='subsubsection')vscode.postMessage({type:'insertSubsubsection',frameIndex:current});else if(action==='paragraphHeading')vscode.postMessage({type:'insertParagraphHeading',frameIndex:current});else if(action==='paragraph')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'paragraph'});else if(action==='bullets')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'itemize'});else if(action==='numbered')vscode.postMessage({type:'insertBlock',frameIndex:current,kind:'enumerate'});else if(action==='mathEquation')openMathInsert('mathEquationDisplay',current);else if(action==='mathMatrix')openMathInsert('mathMatrix',current);else if(action==='mathSystem')openMathInsert('mathSystem',current);else if(action==='citation')openCitationPicker();else if(action==='addbibliography')vscode.postMessage({type:'addBibliography',resumeCitation:false,cursorPos:rememberedStructuralCursorPos()});else if(action==='referencessection')vscode.postMessage({type:'addReferencesSection',cursorPos:rememberedStructuralCursorPos()});else if(action==='openbibliography')vscode.postMessage({type:'openBibliography'});else if(action==='label')openLabelPicker();else if(action==='reference')openReferencePicker();else if(action==='footnote')openLabsFootnote();else if(action==='link')openLabsLink();else if(action==='special')openLabsSpecial();else if(action==='index')openLabsIndex();else if(action==='nomenclature')openLabsNomenclature();else if(action==='field')openLabsField();else if(action==='newpage')labsInsertBlock('\\newpage','break');else if(action==='clearpage')labsInsertBlock('\\clearpage','break');else if(action==='quote')openLabsQuote();else if(action==='minipage')openLabsMinipage();else if(action==='theorem')openLabsTheorem();else if(action==='note')openLabsNote();else if(action==='commentblock')openLabsCommentBlock();else if(action==='commentoutselection')commentOutSelectedText();else if(action==='toggleSourceComments')toggleReviewVisibility('sourceComments');else if(action==='toggleAuthorNotes')toggleReviewVisibility('authorNotes');else if(action==='toggleCommentBlocks')toggleReviewVisibility('commentBlocks');else if(action==='showHiddenReviewItems')restoreHiddenReviewItems();else if(action==='printindex')labsInsertBlock('\\printindex','index');else if(action==='printnomenclature')labsInsertBlock('\\printnomenclature','nomenclature');else if(action==='figure'){const anchor=snapshotVisualCursor()||lastVisualCursor;vscode.postMessage({type:'insertFigure',frameIndex:current,cursorPos:rememberedStructuralCursorPos(anchor),insertAnchor:captureBlockInsertionAnchor(anchor)});}else if(action==='tikz'){const anchor=snapshotVisualCursor()||lastVisualCursor;vscode.postMessage({type:'insertTikzFigure',frameIndex:current,cursorPos:rememberedStructuralCursorPos(anchor),insertAnchor:captureBlockInsertionAnchor(anchor)});}else if(action==='subfigures'){const anchor=snapshotVisualCursor()||lastVisualCursor;vscode.postMessage({type:'chooseSubfigures',frameIndex:current,cursorPos:rememberedStructuralCursorPos(anchor),insertAnchor:captureBlockInsertionAnchor(anchor)});}else if(action==='table')openTableEditor();else if(action==='spacing')openSpacingEditor();else if(action==='documentsettings')renderPreamble(currentPreamble);else if(action==='columns')openLabsColumns();else if(action==='customenvironment')openLabsCustomEnvironment();}
 function renderTopMenu(panelId,sections){const panel=document.getElementById(panelId);if(!panel)return;panel.innerHTML='';const addTitle=t=>{const d=document.createElement('div');d.className='menu-title';d.textContent=t;panel.appendChild(d);};const addDivider=()=>{const d=document.createElement('span');d.className='menu-divider';panel.appendChild(d);};const add=(label,action)=>{const b=document.createElement('button');b.textContent=label;b.onmousedown=e=>{rememberVisualCursor();e.preventDefault();};b.onclick=()=>runTopMenuAction(action);panel.appendChild(b);};sections.forEach((section,i)=>{if(i)addDivider();if(section.title)addTitle(section.title);section.items.forEach(item=>{if(item.when===false)return;add(item.label,item.action);});});}
 function renderTopMenus(){renderTopMenu('structure-menu-panel',[{title:'Document structure',items:[{label:'Normal text',action:'paragraph'},{label:'Title',action:'title'},{label:'Author',action:'author'},{label:'Abstract',action:'abstract',when:!isBeamer},{label:'Table of contents',action:'toc',when:!isBeamer},{label:'Chapter',action:'chapter',when:['book','report'].includes(documentClass)},{label:'Section',action:'section'},{label:'Subsection',action:'subsection'},{label:'Subsubsection',action:'subsubsection',when:!isBeamer},{label:'Paragraph heading',action:'paragraphHeading',when:!isBeamer}]},{title:'Lists',items:[{label:'Bulleted list',action:'bullets'},{label:'Numbered list',action:'numbered'}]},{title:'Blocks & containers',items:[{label:'Quote…',action:'quote'},{label:'Columns…',action:'columns'},{label:'Minipage…',action:'minipage'},{label:'Theorem / proof…',action:'theorem'},{label:'Environment…',action:'customenvironment',when:!isBeamer&&customEnvironments.length>0}]}]);renderTopMenu('insert-menu-panel',[{title:'Comments & notes',items:[{label:'Note…',action:'note'},{label:'Commented-out block…',action:'commentblock'}]},{title:'Math',items:[{label:'Equation…',action:'mathEquation'},{label:'Matrix…',action:'mathMatrix'},{label:'System…',action:'mathSystem'}]},{title:'Objects',items:[{label:'Figure…',action:'figure'},{label:'TikZ figure…',action:'tikz'},{label:'Table…',action:'table'},{label:'Included file…',action:'includedfile',when:!isBeamer}]},{title:'Inline objects',items:[{label:'Footnote…',action:'footnote'},{label:'Link / URL…',action:'link'},{label:'Special character…',action:'special'},{label:'Field…',action:'field'}]},{title:'Spacing & breaks',items:[{label:'Spacing…',action:'spacing'},{label:'Page break',action:'newpage'},{label:'Clear page',action:'clearpage'}]}]);renderTopMenu('references-menu-panel',[{title:'Citations & bibliography',items:[{label:'Insert citation…',action:'citation'},{label:'Add / change bibliography…',action:'addbibliography'},{label:'Insert bibliography…',action:'referencessection'},{label:'Open .bib',action:'openbibliography'}]},{title:'Cross-references',items:[{label:'Add label to selected object…',action:'label',when:!isBeamer},{label:'Insert cross-reference…',action:'reference'}]},{title:'Indexes',items:[{label:'Index entry…',action:'index'},{label:'Print index',action:'printindex'},{label:'Nomenclature entry…',action:'nomenclature'},{label:'Print nomenclature',action:'printnomenclature'}]}]);} document.getElementById('view-continuous').onclick=()=>{documentLayoutMode='continuous';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-pages').onclick=()=>{documentLayoutMode='pages';updateDocumentViewMenu();closeTopMenus();renderWorkspace();};document.getElementById('view-source-comments').onclick=()=>{toggleReviewVisibility('sourceComments');};document.getElementById('view-author-notes').onclick=()=>{toggleReviewVisibility('authorNotes');};document.getElementById('view-comment-blocks').onclick=()=>{toggleReviewVisibility('commentBlocks');};document.getElementById('view-hidden-comments').onclick=()=>{restoreHiddenReviewItems();};updateCommentViewMenu();const commentInspectorClose=document.getElementById('comment-inspector-close');if(commentInspectorClose)commentInspectorClose.onclick=()=>closeCommentInspector();const commentPrev=document.getElementById('comment-prev'),commentNext=document.getElementById('comment-next');if(commentPrev)commentPrev.onclick=()=>navigateReviewComment(-1);if(commentNext)commentNext.onclick=()=>navigateReviewComment(1);const projectIssuesClose=document.getElementById('project-issues-close');if(projectIssuesClose)projectIssuesClose.onclick=()=>closeProjectIssues();document.addEventListener('click',e=>{if(!e.target.closest('.top-menu'))closeTopMenus();});document.querySelectorAll('.mode-tab').forEach(btn=>{btn.onmousedown=()=>{if(viewMode==='visual'&&(btn.dataset.view==='source'||btn.dataset.view==='split')){const loc=currentVisualSourceLocation();if(loc)sourceFocus={...loc,target:'source'};}};btn.onclick=()=>switchViewMode(btn.dataset.view);});document.getElementById('new-document').onclick=()=>{closeTopMenus();vscode.postMessage({type:'newDocument'});};document.getElementById('open-file').onclick=()=>{closeTopMenus();vscode.postMessage({type:'open'});};document.getElementById('save-file').onclick=()=>{closeTopMenus();const el=document.getElementById('save-status');el.textContent='Saving…';vscode.postMessage({type:'save'});};document.getElementById('save-as').onclick=()=>{closeTopMenus();vscode.postMessage({type:'saveAs'});};document.getElementById('document-settings-file').onclick=()=>{closeTopMenus();renderPreamble(currentPreamble);};document.getElementById('undo').onclick=()=>vscode.postMessage({type:'undo'});document.getElementById('redo').onclick=()=>vscode.postMessage({type:'redo'});document.getElementById('find-document').onclick=()=>texflowOpenFind();document.getElementById('labs-find-replace').onclick=()=>{closeTopMenus();openLabsFindReplace();};document.getElementById('labs-copy-object').onclick=()=>{closeTopMenus();labsCopyObject();};document.getElementById('labs-paste-object').onclick=()=>{closeTopMenus();labsPasteObject();};document.getElementById('labs-duplicate-object').onclick=()=>{closeTopMenus();labsDuplicateObject();};document.getElementById('labs-move-up').onclick=()=>{closeTopMenus();labsMoveObject(-1);};document.getElementById('labs-move-down').onclick=()=>{closeTopMenus();labsMoveObject(1);};const commentOutSelectionButton=document.getElementById('comment-out-selection');if(commentOutSelectionButton)commentOutSelectionButton.onclick=()=>{closeTopMenus();commentOutSelectedText();};document.getElementById('project-issues-button').onclick=()=>{closeTopMenus();openProjectIssues();};document.getElementById('project-diagnostics').onclick=()=>{closeTopMenus();vscode.postMessage({type:'showProjectDiagnostics'});};document.getElementById('top-compile').onclick=()=>vscode.postMessage({type:'compile'});document.getElementById('spell-language-automatic').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'auto'});document.getElementById('spell-language-english').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'en'});document.getElementById('spell-language-spanish').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'language',value:'es'});document.getElementById('spell-check-toggle').onclick=()=>vscode.postMessage({type:'updateSpellcheckSetting',key:'enabled',value:!texflowSpellState.enabled});const body=document.body;const toggleNav=document.getElementById('toggle-nav');const focusBtn=document.getElementById('focus-mode');const exitFocus=document.getElementById('exit-focus');const sideResizer=document.getElementById('side-resizer');const findInput=document.getElementById('texflow-find-input'),findPrev=document.getElementById('texflow-find-prev'),findNext=document.getElementById('texflow-find-next'),findClose=document.getElementById('texflow-find-close');if(findInput){findInput.addEventListener('input',()=>{texflowFindState.query=findInput.value||'';texflowFindRefresh(true,true);});findInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();texflowFindNavigate(e.shiftKey?-1:1);}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();texflowCloseFind();}});}if(findPrev)findPrev.onclick=()=>texflowFindNavigate(-1);if(findNext)findNext.onclick=()=>texflowFindNavigate(1);if(findClose)findClose.onclick=()=>texflowCloseFind();const texflowFindObserver=new MutationObserver(()=>texflowFindScheduleRefresh(false));const texflowFindContent=document.getElementById('content');if(texflowFindContent)texflowFindObserver.observe(texflowFindContent,{subtree:true,childList:true,characterData:true});function setSidebarWidth(value,persist=true){const min=190,max=Math.min(520,Math.max(min,window.innerWidth*.82));const width=Math.round(Math.max(min,Math.min(max,Number(value)||252)));document.documentElement.style.setProperty('--sidebar',width+'px');if(sideResizer)sideResizer.setAttribute('aria-valuenow',String(width));if(persist)localStorage.setItem('texflow-sidebar-width',String(width));const content=document.getElementById('content');if(content)scheduleDocumentCommentMarkerAlignment(content);return width;}const storedSidebarWidth=Number(localStorage.getItem('texflow-sidebar-width'));if(Number.isFinite(storedSidebarWidth)&&storedSidebarWidth>0)setSidebarWidth(storedSidebarWidth,false);if(sideResizer){sideResizer.addEventListener('pointerenter',()=>body.classList.add('sidebar-resizer-hover'));sideResizer.addEventListener('pointerleave',()=>{if(!body.classList.contains('sidebar-resizing'))body.classList.remove('sidebar-resizer-hover');});sideResizer.setAttribute('aria-valuemin','190');sideResizer.setAttribute('aria-valuemax','520');sideResizer.addEventListener('pointerdown',e=>{if(e.button!==0)return;e.preventDefault();const startX=e.clientX,startWidth=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sidebar'))||252;body.classList.add('sidebar-resizing');sideResizer.setPointerCapture(e.pointerId);const move=ev=>setSidebarWidth(startWidth+(ev.clientX-startX),false);const end=ev=>{if(sideResizer.hasPointerCapture(ev.pointerId))sideResizer.releasePointerCapture(ev.pointerId);sideResizer.removeEventListener('pointermove',move);sideResizer.removeEventListener('pointerup',end);sideResizer.removeEventListener('pointercancel',end);body.classList.remove('sidebar-resizing');body.classList.remove('sidebar-resizer-hover');const current=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sidebar'))||252;setSidebarWidth(current,true);};sideResizer.addEventListener('pointermove',move);sideResizer.addEventListener('pointerup',end);sideResizer.addEventListener('pointercancel',end);});sideResizer.addEventListener('dblclick',()=>setSidebarWidth(252,true));}
 function updateViewChromeMenu(){toggleNav.textContent=(body.classList.contains('nav-open')?'✓ ':'')+'Document outline';focusBtn.textContent=(body.classList.contains('focus-mode')?'✓ ':'')+'Focus mode';}function setNav(open){body.classList.toggle('nav-open',open);body.classList.toggle('nav-closed',!open);localStorage.setItem('texflow-nav',open?'open':'closed');updateViewChromeMenu();}function setFocus(on){body.classList.toggle('focus-mode',on);localStorage.setItem('texflow-focus',on?'on':'off');updateViewChromeMenu();}// Every TeXFlow document starts with its navigator visible on desktop.

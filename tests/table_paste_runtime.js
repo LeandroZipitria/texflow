@@ -96,9 +96,21 @@ assert.strictEqual(blocks[0].tableSize, 'small');
 assert.strictEqual(blocks[0].tableStyle, 'booktabs');
 
 assert(extension.includes("if (msg.type === 'insertLatexTable')"), 'host paste handler missing');
-assert(extension.includes("if (parsedTable.tableStyle === 'booktabs') await ensurePackage(project, 'booktabs');"), 'pasted booktabs tables must ensure the package');
+const insertLatexTableStart = extension.indexOf("if (msg.type === 'insertLatexTable')");
+const insertTableStart = extension.indexOf("if (msg.type === 'insertTable')", insertLatexTableStart + 1);
+assert(insertLatexTableStart >= 0 && insertTableStart > insertLatexTableStart, 'host paste handler missing');
+const insertLatexTableHandler = extension.slice(insertLatexTableStart, insertTableStart);
+assert(insertLatexTableHandler.includes("parsedTable.tableStyle === 'booktabs'"), 'pasted semantic booktabs tables must be detected');
+assert(insertLatexTableHandler.includes("await ensurePackage(project, 'booktabs');"), 'pasted booktabs tables must ensure the package');
+assert(/toprule\|midrule\|bottomrule\|cmidrule\|addlinespace/.test(insertLatexTableHandler), 'preserved complex booktabs tables must also ensure the package');
 assert(extension.includes('function tryPasteLatexTable(e)'), 'Visual paste detector missing');
-assert(extension.includes("const parsed=pastedTableData(raw);if(!parsed)return false;"), 'Visual paste must use the shared table parser');
+
+assert(extension.includes("const fenceMatch = /^```(?:latex|tex)?\\s*\\n([\\s\\S]*?)\\n```$/i.exec(normalizedFence);"), 'host table paste must accept fenced LaTeX copied from editors/chats');
+assert(extension.includes("\\begin\\s*\\{\\s*table\\s*\\}\\s*(?:\\[[^\\]]*\\])?"), 'host complete-table detection must tolerate whitespace around placement metadata');
+assert(extension.includes('function normalizeVisualTablePaste(raw)'), 'Visual table paste normalization missing');
+assert(extension.includes('function looksLikeCompleteLatexTable(raw)'), 'Visual complete-table detector missing');
+assert(/const parsed\s*=\s*pastedTableData\(raw\)/.test(extension), 'Visual paste must use the shared table parser');
+assert(extension.includes("if(!parsed&&!looksLikeTable)return false;"), 'Visual paste must preserve complex complete LaTeX tables instead of rejecting them');
 assert(extension.includes("if(editable.matches('.title,.head,.beamer-metadata-edit,.doc-metadata-edit'))return null;"), 'metadata/title fields must not accept structural table paste');
 assert(extension.includes("if (tableSize) lines.push(`\\\\${tableSize}`);"), 'host table serializer must preserve table-local size');
 assert(extension.includes("if(tableSize)lines.push('\\\\'+tableSize)"), 'document Visual table serializer must preserve table-local size');

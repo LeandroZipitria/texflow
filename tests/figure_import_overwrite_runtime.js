@@ -8,16 +8,14 @@ const assert = require('assert');
 const root = path.join(__dirname, '..');
 const extension = fs.readFileSync(path.join(root, 'src', 'extension.ts'), 'utf8');
 
-assert(extension.includes('async function copyExternalFigureIntoProject'), 'shared external-figure import helper missing');
-assert(extension.includes("path.join(rootDir, 'figures')"), 'external figures must still be copied into the project figures folder');
-assert(extension.includes('path.basename(original.fsPath)'), 'import target must keep the original file name');
-assert(extension.includes('await vscode.workspace.fs.stat(target);'), 're-import must detect an existing project copy');
-assert(extension.includes("await vscode.workspace.fs.delete(target, { recursive: false, useTrash: false });"), 'existing project copy must be removed before copying');
-assert(extension.includes("error.code !== 'FileNotFound'"), 'missing target must be the only ignored delete/stat condition');
-assert(extension.includes('vscode.workspace.fs.copy(original, target, { overwrite: true })'), 'copy should retain overwrite semantics after explicit replacement');
-assert(!extension.includes('{ overwrite: false }'), 'figure import must not preserve the old non-overwrite behavior');
-assert(!extension.includes('`${parsed.name}-${i++}${parsed.ext}`'), 'figure import must not create -2/-3 suffixed duplicates');
-assert(extension.includes('return copyExternalFigureIntoProject(rootDir, original);'), 'single-figure import must use shared replacement semantics');
-assert(extension.includes('out.push(await copyExternalFigureIntoProject(rootDir,original));continue;'), 'multi-figure import must use shared replacement semantics');
+assert(extension.includes('function figureLatexPathFromDocument'), 'shared figure-path helper missing');
+assert(extension.includes('path.relative(rootDir, original.fsPath)'), 'figure path must be computed relative to the active .tex file');
+assert(extension.includes("return value.replace(/\\\\/g, '/');"), 'figure path must be normalized for LaTeX');
+assert(extension.includes('return { uri: original, latexPath: figureLatexPathFromDocument(rootDocument, original) };'), 'single-figure selection must preserve the chosen file location');
+assert(extension.includes('out.push({uri:original,latexPath:figureLatexPathFromDocument(rootDocument,original)});'), 'multi-figure selection must preserve each chosen file location');
+assert(!extension.includes('async function copyExternalFigureIntoProject'), 'figure selection must not copy external files into a project figures folder');
+assert(!extension.includes("path.join(rootDir, 'figures')"), 'figure selection must not force a figures/ destination');
+assert(!extension.includes('workspace.fs.copy(original, target'), 'figure selection must not silently copy the chosen image');
+assert(!extension.includes('`${parsed.name}-${i++}${parsed.ext}`'), 'figure selection must not create suffixed duplicates');
 
-console.log('PASS figure_import_overwrite_runtime');
+console.log('PASS figure_import_path_runtime');

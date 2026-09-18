@@ -239,12 +239,19 @@ The generic `vsce` bundling warning is not by itself a reason to introduce webpa
 
 ## Versioning and release baselines
 
-Never overwrite a build that has been given to the tester. Each experiment/fix gets a new version identifier or isolated commit. Stable baselines are promoted only after automated and manual validation.
+Never overwrite a validated release or a build that has been given to the tester. Stable baselines are promoted only after automated regression and manual validation.
 
-`0.19.0` is the public baseline immediately before the project-aware/structured-editing expansion.
+`0.20.6` is the current stable release baseline.
 
-`0.20.0` is the stable Foundation + Builds A–D baseline and must remain reproducible.
+Development of a new release starts from the stable baseline in a dedicated version branch, for example `feature/texflow-0.20.7`. Set the target version in `package.json` and `package-lock.json` at the start of that branch, before the first development package is built. Do not keep packaging new work under the previous stable version number.
 
-`0.20.1` is the focused follow-up release for Visual feature lifecycle parity (included-file creation/removal, Abstract/TOC/metadata creation, insertion points, Beamer caret cleanup) and live `TextDocument` lifecycle hardening. Its validated typing/save contract must not be redesigned as incidental cleanup.
+During development, keep already-tested VSIX artifacts distinct (for example `texflow-0.20.7-build-01.vsix`, `texflow-0.20.7-build-02.vsix`) rather than silently overwriting them. The canonical `texflow-X.Y.Z.vsix` filename is reserved for the final release candidate after the release gate passes.
+
+Validated functionality from the stable baseline should not be reopened unless a reproducible regression appears or a new feature explicitly requires it.
+
+Historical baselines:
+- `0.20.0`: Foundation + Builds A–D project-aware/structured-editing baseline.
+- `0.20.1`: Visual feature-lifecycle and live-`TextDocument` hardening baseline.
+- `0.20.6`: document-flow, project navigation, figure lifecycle, and conservative table-fallback baseline.
 
 A future `1.0.0` should be an explicit product/release decision, not an automatic consequence of feature count.

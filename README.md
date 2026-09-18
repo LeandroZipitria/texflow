@@ -8,7 +8,7 @@
 
 TeXFlow is a visual editor for real LaTeX files inside VS Code. It lets you focus on writing while keeping your `.tex` files intact, editable, and fully accessible.
 
-**Current stable release: 0.20.2.**
+**Current stable release: 0.20.6.**
 
 TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files remain the source of truth. When TeXFlow cannot safely edit a complex construct visually, it preserves the underlying LaTeX rather than silently rewriting it.
 
@@ -18,7 +18,7 @@ TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files rema
 - Project-aware Visual editing across `\input` and `\include` files while preserving every source file separately.
 - Build multi-file documents directly from Visual with **Insert → Included file...**: create a new `.tex` file or link an existing one, choose `\input` or `\include`, and remove the relationship later without deleting the file.
 - Explicit master-document and active-document handling for multi-file projects.
-- Project navigator with real `.tex`, `.bib`, and supported figure files; project-relative paths; and a resizable persistent sidebar.
+- Workspace-aware project navigator with real `.tex`, `.bib`, and supported figure files; project-relative paths; and a resizable persistent sidebar.
 - Project-wide labels and cross-references, including navigation, missing references, duplicate labels, and unused labels.
 - Project-wide bibliography intelligence with search by citation key, author, title, and year; missing keys; unused entries; and citation/BibTeX navigation.
 - **Project Issues** for project-wide reference, bibliography, and include diagnostics.
@@ -27,8 +27,8 @@ TeXFlow does not replace LaTeX with a proprietary format. Your `.tex` files rema
 - Bold, italic, underline, color, and paragraph alignment.
 - Unified Equation, Matrix, and System workflows with inline/display placement, semantic numbering, aligned equations, cases, matrices, delimiters, and common accents/symbols.
 - Numbered/unnumbered structural editing, including safe `align` ↔ `align*` and `section` ↔ `section*` round trips.
-- Figures with captions, labels, resize, rotation, subfigures, and unified figure insertion.
-- Tables with row/column editing, alignment, captions, labels, Booktabs, and CSV/TSV paste/import.
+- Figures with captions, labels, resize, rotation, subfigures, unified figure insertion, preserved file locations, and automatic Visual refresh when a referenced image is overwritten on disk.
+- Tables with row/column editing, alignment, captions, labels, Booktabs, and CSV/TSV paste/import. Small compatible tables remain fully visual; large or structurally complex tables fall back to compact, editable LaTeX without losing source.
 - TikZ figures with insertion, Figure properties, inline source editing, PDF preview, Source navigation, and promotion of a bare `tikzpicture` to a Figure.
 - Beamer title-page editing for title, subtitle, author, institution, and date, plus frame operations including duplicate, move, disable/restore, blocks, columns, frame options, and frame-local text sizes.
 - Comments and notes with Comment, TODO, FIXME, Author note, commented-out blocks, and document-order navigation.
